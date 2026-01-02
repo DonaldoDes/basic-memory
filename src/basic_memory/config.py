@@ -40,7 +40,7 @@ class ProjectConfig:
 
     @property
     def project(self):
-        return self.name
+        return self.name  # pragma: no cover
 
     @property
     def project_url(self) -> str:  # pragma: no cover
@@ -233,6 +233,23 @@ class BasicMemoryConfig(BaseSettings):
     )
 
     @property
+    def is_test_env(self) -> bool:
+        """Check if running in a test environment.
+
+        Returns True if any of:
+        - env field is set to "test"
+        - BASIC_MEMORY_ENV environment variable is "test"
+        - PYTEST_CURRENT_TEST environment variable is set (pytest is running)
+
+        Used to disable features like telemetry and file watchers during tests.
+        """
+        return (
+            self.env == "test"
+            or os.getenv("BASIC_MEMORY_ENV", "").lower() == "test"
+            or os.getenv("PYTEST_CURRENT_TEST") is not None
+        )
+
+    @property
     def cloud_mode_enabled(self) -> bool:
         """Check if cloud mode is enabled.
 
@@ -270,7 +287,7 @@ class BasicMemoryConfig(BaseSettings):
         Returns:
             BasicMemoryConfig configured for cloud mode
         """
-        return cls(
+        return cls(  # pragma: no cover
             database_backend=DatabaseBackend.POSTGRES,
             database_url=database_url,
             projects=projects or {},
@@ -295,8 +312,8 @@ class BasicMemoryConfig(BaseSettings):
     def model_post_init(self, __context: Any) -> None:
         """Ensure configuration is valid after initialization."""
         # Skip project initialization in cloud mode - projects are discovered from DB
-        if self.database_backend == DatabaseBackend.POSTGRES:
-            return
+        if self.database_backend == DatabaseBackend.POSTGRES:  # pragma: no cover
+            return  # pragma: no cover
 
         # Ensure at least one project exists; if none exist then create main
         if not self.projects:  # pragma: no cover

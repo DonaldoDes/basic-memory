@@ -1,7 +1,6 @@
 """FastAPI application for basic-memory knowledge graph API."""
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -55,12 +54,7 @@ async def lifespan(app: FastAPI):  # pragma: no cover
     logger.info("Database connections cached in app state")
 
     # Start file sync if enabled
-    is_test_env = (
-        app_config.env == "test"
-        or os.getenv("BASIC_MEMORY_ENV", "").lower() == "test"
-        or os.getenv("PYTEST_CURRENT_TEST") is not None
-    )
-    if app_config.sync_changes and not is_test_env:
+    if app_config.sync_changes and not app_config.is_test_env:
         logger.info(f"Sync changes enabled: {app_config.sync_changes}")
 
         # start file sync task in background
@@ -69,7 +63,7 @@ async def lifespan(app: FastAPI):  # pragma: no cover
 
         app.state.sync_task = asyncio.create_task(_file_sync_runner())
     else:
-        if is_test_env:
+        if app_config.is_test_env:
             logger.info("Test environment detected. Skipping file sync service.")
         else:
             logger.info("Sync changes disabled. Skipping file sync service.")

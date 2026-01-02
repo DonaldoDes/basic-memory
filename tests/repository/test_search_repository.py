@@ -139,6 +139,116 @@ async def test_index_item(search_repository, search_entity):
 
 
 @pytest.mark.asyncio
+async def test_index_item_upsert_on_duplicate_permalink(search_repository, search_entity):
+    """Test that indexing the same permalink twice uses upsert instead of failing.
+
+    This tests the fix for the race condition where parallel entity indexing
+    could cause IntegrityError on the unique permalink constraint.
+    """
+    # First insert
+    search_row1 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Original Title",
+        content_stems="original content",
+        content_snippet="Original content snippet",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"entity_type": search_entity.entity_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row1)
+
+    # Verify first insert worked
+    results = await search_repository.search(search_text="original")
+    assert len(results) == 1
+    assert results[0].title == "Original Title"
+
+    # Second insert with same permalink but different content (simulates race condition)
+    # This should NOT raise IntegrityError - it should upsert (update) instead
+    search_row2 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Updated Title",
+        content_stems="updated content",
+        content_snippet="Updated content snippet",
+        permalink=search_entity.permalink,  # Same permalink!
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"entity_type": search_entity.entity_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    # This should succeed without raising IntegrityError
+    await search_repository.index_item(search_row2)
+
+    # Verify the row was updated, not duplicated
+    results_after = await search_repository.search(search_text="updated")
+    assert len(results_after) == 1
+    assert results_after[0].title == "Updated Title"
+
+    # Verify old content is gone (was replaced)
+    results_old = await search_repository.search(search_text="original")
+    assert len(results_old) == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_index_items_upsert_on_duplicate_permalink(search_repository, search_entity):
+    """Test that bulk_index_items uses upsert for duplicate permalinks.
+
+    This tests the fix for race conditions during bulk entity indexing.
+    """
+    # First bulk insert
+    search_row1 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Bulk Original Title",
+        content_stems="bulk original content",
+        content_snippet="Bulk original content snippet",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"entity_type": search_entity.entity_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.bulk_index_items([search_row1])
+
+    # Verify first insert worked
+    results = await search_repository.search(search_text="bulk original")
+    assert len(results) == 1
+    assert results[0].title == "Bulk Original Title"
+
+    # Second bulk insert with same permalink (simulates race condition)
+    search_row2 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Bulk Updated Title",
+        content_stems="bulk updated content",
+        content_snippet="Bulk updated content snippet",
+        permalink=search_entity.permalink,  # Same permalink!
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"entity_type": search_entity.entity_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    # This should succeed without raising IntegrityError
+    await search_repository.bulk_index_items([search_row2])
+
+    # Verify the row was updated
+    results_after = await search_repository.search(search_text="bulk updated")
+    assert len(results_after) == 1
+    assert results_after[0].title == "Bulk Updated Title"
+
+
+@pytest.mark.asyncio
 async def test_project_isolation(
     search_repository, second_project_repository, search_entity, second_entity
 ):
@@ -547,19 +657,18 @@ class TestSearchTermPreparation:
     @pytest.mark.asyncio
     async def test_fts5_error_handling_database_error(self, search_repository):
         """Test that non-FTS5 database errors are properly re-raised."""
-        import unittest.mock
+        # Force a real database error (not an FTS5 syntax error) by removing the search index.
+        # The repository should re-raise the error rather than returning an empty list.
+        async with db.scoped_session(search_repository.session_maker) as session:
+            await session.execute(text("DROP TABLE IF EXISTS search_index"))
+            await session.commit()
 
-        # Mock the scoped_session to raise a non-FTS5 error
-        with unittest.mock.patch("basic_memory.db.scoped_session") as mock_scoped_session:
-            mock_session = unittest.mock.AsyncMock()
-            mock_scoped_session.return_value.__aenter__.return_value = mock_session
-
-            # Simulate a database error that's NOT an FTS5 syntax error
-            mock_session.execute.side_effect = Exception("Database connection failed")
-
-            # This should re-raise the exception (not return empty list)
-            with pytest.raises(Exception, match="Database connection failed"):
+        try:
+            with pytest.raises(Exception):
                 await search_repository.search(search_text="test")
+        finally:
+            # Restore index so later tests in this module keep working.
+            await search_repository.init_search_index()
 
     @pytest.mark.asyncio
     async def test_version_string_search_integration(self, search_repository, search_entity):

@@ -112,6 +112,8 @@ pythonVersion = "3.12"
 
 [tool.coverage.run]
 concurrency = ["thread", "gevent"]
+parallel = true
+source = ["basic_memory"]
 
 [tool.coverage.report]
 exclude_lines = [
@@ -133,9 +135,11 @@ omit = [
     "*/supabase_auth_provider.py",  # External HTTP calls to Supabase APIs
     "*/watch_service.py",           # File system watching - complex integration testing
     "*/background_sync.py",         # Background processes
-    "*/cli/main.py",               # CLI entry point
-    "*/mcp/tools/project_management.py",  # Covered by integration tests
-    "*/mcp/tools/sync_status.py",  # Covered by integration tests
+    "*/cli/**",                    # CLI is an interactive wrapper; core logic is covered via API/MCP/service tests
+    "*/db.py",                     # Backend/runtime-dependent (sqlite/postgres/windows tuning); validated via integration tests
+    "*/services/initialization.py", # Startup orchestration + background tasks (watchers); exercised indirectly in entrypoints
+    "*/sync/sync_service.py",      # Heavy filesystem/db integration; covered by integration suite, not enforced in unit coverage
+    "*/telemetry.py",              # External analytics; tested lightly, excluded from strict coverage target
     "*/services/migration_service.py", # Complex migration scenarios
 ]
 

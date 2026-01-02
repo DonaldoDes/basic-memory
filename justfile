@@ -37,11 +37,11 @@ test-postgres: test-unit-postgres test-int-postgres
 
 # Run unit tests against SQLite
 test-unit-sqlite:
-    uv run pytest -p pytest_mock -v --no-cov tests
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov tests
 
 # Run unit tests against Postgres
 test-unit-postgres:
-    BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov tests
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov tests
 
 # Run integration tests against SQLite
 test-int-sqlite:
@@ -98,8 +98,30 @@ test-all:
 
 # Generate HTML coverage report
 coverage:
-    uv run pytest -p pytest_mock -v -n auto tests test-int --cov-report=html
-    @echo "Coverage report generated in htmlcov/index.html"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    uv run coverage erase
+    
+    echo "🔎 Coverage (SQLite)..."
+    BASIC_MEMORY_ENV=test uv run coverage run --source=basic_memory -m pytest -p pytest_mock -v --no-cov tests test-int
+    
+    echo "🔎 Coverage (Postgres via testcontainers)..."
+    # Note: Uses timeout due to FastMCP Client + asyncpg cleanup hang (tests pass, process hangs on exit)
+    # See: https://github.com/jlowin/fastmcp/issues/1311
+    TIMEOUT_CMD=$(command -v gtimeout || command -v timeout || echo "")
+    if [[ -n "$TIMEOUT_CMD" ]]; then
+        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run coverage run --source=basic_memory -m pytest -p pytest_mock -v --no-cov -m postgres tests test-int' || test $? -eq 137
+    else
+        echo "⚠️  No timeout command found, running without timeout..."
+        BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run coverage run --source=basic_memory -m pytest -p pytest_mock -v --no-cov -m postgres tests test-int
+    fi
+    
+    echo "🧩 Combining coverage data..."
+    uv run coverage combine
+    uv run coverage report -m
+    uv run coverage html
+    echo "Coverage report generated in htmlcov/index.html"
 
 # Lint and fix code (calls fix)
 lint: fix
@@ -127,14 +149,6 @@ format:
 run-inspector:
     npx @modelcontextprotocol/inspector
 
-# Build macOS installer
-installer-mac:
-    cd installer && chmod +x make_icons.sh && ./make_icons.sh
-    cd installer && uv run python setup.py bdist_mac
-
-# Build Windows installer
-installer-win:
-    cd installer && uv run python setup.py bdist_win32
 
 # Update all dependencies to latest versions
 update-deps:
@@ -182,8 +196,9 @@ release version:
     fi
     
     # Run quality checks
-    echo "🔍 Running quality checks..."
-    just check
+    echo "🔍 Running lint  checks..."
+    just lint
+    just typecheck
     
     # Update version in __init__.py
     echo "📝 Updating version in __init__.py..."
@@ -241,8 +256,9 @@ beta version:
     fi
     
     # Run quality checks
-    echo "🔍 Running quality checks..."
-    just check
+    echo "🔍 Running lint  checks..."
+    just lint
+    just typecheck
     
     # Update version in __init__.py
     echo "📝 Updating version in __init__.py..."

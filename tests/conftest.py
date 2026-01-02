@@ -9,6 +9,8 @@ from typing import AsyncGenerator
 
 import pytest
 import pytest_asyncio
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -206,10 +208,18 @@ async def engine_factory(
             autoflush=False,
         )
 
+        # Important: wire the engine/session into the global db module state.
+        # Some codepaths (e.g. app initialization / MCP lifespan) call db.get_or_create_db(),
+        # which would otherwise create a separate engine and run migrations, conflicting with
+        # our test-created schema (and causing DuplicateTableError).
+        db._engine = engine
+        db._session_maker = session_maker
+
         from basic_memory.models.search import (
             CREATE_POSTGRES_SEARCH_INDEX_TABLE,
             CREATE_POSTGRES_SEARCH_INDEX_FTS,
             CREATE_POSTGRES_SEARCH_INDEX_METADATA,
+            CREATE_POSTGRES_SEARCH_INDEX_PERMALINK,
         )
 
         # Drop and recreate all tables for test isolation
@@ -223,10 +233,30 @@ async def engine_factory(
             await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_TABLE)
             await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_FTS)
             await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_METADATA)
+            await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_PERMALINK)
+
+            # Mark migrations as already applied for this test-created schema.
+            #
+            # Some codepaths (e.g. ensure_initialization()) invoke Alembic migrations.
+            # If we create tables via ORM directly, alembic_version is missing and migrations
+            # will try to create tables again, causing DuplicateTableError.
+            alembic_dir = Path(db.__file__).parent / "alembic"
+            cfg = Config()
+            cfg.set_main_option("script_location", str(alembic_dir))
+            cfg.set_main_option(
+                "file_template",
+                "%%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s",
+            )
+            cfg.set_main_option("timezone", "UTC")
+            cfg.set_main_option("revision_environment", "false")
+            cfg.set_main_option("sqlalchemy.url", async_url)
+            command.stamp(cfg, "head")
 
         yield engine, session_maker
 
         await engine.dispose()
+        db._engine = None
+        db._session_maker = None
     else:
         # SQLite mode
         db_type = DatabaseType.MEMORY

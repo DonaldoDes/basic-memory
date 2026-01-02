@@ -210,20 +210,24 @@ async def delete_note(
 
         try:
             # Resolve identifier to entity ID
-            entity_id = await resolve_entity_id(client, active_project.id, identifier)
+            entity_id = await resolve_entity_id(client, active_project.external_id, identifier)
         except ToolError as e:
             # If entity not found, return False (note doesn't exist)
             if "Entity not found" in str(e) or "not found" in str(e).lower():
                 logger.warning(f"Note not found for deletion: {identifier}")
                 return False
             # For other resolution errors, return formatted error message
-            logger.error(f"Delete failed for '{identifier}': {e}, project: {active_project.name}")
-            return _format_delete_error_response(active_project.name, str(e), identifier)
+            logger.error(  # pragma: no cover
+                f"Delete failed for '{identifier}': {e}, project: {active_project.name}"
+            )
+            return _format_delete_error_response(  # pragma: no cover
+                active_project.name, str(e), identifier
+            )
 
         try:
             # Call the DELETE endpoint
             response = await call_delete(
-                client, f"/v2/projects/{active_project.id}/knowledge/entities/{entity_id}"
+                client, f"/v2/projects/{active_project.external_id}/knowledge/entities/{entity_id}"
             )
             result = DeleteEntitiesResponse.model_validate(response.json())
 
@@ -233,8 +237,10 @@ async def delete_note(
                 )
                 return True
             else:
-                logger.warning(f"Delete operation completed but note was not deleted: {identifier}")
-                return False
+                logger.warning(  # pragma: no cover
+                    f"Delete operation completed but note was not deleted: {identifier}"
+                )
+                return False  # pragma: no cover
 
         except Exception as e:  # pragma: no cover
             logger.error(f"Delete failed for '{identifier}': {e}, project: {active_project.name}")

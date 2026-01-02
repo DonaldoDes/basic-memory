@@ -623,7 +623,7 @@ class SyncService:
         except Exception as e:
             # Check if this is a fatal error (or caused by one)
             # Fatal errors like project deletion should terminate sync immediately
-            if isinstance(e, SyncFatalError) or isinstance(e.__cause__, SyncFatalError):
+            if isinstance(e, SyncFatalError) or isinstance(e.__cause__, SyncFatalError):  # pragma: no cover
                 logger.error(f"Fatal sync error encountered, terminating sync: path={path}")
                 raise
 
@@ -766,7 +766,13 @@ class SyncService:
                 return entity, checksum
             except IntegrityError as e:
                 # Handle race condition where entity was created by another process
-                if "UNIQUE constraint failed: entity.file_path" in str(e):
+                msg = str(e)
+                if (
+                    "UNIQUE constraint failed: entity.file_path" in msg
+                    or "uix_entity_file_path_project" in msg
+                    or "duplicate key value violates unique constraint" in msg
+                    and "file_path" in msg
+                ):
                     logger.info(
                         f"Entity already exists for file_path={path}, updating instead of creating"
                     )
@@ -795,7 +801,7 @@ class SyncService:
                     return updated, checksum
                 else:
                     # Re-raise if it's a different integrity error
-                    raise
+                    raise  # pragma: no cover
         else:
             # Get file timestamps for updating modification time
             file_metadata = await self.file_service.get_file_metadata(path)

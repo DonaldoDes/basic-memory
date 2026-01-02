@@ -164,16 +164,14 @@ async def delete_project(project_name: str, context: Context | None = None) -> s
         response = await call_get(client, "/projects/projects")
         project_list = ProjectList.model_validate(response.json())
 
-        # Find the project by name (case-insensitive) or permalink - same logic as switch_project
+        # Find the project by permalink (derived from name).
+        # Note: The API response uses `ProjectItem` which derives `permalink` from `name`,
+        # so a separate case-insensitive name match would be redundant here.
         project_permalink = generate_permalink(project_name)
         target_project = None
         for p in project_list.projects:
             # Match by permalink (handles case-insensitive input)
             if p.permalink == project_permalink:
-                target_project = p
-                break
-            # Also match by name comparison (case-insensitive)
-            if p.name.lower() == project_name.lower():
                 target_project = p
                 break
 
@@ -183,8 +181,8 @@ async def delete_project(project_name: str, context: Context | None = None) -> s
                 f"Project '{project_name}' not found. Available projects: {', '.join(available_projects)}"
             )
 
-        # Call v2 API to delete project using project ID
-        response = await call_delete(client, f"/v2/projects/{target_project.id}")
+        # Call v2 API to delete project using project external_id
+        response = await call_delete(client, f"/v2/projects/{target_project.external_id}")
         status_response = ProjectStatusResponse.model_validate(response.json())
 
         result = f"✓ {status_response.message}\n\n"

@@ -2,165 +2,110 @@
 
 import json
 import pytest
-from unittest.mock import AsyncMock, patch
 
+from basic_memory.mcp.tools import write_note
 from basic_memory.schemas.search import SearchResponse, SearchResult, SearchItemType
 
 
 @pytest.mark.asyncio
-async def test_search_successful_results():
+async def test_search_successful_results(client, test_project):
     """Test search with successful results returns proper MCP content array format."""
-    # Mock successful search results
-    mock_results = SearchResponse(
-        results=[
-            SearchResult(
-                title="Test Document 1",
-                permalink="docs/test-doc-1",
-                content="This is test content for document 1",
-                type=SearchItemType.ENTITY,
-                score=1.0,
-                file_path="/test/docs/test-doc-1.md",
-            ),
-            SearchResult(
-                title="Test Document 2",
-                permalink="docs/test-doc-2",
-                content="This is test content for document 2",
-                type=SearchItemType.ENTITY,
-                score=0.9,
-                file_path="/test/docs/test-doc-2.md",
-            ),
-        ],
-        current_page=1,
-        page_size=10,
+    await write_note.fn(
+        project=test_project.name,
+        title="Test Document 1",
+        folder="docs",
+        content="# Test Document 1\n\nThis is test content for document 1",
+    )
+    await write_note.fn(
+        project=test_project.name,
+        title="Test Document 2",
+        folder="docs",
+        content="# Test Document 2\n\nThis is test content for document 2",
     )
 
-    with patch(
-        "basic_memory.mcp.tools.chatgpt_tools.search_notes.fn", new_callable=AsyncMock
-    ) as mock_search:
-        mock_search.return_value = mock_results
+    from basic_memory.mcp.tools.chatgpt_tools import search
 
-        # Import and call the actual function
-        from basic_memory.mcp.tools.chatgpt_tools import search
+    result = await search.fn("test content")
 
-        result = await search.fn("test query")
+    # Verify MCP content array format
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["type"] == "text"
 
-        # Verify MCP content array format
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert result[0]["type"] == "text"
+    # Parse the JSON content
+    content = json.loads(result[0]["text"])
+    assert "results" in content
+    assert content["query"] == "test content"
 
-        # Parse the JSON content
-        content = json.loads(result[0]["text"])
-        assert "results" in content
-        assert "query" in content
-
-        # Verify result structure
-        assert len(content["results"]) == 2
-        assert content["query"] == "test query"
-
-        # Verify individual result format
-        result_item = content["results"][0]
-        assert result_item["id"] == "docs/test-doc-1"
-        assert result_item["title"] == "Test Document 1"
-        assert result_item["url"] == "docs/test-doc-1"
+    # Verify individual result format
+    assert any(r["id"] == "docs/test-document-1" for r in content["results"])
+    assert any(r["id"] == "docs/test-document-2" for r in content["results"])
 
 
 @pytest.mark.asyncio
-async def test_search_with_error_response():
-    """Test search when underlying search_notes returns error string."""
+async def test_search_with_error_response(monkeypatch, client, test_project):
+    """Test search when underlying search_notes returns an error string."""
+    import basic_memory.mcp.tools.chatgpt_tools as chatgpt_tools
+
     error_message = "# Search Failed - Invalid Syntax\n\nThe search query contains errors..."
 
-    with patch(
-        "basic_memory.mcp.tools.chatgpt_tools.search_notes.fn", new_callable=AsyncMock
-    ) as mock_search:
-        mock_search.return_value = error_message
+    async def fake_search_notes_fn(*args, **kwargs):
+        return error_message
 
-        from basic_memory.mcp.tools.chatgpt_tools import search
+    monkeypatch.setattr(chatgpt_tools.search_notes, "fn", fake_search_notes_fn)
 
-        result = await search.fn("invalid query")
+    result = await chatgpt_tools.search.fn("invalid query")
 
-        # Verify MCP content array format
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert result[0]["type"] == "text"
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["type"] == "text"
 
-        # Parse the JSON content
-        content = json.loads(result[0]["text"])
-        assert content["results"] == []
-        assert content["error"] == "Search failed"
-        assert "error_details" in content
+    content = json.loads(result[0]["text"])
+    assert content["results"] == []
+    assert content["error"] == "Search failed"
+    assert "error_details" in content
 
 
 @pytest.mark.asyncio
-async def test_fetch_successful_document():
+async def test_fetch_successful_document(client, test_project):
     """Test fetch with successful document retrieval."""
-    document_content = """# Test Document
+    await write_note.fn(
+        project=test_project.name,
+        title="Test Document",
+        folder="docs",
+        content="# Test Document\n\nThis is the content of a test document.",
+    )
 
-This is the content of a test document.
+    from basic_memory.mcp.tools.chatgpt_tools import fetch
 
-## Section 1
-Some content here.
+    result = await fetch.fn("docs/test-document")
 
-## Observations
-- [observation] This is a test observation
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["type"] == "text"
 
-## Relations
-- relates_to [[Another Document]]
-"""
-
-    with patch(
-        "basic_memory.mcp.tools.chatgpt_tools.read_note.fn", new_callable=AsyncMock
-    ) as mock_read:
-        mock_read.return_value = document_content
-
-        from basic_memory.mcp.tools.chatgpt_tools import fetch
-
-        result = await fetch.fn("docs/test-document")
-
-        # Verify MCP content array format
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert result[0]["type"] == "text"
-
-        # Parse the JSON content
-        content = json.loads(result[0]["text"])
-        assert content["id"] == "docs/test-document"
-        assert content["title"] == "Test Document"  # Extracted from markdown
-        assert content["text"] == document_content
-        assert content["url"] == "docs/test-document"
-        assert content["metadata"]["format"] == "markdown"
+    content = json.loads(result[0]["text"])
+    assert content["id"] == "docs/test-document"
+    assert content["title"] == "Test Document"
+    assert "This is the content of a test document." in content["text"]
+    assert content["url"] == "docs/test-document"
+    assert content["metadata"]["format"] == "markdown"
 
 
 @pytest.mark.asyncio
-async def test_fetch_document_not_found():
+async def test_fetch_document_not_found(client, test_project):
     """Test fetch when document is not found."""
-    error_content = """# Note Not Found: "nonexistent-doc"
+    from basic_memory.mcp.tools.chatgpt_tools import fetch
 
-I couldn't find any notes matching "nonexistent-doc". Here are some suggestions:
+    result = await fetch.fn("nonexistent-doc")
 
-## Check Identifier Type
-- If you provided a title, try using the exact permalink instead
-"""
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["type"] == "text"
 
-    with patch(
-        "basic_memory.mcp.tools.chatgpt_tools.read_note.fn", new_callable=AsyncMock
-    ) as mock_read:
-        mock_read.return_value = error_content
-
-        from basic_memory.mcp.tools.chatgpt_tools import fetch
-
-        result = await fetch.fn("nonexistent-doc")
-
-        # Verify MCP content array format
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert result[0]["type"] == "text"
-
-        # Parse the JSON content
-        content = json.loads(result[0]["text"])
-        assert content["id"] == "nonexistent-doc"
-        assert content["text"] == error_content
-        assert content["metadata"]["error"] == "Document not found"
+    content = json.loads(result[0]["text"])
+    assert content["id"] == "nonexistent-doc"
+    assert content["metadata"]["error"] == "Document not found"
 
 
 def test_format_search_results_for_chatgpt():
@@ -226,3 +171,45 @@ def test_format_document_error_handling():
     assert result["title"] == "Missing Doc"
     assert result["text"] == error_content
     assert result["metadata"]["error"] == "Document not found"
+
+
+def test_format_document_untitled_fallback_for_empty_identifier():
+    """If identifier is empty and content has no H1, we still return a stable title."""
+    from basic_memory.mcp.tools.chatgpt_tools import _format_document_for_chatgpt
+
+    result = _format_document_for_chatgpt("no title here", "")
+    assert result["title"] == "Untitled Document"
+
+
+@pytest.mark.asyncio
+async def test_search_internal_exception_returns_error_payload(monkeypatch, client, test_project):
+    """search() should return a structured error payload if an unexpected exception occurs."""
+    import basic_memory.mcp.tools.chatgpt_tools as chatgpt_tools
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chatgpt_tools.search_notes, "fn", boom)
+
+    result = await chatgpt_tools.search.fn("anything")
+    assert isinstance(result, list)
+    content = json.loads(result[0]["text"])
+    assert content["error"] == "Internal search error"
+    assert "error_message" in content
+
+
+@pytest.mark.asyncio
+async def test_fetch_internal_exception_returns_error_payload(monkeypatch, client, test_project):
+    """fetch() should return a structured error payload if an unexpected exception occurs."""
+    import basic_memory.mcp.tools.chatgpt_tools as chatgpt_tools
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chatgpt_tools.read_note, "fn", boom)
+
+    result = await chatgpt_tools.fetch.fn("docs/test")
+    assert isinstance(result, list)
+    content = json.loads(result[0]["text"])
+    assert content["id"] == "docs/test"
+    assert content["metadata"]["error"] == "Fetch failed"

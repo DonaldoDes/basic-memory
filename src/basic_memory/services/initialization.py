@@ -82,14 +82,8 @@ async def initialize_file_sync(
     """
     # Never start file watching during tests. Even "background" watchers add tasks/threads
     # and can interact badly with strict asyncio teardown (especially on Windows/aiosqlite).
-    #
-    # Note: Some tests patch ConfigManager.config with a minimal BasicMemoryConfig that
-    # may not set env="test". So also detect pytest via env vars.
-    if (
-        app_config.env == "test"
-        or os.getenv("BASIC_MEMORY_ENV", "").lower() == "test"
-        or os.getenv("PYTEST_CURRENT_TEST") is not None
-    ):
+    # Skip file sync in test environments to avoid interference with tests
+    if app_config.is_test_env:
         logger.info("Test environment detected - skipping file sync initialization")
         return None
 
@@ -168,6 +162,11 @@ async def initialize_app(
     Args:
         app_config: The Basic Memory project configuration
     """
+    # Skip initialization in cloud mode - cloud manages its own projects
+    if app_config.cloud_mode_enabled:
+        logger.debug("Skipping initialization in cloud mode - projects managed by cloud")
+        return
+
     logger.info("Initializing app...")
     # Initialize database first
     await initialize_database(app_config)

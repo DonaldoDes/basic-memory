@@ -49,7 +49,9 @@ def status() -> None:
 
     config = ConfigManager().config
 
-    status_text = "[green]enabled[/green]" if config.telemetry_enabled else "[yellow]disabled[/yellow]"
+    status_text = (
+        "[green]enabled[/green]" if config.telemetry_enabled else "[yellow]disabled[/yellow]"
+    )
 
     console.print(f"\nTelemetry: {status_text}")
     console.print(f"Install ID: [dim]{get_install_id()}[/dim]")
