@@ -87,6 +87,7 @@ class DirectoryService:
                 type="file",
                 title=file.title,
                 permalink=file.permalink,
+                external_id=file.external_id,  # UUID for v2 API
                 entity_id=file.id,
                 entity_type=file.entity_type,
                 content_type=file.content_type,
@@ -251,6 +252,7 @@ class DirectoryService:
                 type="file",
                 title=file.title,
                 permalink=file.permalink,
+                external_id=file.external_id,  # UUID for v2 API
                 entity_id=file.id,
                 entity_type=file.entity_type,
                 content_type=file.content_type,

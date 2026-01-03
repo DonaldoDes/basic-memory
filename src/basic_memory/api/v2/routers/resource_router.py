@@ -16,7 +16,6 @@ from loguru import logger
 
 from basic_memory.deps import (
     ProjectConfigV2ExternalDep,
-    EntityServiceV2ExternalDep,
     FileServiceV2ExternalDep,
     EntityRepositoryV2ExternalDep,
     SearchServiceV2ExternalDep,
