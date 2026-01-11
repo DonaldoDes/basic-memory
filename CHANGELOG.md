@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## v0.17.5 (2026-01-11)
+
+### Bug Fixes
+
+- **#505**: Prevent CLI commands from hanging on exit (Python 3.14 compatibility)
+  ([`863e0a4`](https://github.com/basicmachines-co/basic-memory/commit/863e0a4))
+  - Skip `nest_asyncio` on Python 3.14+ where it causes event loop issues
+  - Simplify CLI test infrastructure for cross-version compatibility
+  - Update pyright to 1.1.408 for Python 3.14 support
+  - Fix SQLAlchemy rowcount typing for Python 3.14
+
 ## v0.17.4 (2026-01-05)
 
 ### Bug Fixes
