@@ -220,6 +220,11 @@ release version:
     echo "✅ Release {{version}} created successfully!"
     echo "📦 GitHub Actions will build and publish to PyPI"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
+    echo ""
+    echo "📝 REMINDER: Update documentation sites after release is published:"
+    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
+    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   See: .claude/commands/release/release.md for detailed instructions"
 
 # Create a beta release (e.g., just beta v0.13.2b1)
 beta version:
@@ -281,6 +286,11 @@ beta version:
     echo "📦 GitHub Actions will build and publish to PyPI as pre-release"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
     echo "📥 Install with: uv tool install basic-memory --pre"
+    echo ""
+    echo "📝 REMINDER: For stable releases, update documentation sites:"
+    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
+    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   See: .claude/commands/release/release.md for detailed instructions"
 
 # List all available recipes
 default:
