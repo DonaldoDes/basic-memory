@@ -142,6 +142,3 @@ omit = [
     "*/telemetry.py",              # External analytics; tested lightly, excluded from strict coverage target
     "*/services/migration_service.py", # Complex migration scenarios
 ]
-
-[tool.logfire]
-ignore_no_config = true
