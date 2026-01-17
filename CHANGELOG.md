@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## v0.17.6 (2026-01-17)
+
+### Bug Fixes
+
+- **#510**: Fix Docker container Python symlink broken at runtime
+  ([`1799c94`](https://github.com/basicmachines-co/basic-memory/commit/1799c94))
+
+### Internal
+
+- Remove logfire config and specs docs, reduce lifespan and sync logging to debug level
+  ([`d1d433d`](https://github.com/basicmachines-co/basic-memory/commit/d1d433d),
+  [`803f3ef`](https://github.com/basicmachines-co/basic-memory/commit/803f3ef))
+
 ## v0.17.5 (2026-01-11)
 
 ### Bug Fixes
