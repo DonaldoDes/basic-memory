@@ -13,7 +13,10 @@
       "identifier": "basic-memory",
       "version": "0.17.7",
       "runtimeHint": "uvx",
-      "runtimeArguments": ["basic-memory", "mcp"],
+      "runtimeArguments": [
+        {"type": "positional", "value": "basic-memory"},
+        {"type": "positional", "value": "mcp"}
+      ],
       "transport": {
         "type": "stdio"
       }
