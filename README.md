@@ -6,7 +6,6 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
-[![smithery badge](https://smithery.ai/badge/@basicmachines-co/basic-memory)](https://smithery.ai/server/@basicmachines-co/basic-memory)
 
 ## 🚀 Basic Memory Cloud is Live!
 
