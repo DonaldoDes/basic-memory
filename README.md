@@ -63,12 +63,6 @@ uv tool install basic-memory
 
 You can view shared context via files in `~/basic-memory` (default directory location).
 
-### Glama.ai
-
-<a href="https://glama.ai/mcp/servers/o90kttu9ym">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/o90kttu9ym/badge" alt="basic-memory MCP server" />
-</a>
-
 ## Why Basic Memory?
 
 Most LLM interactions are ephemeral - you ask a question, get an answer, and everything is forgotten. Each conversation
