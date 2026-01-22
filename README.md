@@ -14,7 +14,7 @@
 - **Early Supporter Pricing:** Early users get 25% off forever. 
 The open source project continues as always. Cloud just makes it work everywhere.
 
-[Sign up now →](https://basicmemory.com/beta)
+[Sign up now →](https://basicmemory.com)
 
 with a 7 day free trial
 
@@ -24,8 +24,8 @@ Basic Memory lets you build persistent knowledge through natural conversations w
 Claude, while keeping everything in simple Markdown files on your computer. It uses the Model Context Protocol (MCP) to
 enable any compatible LLM to read and write to your local knowledge base.
 
-- Website: https://basicmachines.co
-- Documentation: https://memory.basicmachines.co
+- Website: https://basicmemory.com
+- Documentation: https://docs.basicmemory.com
 
 ## Pick up your conversation right where you left off
 
@@ -62,18 +62,6 @@ uv tool install basic-memory
 ```
 
 You can view shared context via files in `~/basic-memory` (default directory location).
-
-### Alternative Installation via Smithery
-
-You can use [Smithery](https://smithery.ai/server/@basicmachines-co/basic-memory) to automatically configure Basic
-Memory for Claude Desktop:
-
-```bash
-npx -y @smithery/cli install @basicmachines-co/basic-memory --client claude
-```
-
-This installs and configures Basic Memory without requiring manual edits to the Claude Desktop configuration file. The
-Smithery server hosts the MCP server component, while your data remains stored locally as Markdown files.
 
 ### Glama.ai
 
@@ -426,7 +414,7 @@ canvas(nodes, edges, title, folder) - Generate knowledge visualizations
 
 ## Futher info
 
-See the [Documentation](https://memory.basicmachines.co/) for more info, including:
+See the [Documentation](https://docs.basicmemory.com) for more info, including:
 
 - [Complete User Guide](https://docs.basicmemory.com/user-guide/)
 - [CLI tools](https://docs.basicmemory.com/guides/cli-reference/)
