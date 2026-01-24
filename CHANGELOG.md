@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## v0.17.8 (2026-01-24)
+
+### Bug Fixes
+
+- **#521**: Fix `get_default_project()` returning multiple results
+  ([`6888eff`](https://github.com/basicmachines-co/basic-memory/commit/6888eff))
+  - Query incorrectly matched any project with non-NULL `is_default` (both True and False)
+  - Now correctly checks for `is_default=True` only
+
 ## v0.17.7 (2026-01-24)
 
 ### Features
@@ -13,11 +22,6 @@
   ([`7a502e6`](https://github.com/basicmachines-co/basic-memory/commit/7a502e6))
 
 ### Bug Fixes
-
-- **#521**: Fix `get_default_project()` returning multiple results
-  ([`6888eff`](https://github.com/basicmachines-co/basic-memory/commit/6888eff))
-  - Query incorrectly matched any project with non-NULL `is_default` (both True and False)
-  - Now correctly checks for `is_default=True` only
 
 - **#520**: Read default project from database in cloud mode
   ([`38616c3`](https://github.com/basicmachines-co/basic-memory/commit/38616c3))
