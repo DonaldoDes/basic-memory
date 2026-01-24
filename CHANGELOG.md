@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## v0.17.9 (2026-01-24)
+
+### Bug Fixes
+
+- **#523**: Fix `remove_project()` checking stale config in cloud mode
+  ([`17c0e0a`](https://github.com/basicmachines-co/basic-memory/commit/17c0e0a))
+  - In cloud mode, only check database `is_default` field (source of truth)
+  - Config file can become stale when users set default project via v2 API
+
 ## v0.17.8 (2026-01-24)
 
 ### Bug Fixes
