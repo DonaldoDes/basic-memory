@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## v0.17.7 (2026-01-24)
+
+### Features
+
+- **#476**: Add SPEC-29 Phase 3 bucket snapshot CLI commands
+  ([`369ad37`](https://github.com/basicmachines-co/basic-memory/commit/369ad37))
+  - New `basic-memory cloud snapshot` commands for managing cloud snapshots
+  - Commands: `create`, `list`, `delete`, `show`, `browse`
+
+- **#515**: Add MCP registry publication files
+  ([`7a502e6`](https://github.com/basicmachines-co/basic-memory/commit/7a502e6))
+
+### Bug Fixes
+
+- **#521**: Fix `get_default_project()` returning multiple results
+  ([`6888eff`](https://github.com/basicmachines-co/basic-memory/commit/6888eff))
+  - Query incorrectly matched any project with non-NULL `is_default` (both True and False)
+  - Now correctly checks for `is_default=True` only
+
+- **#520**: Read default project from database in cloud mode
+  ([`38616c3`](https://github.com/basicmachines-co/basic-memory/commit/38616c3))
+
+- **#513**: Ensure external_id is set on entity creation
+  ([`c7835a9`](https://github.com/basicmachines-co/basic-memory/commit/c7835a9))
+
+### Internal
+
+- **#514**: Remove OpenPanel telemetry
+  ([`85835ae`](https://github.com/basicmachines-co/basic-memory/commit/85835ae))
+
+- Update README links to point to basicmemory.com
+  ([`2aaee73`](https://github.com/basicmachines-co/basic-memory/commit/2aaee73))
+
 ## v0.17.6 (2026-01-17)
 
 ### Bug Fixes
