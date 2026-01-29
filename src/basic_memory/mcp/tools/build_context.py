@@ -143,9 +143,13 @@ async def build_context(
                     try:
                         dataview_results = integration.process_note(primary.content)
                         if dataview_results:
-                            # Append Dataview summary to content
-                            summary = f"\n\n---\n**Dataview:** {len(dataview_results)} quer{'y' if len(dataview_results) == 1 else 'ies'} executed"
-                            primary.content += summary
+                            # Append Dataview results markdown to content
+                            dataview_section = "\n\n---\n## Dataview Query Results\n\n"
+                            for result in dataview_results:
+                                if result['status'] == 'success' and result.get('result_markdown'):
+                                    dataview_section += result['result_markdown'] + "\n\n"
+                            if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
+                                primary.content += dataview_section
                     except Exception as e:
                         logger.warning(f"Failed to process Dataview for primary result: {e}")
                 
@@ -157,8 +161,12 @@ async def build_context(
                             try:
                                 dataview_results = integration.process_note(entity.content)
                                 if dataview_results:
-                                    summary = f"\n\n---\n**Dataview:** {len(dataview_results)} quer{'y' if len(dataview_results) == 1 else 'ies'}"
-                                    entity.content += summary
+                                    dataview_section = "\n\n---\n## Dataview Query Results\n\n"
+                                    for result in dataview_results:
+                                        if result['status'] == 'success' and result.get('result_markdown'):
+                                            dataview_section += result['result_markdown'] + "\n\n"
+                                    if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
+                                        entity.content += dataview_section
                             except Exception as e:
                                 logger.warning(f"Failed to process Dataview for related entity: {e}")
                     elif related.type == "observation":
@@ -167,8 +175,12 @@ async def build_context(
                             try:
                                 dataview_results = integration.process_note(obs.content)
                                 if dataview_results:
-                                    summary = f"\n\n---\n**Dataview:** {len(dataview_results)} quer{'y' if len(dataview_results) == 1 else 'ies'}"
-                                    obs.content += summary
+                                    dataview_section = "\n\n---\n## Dataview Query Results\n\n"
+                                    for result in dataview_results:
+                                        if result['status'] == 'success' and result.get('result_markdown'):
+                                            dataview_section += result['result_markdown'] + "\n\n"
+                                    if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
+                                        obs.content += dataview_section
                             except Exception as e:
                                 logger.warning(f"Failed to process Dataview for related observation: {e}")
         
