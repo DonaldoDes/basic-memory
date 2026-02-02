@@ -131,6 +131,10 @@ class DataviewRefreshManager:
         all_entities = await self.sync_service.entity_repository.find_all()
         
         for entity in all_entities:
+            # Skip non-markdown files (can't contain dataview queries)
+            if entity.content_type != 'text/markdown':
+                continue
+            
             # Read file content to check for dataview queries
             content = await self.sync_service.file_service.read_entity_content(entity)
             if content and '```dataview' in content:
