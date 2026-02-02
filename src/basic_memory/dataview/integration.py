@@ -344,6 +344,26 @@ class DataviewIntegration:
 
         return results
 
+    def execute_raw_query(self, query_text: str, query_id: str = "dv-1") -> Dict[str, Any]:
+        """
+        Execute a raw Dataview query string.
+        
+        Public API for executing Dataview queries from external callers.
+        
+        Args:
+            query_text: The Dataview query text to execute
+            query_id: Unique identifier for this query (default: "dv-1")
+            
+        Returns:
+            Dictionary with query results and metadata
+        """
+        return self._execute_query(
+            query_id=query_id,
+            query_text=query_text,
+            line_number=0,  # Line number not available for raw queries
+            block_type="codeblock"
+        )
+
     def _extract_discovered_links(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Extract discovered links from query results.

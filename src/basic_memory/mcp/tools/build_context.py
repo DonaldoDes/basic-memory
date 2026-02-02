@@ -127,61 +127,50 @@ async def build_context(
         
         # Enrich with Dataview if enabled
         if enable_dataview:
-            logger.info("Enriching graph context with Dataview queries")
+            # Check if any primary results have dataview_queries in metadata
+            has_queries = any(
+                context_result.primary_result.type == "entity" 
+                and context_result.primary_result.metadata 
+                and "dataview_queries" in context_result.primary_result.metadata
+                for context_result in graph_context.results
+            )
             
-            # Fetch all notes for Dataview query execution
-            knowledge_client = KnowledgeClient(client, active_project.external_id)
-            notes = await knowledge_client.list_entities_for_dataview()
-            
-            # Create integration with notes_provider
-            integration = create_dataview_integration(notes_provider=lambda: notes)
-            
-            for context_result in graph_context.results:
-                # Process primary result if it's an entity with content
-                primary = context_result.primary_result
-                if primary.type == "entity" and primary.content:
-                    try:
-                        dataview_results = integration.process_note(primary.content)
-                        if dataview_results:
-                            # Append Dataview results markdown to content
-                            dataview_section = "\n\n---\n## Dataview Query Results\n\n"
-                            for result in dataview_results:
-                                if result['status'] == 'success' and result.get('result_markdown'):
-                                    dataview_section += result['result_markdown'] + "\n\n"
-                            if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
-                                primary.content += dataview_section
-                    except Exception as e:
-                        logger.warning(f"Failed to process Dataview for primary result: {e}")
+            if has_queries:
+                logger.info("Enriching graph context with Dataview queries from metadata")
                 
-                # Process related results (only entities and observations have content)
-                for related in context_result.related_results:
-                    if related.type == "entity":
-                        entity = cast(EntitySummary, related)
-                        if entity.content:
+                # Fetch all notes for Dataview query execution (only once)
+                knowledge_client = KnowledgeClient(client, active_project.external_id)
+                notes = await knowledge_client.list_entities_for_dataview()
+                
+                # Create integration with notes_provider
+                integration = create_dataview_integration(notes_provider=lambda: notes)
+                
+                for context_result in graph_context.results:
+                    # Process primary result if it has dataview_queries in metadata
+                    primary = context_result.primary_result
+                    if (primary.type == "entity" 
+                        and primary.metadata 
+                        and "dataview_queries" in primary.metadata
+                        and primary.content):
+                        
+                        queries = primary.metadata["dataview_queries"]
+                        if queries:
                             try:
-                                dataview_results = integration.process_note(entity.content)
-                                if dataview_results:
-                                    dataview_section = "\n\n---\n## Dataview Query Results\n\n"
-                                    for result in dataview_results:
-                                        if result['status'] == 'success' and result.get('result_markdown'):
-                                            dataview_section += result['result_markdown'] + "\n\n"
-                                    if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
-                                        entity.content += dataview_section
+                                # Execute each query stored in metadata
+                                dataview_section = "\n\n---\n## Dataview Query Results\n\n"
+                                for idx, query_text in enumerate(queries, 1):
+                                    result = integration.execute_raw_query(
+                                        query_text=query_text,
+                                        query_id=f"dv-{idx}"
+                                    )
+                                    if result['status'] == 'success' and result.get('result_markdown'):
+                                        dataview_section += result['result_markdown'] + "\n\n"
+                                
+                                if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
+                                    primary.content += dataview_section
                             except Exception as e:
-                                logger.warning(f"Failed to process Dataview for related entity: {e}")
-                    elif related.type == "observation":
-                        obs = cast(ObservationSummary, related)
-                        if obs.content:
-                            try:
-                                dataview_results = integration.process_note(obs.content)
-                                if dataview_results:
-                                    dataview_section = "\n\n---\n## Dataview Query Results\n\n"
-                                    for result in dataview_results:
-                                        if result['status'] == 'success' and result.get('result_markdown'):
-                                            dataview_section += result['result_markdown'] + "\n\n"
-                                    if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
-                                        obs.content += dataview_section
-                            except Exception as e:
-                                logger.warning(f"Failed to process Dataview for related observation: {e}")
+                                logger.warning(f"Failed to execute Dataview queries from metadata: {e}")
+            else:
+                logger.debug("No dataview_queries found in metadata, skipping Dataview enrichment")
         
         return graph_context
