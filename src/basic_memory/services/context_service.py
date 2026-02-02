@@ -33,6 +33,7 @@ class ContextResultRow:
     content: Optional[str] = None
     category: Optional[str] = None
     entity_id: Optional[int] = None
+    metadata: Optional[dict] = None
 
 
 @dataclass
@@ -331,6 +332,7 @@ class ContextService:
                 content=row.content,
                 category=row.category,
                 entity_id=row.entity_id,
+                metadata=row.metadata,
                 depth=row.depth,
                 root_id=row.root_id,
                 created_at=parse_datetime(row.created_at),
@@ -364,11 +366,13 @@ class ContextService:
                 CAST(NULL AS TEXT) as content,
                 CAST(NULL AS TEXT) as category,
                 CAST(NULL AS INTEGER) as entity_id,
+                si.metadata,
                 0 as depth,
                 e.id as root_id,
                 e.created_at,
                 e.created_at as relation_date
             FROM entity e
+            LEFT JOIN search_index si ON (si.id = e.id AND si.type = 'entity' AND si.project_id = e.project_id)
             WHERE e.id IN ({entity_id_values})
             {date_filter}
             {project_filter}
@@ -414,6 +418,10 @@ class ContextService:
                 CAST(NULL AS TEXT) as content,
                 CAST(NULL AS TEXT) as category,
                 CAST(NULL AS INTEGER) as entity_id,
+                CASE
+                    WHEN step_type = 1 THEN CAST(NULL AS JSONB)
+                    ELSE si.metadata
+                END as metadata,
                 eg.depth + step_type as depth,
                 eg.root_id,
                 CASE
@@ -443,6 +451,12 @@ class ContextService:
                 {date_filter}
                 {project_filter}
             )
+            LEFT JOIN search_index si ON (
+                step_type = 2 AND
+                si.id = e.id AND
+                si.type = 'entity' AND
+                si.project_id = e.project_id
+            )
             WHERE eg.depth < :max_depth
             AND (step_type = 1 OR (step_type = 2 AND e.id IS NOT NULL AND e.id != eg.id))
             {timeframe_condition}
@@ -460,13 +474,14 @@ class ContextService:
             content,
             category,
             entity_id,
+            metadata,
             MIN(depth) as depth,
             root_id,
             created_at
         FROM entity_graph
         WHERE depth > 0
         GROUP BY type, id, title, permalink, file_path, from_id, to_id,
-                 relation_type, content, category, entity_id, root_id, created_at
+                 relation_type, content, category, entity_id, metadata, root_id, created_at
         ORDER BY depth, type, id
         LIMIT :max_results
        """)
@@ -497,12 +512,14 @@ class ContextService:
                 NULL as content,
                 NULL as category,
                 NULL as entity_id,
+                si.metadata,
                 0 as depth,
                 e.id as root_id,
                 e.created_at,
                 e.created_at as relation_date,
                 0 as is_incoming
             FROM entity e
+            LEFT JOIN search_index si ON (si.id = e.id AND si.type = 'entity' AND si.project_id = e.project_id)
             WHERE e.id IN ({entity_id_values})
             {date_filter}
             {project_filter}
@@ -522,6 +539,7 @@ class ContextService:
                 NULL as content,
                 NULL as category,
                 NULL as entity_id,
+                NULL as metadata,
                 eg.depth + 1,
                 eg.root_id,
                 e_from.created_at,
@@ -559,6 +577,7 @@ class ContextService:
                 NULL as content,
                 NULL as category,
                 NULL as entity_id,
+                si.metadata,
                 eg.depth + 1,
                 eg.root_id,
                 e.created_at,
@@ -574,6 +593,7 @@ class ContextService:
                 {date_filter}
                 {project_filter}
             )
+            LEFT JOIN search_index si ON (si.id = e.id AND si.type = 'entity' AND si.project_id = e.project_id)
             WHERE eg.depth < :max_depth
             {timeframe_condition}
         )
@@ -589,13 +609,14 @@ class ContextService:
             content,
             category,
             entity_id,
+            metadata,
             MIN(depth) as depth,
             root_id,
             created_at
         FROM entity_graph
         WHERE depth > 0
         GROUP BY type, id, title, permalink, file_path, from_id, to_id,
-                 relation_type, content, category, entity_id, root_id, created_at
+                 relation_type, content, category, entity_id, metadata, root_id, created_at
         ORDER BY depth, type, id
         LIMIT :max_results
        """)

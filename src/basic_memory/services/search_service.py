@@ -10,6 +10,7 @@ from fastapi import BackgroundTasks
 from loguru import logger
 from sqlalchemy import text
 
+from basic_memory.dataview.detector import DataviewDetector
 from basic_memory.models import Entity
 from basic_memory.repository import EntityRepository
 from basic_memory.repository.search_repository import SearchRepository, SearchIndexRow
@@ -294,6 +295,21 @@ class SearchService:
         if len(entity_content_stems) > MAX_CONTENT_STEMS_SIZE:  # pragma: no cover
             entity_content_stems = entity_content_stems[:MAX_CONTENT_STEMS_SIZE]  # pragma: no cover
 
+        # Build metadata
+        entity_metadata = {
+            "entity_type": entity.entity_type,
+        }
+        
+        # Extract and store Dataview queries if present
+        if content:
+            dataview_queries = DataviewDetector.extract_query_text(content)
+            logger.debug(f"Dataview extraction for {entity.title}: found {len(dataview_queries)} queries")
+            if dataview_queries:
+                entity_metadata["dataview_queries"] = dataview_queries
+                logger.debug(f"Added dataview_queries to metadata for {entity.title}")
+        else:
+            logger.warning(f"No content available for {entity.title} (entity_id={entity.id})")
+
         # Add entity row
         rows_to_index.append(
             SearchIndexRow(
@@ -305,9 +321,7 @@ class SearchService:
                 permalink=entity.permalink,
                 file_path=entity.file_path,
                 entity_id=entity.id,
-                metadata={
-                    "entity_type": entity.entity_type,
-                },
+                metadata=entity_metadata,
                 created_at=entity.created_at,
                 updated_at=_mtime_to_datetime(entity),
                 project_id=entity.project_id,

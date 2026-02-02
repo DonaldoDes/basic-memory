@@ -1,4 +1,5 @@
 from typing import Optional, List
+import json
 
 from basic_memory.repository import EntityRepository
 from basic_memory.repository.search_repository import SearchIndexRow
@@ -44,6 +45,16 @@ async def to_graph_context(
 
     # Helper function to convert items to summaries
     def to_summary(item: SearchIndexRow | ContextResultRow):
+        # Extract metadata if available (only SearchIndexRow has it)
+        metadata = getattr(item, "metadata", None)
+        
+        # Parse JSON string to dict if needed (SQLite stores JSON as TEXT)
+        if metadata and isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = None
+        
         match item.type:
             case SearchItemType.ENTITY:
                 return EntitySummary(
@@ -53,6 +64,7 @@ async def to_graph_context(
                     content=item.content,
                     file_path=item.file_path,
                     created_at=item.created_at,
+                    metadata=metadata,
                 )
             case SearchItemType.OBSERVATION:
                 return ObservationSummary(

@@ -132,6 +132,7 @@ class EntitySummary(BaseModel):
     created_at: Annotated[
         datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})
     ]
+    metadata: Optional[Dict] = None
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime) -> str:
