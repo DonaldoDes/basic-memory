@@ -198,7 +198,10 @@ async def test_read_file_content_raises_file_operation_error_for_directory(
     tmp_path: Path, file_service: FileService
 ):
     """read_file_content should wrap non-FileNotFound errors in FileOperationError."""
-    dir_path = tmp_path / "not-a-file"
+    # Use a .md "file path" that is actually a directory to exercise the
+    # IsADirectoryError branch (a non-.md path now triggers BinaryFileError
+    # before reaching the open() call).
+    dir_path = tmp_path / "not-a-file.md"
     dir_path.mkdir()
 
     with pytest.raises(FileOperationError) as exc_info:

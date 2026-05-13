@@ -1206,8 +1206,10 @@ async def test_sync_non_markdown_files_modified(
     report = await sync_service.sync(project_config.home)
     assert len(report.modified) == 2
 
-    pdf_file_content, pdf_checksum = await file_service.read_file(test_files["pdf"].name)
-    image_file_content, img_checksum = await file_service.read_file(test_files["image"].name)
+    # Use compute_checksum for non-markdown files (read_file refuses binaries
+    # since fix/skip-binary-files-in-read-entity-content).
+    pdf_checksum = await file_service.compute_checksum(test_files["pdf"].name)
+    img_checksum = await file_service.compute_checksum(test_files["image"].name)
 
     pdf_entity = await sync_service.entity_repository.get_by_file_path(str(test_files["pdf"].name))
     image_entity = await sync_service.entity_repository.get_by_file_path(
@@ -1287,8 +1289,10 @@ async def test_sync_non_markdown_files_move_with_delete(
     assert moved_entity is not None
     assert moved_entity.permalink is None
 
-    file_content, _ = await file_service.read_file("doc.pdf")
-    assert "content2" in file_content
+    # read_file_bytes for non-markdown paths (read_file refuses binaries
+    # since fix/skip-binary-files-in-read-entity-content).
+    file_bytes = await file_service.read_file_bytes("doc.pdf")
+    assert b"content2" in file_bytes
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ from basic_memory.file_utils import FileError, FileMetadata, ParseError
 from basic_memory.markdown.markdown_processor import MarkdownProcessor
 from basic_memory.models import Entity as EntityModel
 from basic_memory.schemas import Entity as EntitySchema
-from basic_memory.services.exceptions import FileOperationError
+from basic_memory.services.exceptions import BinaryFileError, FileOperationError
 from basic_memory.utils import FilePath
 from loguru import logger
 
@@ -71,13 +71,28 @@ class FileService:
         Used to index for search. Returns raw content without frontmatter,
         observations, or relations.
 
+        Non-markdown entities (PDFs, images, binary files registered as
+        type='file') return an empty string instead of being decoded as
+        UTF-8 — decoding binary bytes as text crashes with UnicodeDecodeError
+        and pollutes the search index with garbage anyway.
+
         Args:
             entity: Entity to read content for
 
         Returns:
-            Raw content string without metadata sections
+            Raw content string without metadata sections, or "" for binary
+            entities.
         """
         logger.debug(f"Reading entity content, entity_id={entity.id}, permalink={entity.permalink}")
+
+        # Skip non-markdown entities (PDFs, JPEGs, …) — would crash on UTF-8 decode.
+        if entity.content_type != "text/markdown":
+            logger.debug(
+                "Skipping binary entity content read "
+                f"entity_id={entity.id} content_type={entity.content_type} "
+                f"file_path={entity.file_path}"
+            )
+            return ""
 
         file_path = self.get_entity_path(entity)
         markdown = await self.markdown_processor.read_file(file_path)
@@ -216,11 +231,18 @@ class FileService:
             File content as string
 
         Raises:
-            FileOperationError: If read fails
+            BinaryFileError: If the path is not a markdown file (use
+                read_file_bytes for binary content).
+            FileOperationError: If read fails for any other reason.
+            FileNotFoundError: If the file does not exist.
         """
         # Convert string to Path if needed
         path_obj = self.base_path / path if isinstance(path, str) else path
         full_path = path_obj if path_obj.is_absolute() else self.base_path / path_obj
+
+        # Fail-fast on non-markdown files instead of crashing on UTF-8 decode.
+        if not self.is_markdown(path):
+            raise BinaryFileError(str(full_path))
 
         try:
             logger.debug("Reading file content", operation="read_file_content", path=str(full_path))
@@ -292,11 +314,17 @@ class FileService:
             Tuple of (content, checksum)
 
         Raises:
-            FileOperationError: If read fails
+            BinaryFileError: If the path is not a markdown file (use
+                read_file_bytes for binary content).
+            FileOperationError: If read fails for any other reason.
         """
         # Convert string to Path if needed
         path_obj = self.base_path / path if isinstance(path, str) else path
         full_path = path_obj if path_obj.is_absolute() else self.base_path / path_obj
+
+        # Fail-fast on non-markdown files instead of crashing on UTF-8 decode.
+        if not self.is_markdown(path):
+            raise BinaryFileError(str(full_path))
 
         try:
             logger.debug("Reading file", operation="read_file", path=str(full_path))
