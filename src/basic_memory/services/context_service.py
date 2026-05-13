@@ -437,6 +437,7 @@ class ContextService:
             JOIN relation r ON (
                 eg.type = 'entity' AND
                 (r.from_id = eg.id OR r.to_id = eg.id)
+                AND r.relation_type != 'dataview_link'
             )
             JOIN entity e_from ON (
                 r.from_id = e_from.id
@@ -549,6 +550,7 @@ class ContextService:
             JOIN relation r ON (
                 eg.type = 'entity' AND
                 (r.from_id = eg.id OR r.to_id = eg.id)
+                AND r.relation_type != 'dataview_link'
             )
             JOIN entity e_from ON (
                 r.from_id = e_from.id
