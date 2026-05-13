@@ -1,9 +1,12 @@
 """Tests for V2 knowledge graph API routes (ID-based endpoints)."""
 
+from datetime import datetime, timezone
+
 import pytest
 from httpx import AsyncClient
 
 from basic_memory.models import Project
+from basic_memory.models.knowledge import Entity
 from basic_memory.schemas import DeleteEntitiesResponse
 from basic_memory.schemas.v2 import EntityResponseV2, EntityResolveResponse
 
@@ -378,6 +381,79 @@ async def test_v2_endpoints_use_project_id_not_name(client: AsyncClient, test_pr
 
     # Should get 404 because name is not a valid project external_id
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_entities_for_dataview_skips_binary_files(
+    client: AsyncClient,
+    v2_project_url,
+    entity_repository,
+    file_service,
+):
+    """Regression: dataview endpoint must NOT spam ERROR logs on binary entities.
+
+    Before fix: reading a PDF/JPEG entity via file_service.read_file raised
+    UnicodeDecodeError that was logged at ERROR level inside
+    FileService.read_file's except-clause, spamming the log on every
+    read_note / build_context call (which iterates all entities for
+    Dataview enrichment).
+    """
+    from loguru import logger as loguru_logger
+
+    # Create a real binary file on disk + register entity in DB
+    pdf_path = file_service.base_path / "binary.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_bytes(b"%PDF-1.4\n%\xd3\xeb\xe9\xe1\nbinary content\xff\xfe\xfd")
+
+    binary_entity = await entity_repository.add(
+        Entity(
+            title="binary.pdf",
+            entity_type="file",
+            content_type="application/pdf",
+            file_path="binary.pdf",
+            checksum="deadbeef",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+
+    # Also create a markdown entity so we have at least one normal note
+    md_data = {
+        "title": "MarkdownNote",
+        "folder": "test",
+        "content": "# A note\n\nWith text body.",
+    }
+    md_response = await client.post(f"{v2_project_url}/knowledge/entities", json=md_data)
+    assert md_response.status_code == 200
+
+    # Capture loguru ERROR records during the dataview call
+    captured: list[str] = []
+
+    def sink(message):
+        record = message.record
+        if record["level"].name == "ERROR":
+            captured.append(record["message"])
+
+    handler_id = loguru_logger.add(sink, level="ERROR")
+    try:
+        # Hit the dataview endpoint that crashed in production
+        response = await client.get(f"{v2_project_url}/knowledge/entities/dataview")
+    finally:
+        loguru_logger.remove(handler_id)
+
+    assert response.status_code == 200
+    notes = response.json()
+
+    # Binary entity must appear in the listing (metadata is still useful)
+    paths = [n["file"]["path"] for n in notes]
+    assert "binary.pdf" in paths
+    assert binary_entity.id is not None
+
+    # No "File read error" log spam from FileService.read_file's except-clause
+    file_read_errors = [m for m in captured if "File read error" in m]
+    assert file_read_errors == [], (
+        f"Expected no File read errors during dataview enrichment, got: {file_read_errors}"
+    )
 
 
 @pytest.mark.asyncio

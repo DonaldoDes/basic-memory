@@ -4,6 +4,20 @@ class FileOperationError(Exception):
     pass
 
 
+class BinaryFileError(FileOperationError):
+    """Raised when a text-only file operation is attempted on a binary file.
+
+    Used by FileService.read_file / read_file_content to fail-fast on PDFs,
+    images, etc. instead of crashing with UnicodeDecodeError. Callers that
+    legitimately handle binary files (e.g. resource_router) should use
+    read_file_bytes, or catch this exception and skip the file.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        super().__init__(f"Refusing to read binary file as text: {path}")
+
+
 class EntityNotFoundError(Exception):
     """Raised when an entity cannot be found"""
 
