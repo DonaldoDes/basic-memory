@@ -1,3 +1,4 @@
+<!-- mcp-name: io.github.basicmachines-co/basic-memory -->
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![PyPI version](https://badge.fury.io/py/basic-memory.svg)](https://badge.fury.io/py/basic-memory)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
@@ -5,7 +6,6 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
-[![smithery badge](https://smithery.ai/badge/@basicmachines-co/basic-memory)](https://smithery.ai/server/@basicmachines-co/basic-memory)
 
 ## 🚀 Basic Memory Cloud is Live!
 
@@ -13,7 +13,7 @@
 - **Early Supporter Pricing:** Early users get 25% off forever. 
 The open source project continues as always. Cloud just makes it work everywhere.
 
-[Sign up now →](https://basicmemory.com/beta)
+[Sign up now →](https://basicmemory.com)
 
 with a 7 day free trial
 
@@ -23,8 +23,8 @@ Basic Memory lets you build persistent knowledge through natural conversations w
 Claude, while keeping everything in simple Markdown files on your computer. It uses the Model Context Protocol (MCP) to
 enable any compatible LLM to read and write to your local knowledge base.
 
-- Website: https://basicmachines.co
-- Documentation: https://memory.basicmachines.co
+- Website: https://basicmemory.com
+- Documentation: https://docs.basicmemory.com
 
 ## Pick up your conversation right where you left off
 
@@ -61,24 +61,6 @@ uv tool install basic-memory
 ```
 
 You can view shared context via files in `~/basic-memory` (default directory location).
-
-### Alternative Installation via Smithery
-
-You can use [Smithery](https://smithery.ai/server/@basicmachines-co/basic-memory) to automatically configure Basic
-Memory for Claude Desktop:
-
-```bash
-npx -y @smithery/cli install @basicmachines-co/basic-memory --client claude
-```
-
-This installs and configures Basic Memory without requiring manual edits to the Claude Desktop configuration file. The
-Smithery server hosts the MCP server component, while your data remains stored locally as Markdown files.
-
-### Glama.ai
-
-<a href="https://glama.ai/mcp/servers/o90kttu9ym">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/o90kttu9ym/badge" alt="basic-memory MCP server" />
-</a>
 
 ## Why Basic Memory?
 
@@ -425,7 +407,7 @@ canvas(nodes, edges, title, folder) - Generate knowledge visualizations
 
 ## Futher info
 
-See the [Documentation](https://memory.basicmachines.co/) for more info, including:
+See the [Documentation](https://docs.basicmemory.com) for more info, including:
 
 - [Complete User Guide](https://docs.basicmemory.com/user-guide/)
 - [CLI tools](https://docs.basicmemory.com/guides/cli-reference/)

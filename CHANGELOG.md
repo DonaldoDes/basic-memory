@@ -1,5 +1,75 @@
 # CHANGELOG
 
+## v0.17.9 (2026-01-24)
+
+### Bug Fixes
+
+- **#523**: Fix `remove_project()` checking stale config in cloud mode
+  ([`17c0e0a`](https://github.com/basicmachines-co/basic-memory/commit/17c0e0a))
+  - In cloud mode, only check database `is_default` field (source of truth)
+  - Config file can become stale when users set default project via v2 API
+
+## v0.17.8 (2026-01-24)
+
+### Bug Fixes
+
+- **#521**: Fix `get_default_project()` returning multiple results
+  ([`6888eff`](https://github.com/basicmachines-co/basic-memory/commit/6888eff))
+  - Query incorrectly matched any project with non-NULL `is_default` (both True and False)
+  - Now correctly checks for `is_default=True` only
+
+## v0.17.7 (2026-01-24)
+
+### Features
+
+- **#476**: Add SPEC-29 Phase 3 bucket snapshot CLI commands
+  ([`369ad37`](https://github.com/basicmachines-co/basic-memory/commit/369ad37))
+  - New `basic-memory cloud snapshot` commands for managing cloud snapshots
+  - Commands: `create`, `list`, `delete`, `show`, `browse`
+
+- **#515**: Add MCP registry publication files
+  ([`7a502e6`](https://github.com/basicmachines-co/basic-memory/commit/7a502e6))
+
+### Bug Fixes
+
+- **#520**: Read default project from database in cloud mode
+  ([`38616c3`](https://github.com/basicmachines-co/basic-memory/commit/38616c3))
+
+- **#513**: Ensure external_id is set on entity creation
+  ([`c7835a9`](https://github.com/basicmachines-co/basic-memory/commit/c7835a9))
+
+### Internal
+
+- **#514**: Remove OpenPanel telemetry
+  ([`85835ae`](https://github.com/basicmachines-co/basic-memory/commit/85835ae))
+
+- Update README links to point to basicmemory.com
+  ([`2aaee73`](https://github.com/basicmachines-co/basic-memory/commit/2aaee73))
+
+## v0.17.6 (2026-01-17)
+
+### Bug Fixes
+
+- **#510**: Fix Docker container Python symlink broken at runtime
+  ([`1799c94`](https://github.com/basicmachines-co/basic-memory/commit/1799c94))
+
+### Internal
+
+- Remove logfire config and specs docs, reduce lifespan and sync logging to debug level
+  ([`d1d433d`](https://github.com/basicmachines-co/basic-memory/commit/d1d433d),
+  [`803f3ef`](https://github.com/basicmachines-co/basic-memory/commit/803f3ef))
+
+## v0.17.5 (2026-01-11)
+
+### Bug Fixes
+
+- **#505**: Prevent CLI commands from hanging on exit (Python 3.14 compatibility)
+  ([`863e0a4`](https://github.com/basicmachines-co/basic-memory/commit/863e0a4))
+  - Skip `nest_asyncio` on Python 3.14+ where it causes event loop issues
+  - Simplify CLI test infrastructure for cross-version compatibility
+  - Update pyright to 1.1.408 for Python 3.14 support
+  - Fix SQLAlchemy rowcount typing for Python 3.14
+
 ## v0.17.4 (2026-01-05)
 
 ### Bug Fixes

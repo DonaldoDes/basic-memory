@@ -204,9 +204,14 @@ release version:
     echo "📝 Updating version in __init__.py..."
     sed -i.bak "s/__version__ = \".*\"/__version__ = \"$VERSION_NUM\"/" src/basic_memory/__init__.py
     rm -f src/basic_memory/__init__.py.bak
-    
+
+    # Update version in server.json (MCP registry metadata)
+    echo "📝 Updating version in server.json..."
+    sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION_NUM\"/g" server.json
+    rm -f server.json.bak
+
     # Commit version update
-    git add src/basic_memory/__init__.py
+    git add src/basic_memory/__init__.py server.json
     git commit -m "chore: update version to $VERSION_NUM for {{version}} release"
     
     # Create and push tag
@@ -220,6 +225,12 @@ release version:
     echo "✅ Release {{version}} created successfully!"
     echo "📦 GitHub Actions will build and publish to PyPI"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
+    echo ""
+    echo "📝 REMINDER: Post-release tasks:"
+    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
+    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   3. MCP Registry - Run: mcp-publisher publish"
+    echo "   See: .claude/commands/release/release.md for detailed instructions"
 
 # Create a beta release (e.g., just beta v0.13.2b1)
 beta version:
@@ -264,9 +275,14 @@ beta version:
     echo "📝 Updating version in __init__.py..."
     sed -i.bak "s/__version__ = \".*\"/__version__ = \"$VERSION_NUM\"/" src/basic_memory/__init__.py
     rm -f src/basic_memory/__init__.py.bak
-    
+
+    # Update version in server.json (MCP registry metadata)
+    echo "📝 Updating version in server.json..."
+    sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION_NUM\"/g" server.json
+    rm -f server.json.bak
+
     # Commit version update
-    git add src/basic_memory/__init__.py
+    git add src/basic_memory/__init__.py server.json
     git commit -m "chore: update version to $VERSION_NUM for {{version}} beta release"
     
     # Create and push tag
@@ -281,6 +297,11 @@ beta version:
     echo "📦 GitHub Actions will build and publish to PyPI as pre-release"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
     echo "📥 Install with: uv tool install basic-memory --pre"
+    echo ""
+    echo "📝 REMINDER: For stable releases, update documentation sites:"
+    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
+    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   See: .claude/commands/release/release.md for detailed instructions"
 
 # List all available recipes
 default:

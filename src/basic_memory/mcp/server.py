@@ -28,7 +28,7 @@ async def lifespan(app: FastMCP):
     container = McpContainer.create()
     set_container(container)
 
-    logger.info(f"Starting Basic Memory MCP server (mode={container.mode.name})")
+    logger.debug(f"Starting Basic Memory MCP server (mode={container.mode.name})")
 
     # Show telemetry notice (first run only) and track startup
     show_notice_if_needed()
@@ -50,13 +50,13 @@ async def lifespan(app: FastMCP):
         yield
     finally:
         # Shutdown - coordinator handles clean task cancellation
-        logger.info("Shutting down Basic Memory MCP server")
+        logger.debug("Shutting down Basic Memory MCP server")
         await sync_coordinator.stop()
 
         # Only shutdown DB if we created it (not if test fixture provided it)
         if engine_was_none:
             await db.shutdown_db()
-            logger.info("Database connections closed")
+            logger.debug("Database connections closed")
         else:  # pragma: no cover
             logger.debug("Skipping DB shutdown - engine provided externally")
 

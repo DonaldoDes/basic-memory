@@ -78,7 +78,7 @@ class SyncCoordinator:
         """
         if not self.should_sync:
             if self.skip_reason:
-                logger.info(f"{self.skip_reason} - skipping local file sync")
+                logger.debug(f"{self.skip_reason} - skipping local file sync")
             self._status = SyncStatus.STOPPED
             return
 

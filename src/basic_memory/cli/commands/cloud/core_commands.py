@@ -140,7 +140,6 @@ def status() -> None:
 def setup() -> None:
     """Set up cloud sync by installing rclone and configuring credentials.
 
-    SPEC-20: Simplified to project-scoped workflow.
     After setup, use project commands for syncing:
       bm project add <name> <path> --local-path ~/projects/<name>
       bm project bisync --name <name> --resync  # First time
