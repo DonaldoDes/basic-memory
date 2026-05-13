@@ -1,10 +1,12 @@
 """Tests for file operations service."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from basic_memory.services.exceptions import FileOperationError
+from basic_memory.models.knowledge import Entity
+from basic_memory.services.exceptions import BinaryFileError, FileOperationError
 from basic_memory.services.file_service import FileService
 
 
@@ -196,7 +198,10 @@ async def test_read_file_content_raises_file_operation_error_for_directory(
     tmp_path: Path, file_service: FileService
 ):
     """read_file_content should wrap non-FileNotFound errors in FileOperationError."""
-    dir_path = tmp_path / "not-a-file"
+    # Use a .md "file path" that is actually a directory to exercise the
+    # IsADirectoryError branch (a non-.md path now triggers BinaryFileError
+    # before reaching the open() call).
+    dir_path = tmp_path / "not-a-file.md"
     dir_path.mkdir()
 
     with pytest.raises(FileOperationError) as exc_info:
@@ -254,3 +259,103 @@ async def test_read_file_bytes_text_file(tmp_path: Path, file_service: FileServi
 
     content = await file_service.read_file_bytes(test_path)
     assert content == text_content.encode("utf-8")
+
+
+# -----------------------------------------------------------------------------
+# Binary file handling (regression: UnicodeDecodeError on PDF/image entities)
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_entity_content_skips_binary_file(
+    tmp_path: Path, file_service: FileService, test_project
+):
+    """read_entity_content must NOT crash on a binary entity (type='file').
+
+    Regression: previously decoded PDF/JPEG bytes as UTF-8 and raised
+    UnicodeDecodeError. Now returns empty string for non-markdown entities.
+    """
+    pdf_path = file_service.base_path / "fixture.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    # Real PDF header followed by non-UTF8 bytes (mimics actual PDFs)
+    pdf_path.write_bytes(b"%PDF-1.4\n%\xd3\xeb\xe9\xe1\nbinary content\xff\xfe\xfd")
+
+    entity = Entity(
+        title="fixture.pdf",
+        entity_type="file",
+        content_type="application/pdf",
+        file_path="fixture.pdf",
+        project_id=test_project.id,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    content = await file_service.read_entity_content(entity)
+
+    assert content == ""
+
+
+@pytest.mark.asyncio
+async def test_read_entity_content_markdown_still_works(
+    tmp_path: Path, file_service: FileService, test_project
+):
+    """read_entity_content must still return content for markdown entities."""
+    md_path = file_service.base_path / "note.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text("# Title\n\nbody text\n", encoding="utf-8")
+
+    entity = Entity(
+        title="note",
+        entity_type="note",
+        content_type="text/markdown",
+        file_path="note.md",
+        project_id=test_project.id,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    content = await file_service.read_entity_content(entity)
+
+    assert "body text" in content
+
+
+@pytest.mark.asyncio
+async def test_read_file_content_raises_binary_file_error(
+    tmp_path: Path, file_service: FileService
+):
+    """read_file_content must raise BinaryFileError for non-markdown paths.
+
+    This forces callers (entity_service, knowledge_router dataview, sync) to
+    explicitly handle binary files instead of crashing on UTF-8 decode.
+    """
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%\xd3\xeb\xe9\xe1\n")
+
+    with pytest.raises(BinaryFileError) as exc_info:
+        await file_service.read_file_content(pdf_path)
+
+    assert "doc.pdf" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_read_file_raises_binary_file_error(tmp_path: Path, file_service: FileService):
+    """read_file must raise BinaryFileError for non-markdown paths."""
+    img_path = tmp_path / "image.jpeg"
+    img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00")
+
+    with pytest.raises(BinaryFileError) as exc_info:
+        await file_service.read_file(img_path)
+
+    assert "image.jpeg" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_read_file_content_markdown_unchanged(
+    tmp_path: Path, file_service: FileService
+):
+    """read_file_content on markdown files keeps its existing behaviour."""
+    md_path = tmp_path / "ok.md"
+    md_path.write_text("hello", encoding="utf-8")
+
+    content = await file_service.read_file_content(md_path)
+    assert content == "hello"

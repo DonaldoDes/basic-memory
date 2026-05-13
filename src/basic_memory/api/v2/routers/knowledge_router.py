@@ -33,6 +33,7 @@ from basic_memory.schemas.v2 import (
     EntityResponseV2,
     MoveEntityRequestV2,
 )
+from basic_memory.services.exceptions import BinaryFileError
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge-v2"])
 
@@ -197,6 +198,13 @@ async def list_entities_for_dataview(
                 for key, value in post.metadata.items():
                     if key not in note:
                         note[key] = value
+        except BinaryFileError:
+            # Non-markdown files (PDF, images, …) have no frontmatter to read.
+            # Skip silently — entity metadata from DB is still included above.
+            logger.debug(
+                f"Skipping frontmatter load for binary entity {entity.permalink} "
+                f"(file_path={entity.file_path})"
+            )
         except Exception as ex:
             logger.debug(f"Could not load frontmatter for {entity.permalink}: {ex}")
 
