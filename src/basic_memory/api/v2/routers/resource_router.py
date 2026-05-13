@@ -15,6 +15,7 @@ from pathlib import Path as PathLib
 from fastapi import APIRouter, HTTPException, Response, Path
 from loguru import logger
 
+import logfire
 from basic_memory.deps import (
     ProjectConfigV2ExternalDep,
     FileServiceV2ExternalDep,
@@ -55,36 +56,62 @@ async def get_resource_content(
     Raises:
         HTTPException: 404 if entity or file not found
     """
-    logger.debug(f"V2 Getting content for project {project_id}, entity_id: {entity_id}")
+    with logfire.span(
+        "api.request.resource.get_content",
+        entrypoint="api",
+        domain="resource",
+        action="get_content",
+    ):
+        logger.debug(f"V2 Getting content for project {project_id}, entity_id: {entity_id}")
 
-    # Get entity by external_id
-    entity = await entity_repository.get_by_external_id(entity_id)
-    if not entity:
-        raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+        with logfire.span(
+            "api.resource.get_content.load_entity",
+            domain="resource",
+            action="get_content",
+            phase="load_entity",
+        ):
+            entity = await entity_repository.get_by_external_id(entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
 
-    # Validate entity file path to prevent path traversal
-    project_path = PathLib(config.home)
-    if not validate_project_path(entity.file_path, project_path):
-        logger.error(  # pragma: no cover
-            f"Invalid file path in entity {entity.id}: {entity.file_path}"
-        )
-        raise HTTPException(  # pragma: no cover
-            status_code=500,
-            detail="Entity contains invalid file path",
-        )
+        with logfire.span(
+            "api.resource.get_content.validate_path",
+            domain="resource",
+            action="get_content",
+            phase="validate_path",
+        ):
+            project_path = PathLib(config.home)
+            if not validate_project_path(entity.file_path, project_path):
+                logger.error(  # pragma: no cover
+                    f"Invalid file path in entity {entity.id}: {entity.file_path}"
+                )
+                raise HTTPException(  # pragma: no cover
+                    status_code=500,
+                    detail="Entity contains invalid file path",
+                )
 
-    # Check file exists via file_service (for cloud compatibility)
-    if not await file_service.exists(entity.file_path):
-        raise HTTPException(  # pragma: no cover
-            status_code=404,
-            detail=f"File not found: {entity.file_path}",
-        )
+        with logfire.span(
+            "api.resource.get_content.ensure_exists",
+            domain="resource",
+            action="get_content",
+            phase="ensure_exists",
+        ):
+            if not await file_service.exists(entity.file_path):
+                raise HTTPException(  # pragma: no cover
+                    status_code=404,
+                    detail=f"File not found: {entity.file_path}",
+                )
 
-    # Read content via file_service as bytes (works with both local and S3)
-    content = await file_service.read_file_bytes(entity.file_path)
-    content_type = file_service.content_type(entity.file_path)
+        with logfire.span(
+            "api.resource.get_content.read_content",
+            domain="resource",
+            action="get_content",
+            phase="read_content",
+        ):
+            content = await file_service.read_file_bytes(entity.file_path)
+            content_type = file_service.content_type(entity.file_path)
 
-    return Response(content=content, media_type=content_type)
+        return Response(content=content, media_type=content_type)
 
 
 @router.post("", response_model=ResourceResponse)
@@ -112,74 +139,94 @@ async def create_resource(
     Raises:
         HTTPException: 400 for invalid file paths, 409 if file already exists
     """
-    try:
-        # Validate path to prevent path traversal attacks
-        project_path = PathLib(config.home)
-        if not validate_project_path(data.file_path, project_path):
-            logger.warning(
-                f"Invalid file path attempted: {data.file_path} in project {config.name}"
+    with logfire.span(
+        "api.request.resource.create",
+        entrypoint="api",
+        domain="resource",
+        action="create",
+    ):
+        try:
+            # Validate path to prevent path traversal attacks
+            project_path = PathLib(config.home)
+            if not validate_project_path(data.file_path, project_path):
+                logger.warning(
+                    f"Invalid file path attempted: {data.file_path} in project {config.name}"
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file path: {data.file_path}. "
+                    "Path must be relative and stay within project boundaries.",
+                )
+
+            existing_entity = await entity_repository.get_by_file_path(data.file_path)
+            if existing_entity:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Resource already exists at {data.file_path} with entity_id {existing_entity.external_id}. "
+                    f"Use PUT /resource/{existing_entity.external_id} to update it.",
+                )
+
+            with logfire.span(
+                "api.resource.create.write_file",
+                domain="resource",
+                action="create",
+                phase="write_file",
+            ):
+                await file_service.ensure_directory(PathLib(data.file_path).parent)
+                checksum = await file_service.write_file(data.file_path, data.content)
+
+            with logfire.span(
+                "api.resource.create.read_metadata",
+                domain="resource",
+                action="create",
+                phase="read_metadata",
+            ):
+                file_metadata = await file_service.get_file_metadata(data.file_path)
+
+            file_name = PathLib(data.file_path).name
+            content_type = file_service.content_type(data.file_path)
+            note_type = "canvas" if data.file_path.endswith(".canvas") else "file"
+
+            entity = EntityModel(
+                external_id=str(uuid.uuid4()),
+                title=file_name,
+                note_type=note_type,
+                content_type=content_type,
+                file_path=data.file_path,
+                checksum=checksum,
+                created_at=file_metadata.created_at,
+                updated_at=file_metadata.modified_at,
             )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid file path: {data.file_path}. "
-                "Path must be relative and stay within project boundaries.",
+            with logfire.span(
+                "api.resource.create.upsert_entity",
+                domain="resource",
+                action="create",
+                phase="upsert_entity",
+            ):
+                entity = await entity_repository.add(entity)
+
+            with logfire.span(
+                "api.resource.create.search_index",
+                domain="resource",
+                action="create",
+                phase="search_index",
+            ):
+                await search_service.index_entity(entity)
+
+            return ResourceResponse(
+                entity_id=entity.id,
+                external_id=entity.external_id,
+                file_path=data.file_path,
+                checksum=checksum,
+                size=file_metadata.size,
+                created_at=file_metadata.created_at.timestamp(),
+                modified_at=file_metadata.modified_at.timestamp(),
             )
-
-        # Check if entity already exists
-        existing_entity = await entity_repository.get_by_file_path(data.file_path)
-        if existing_entity:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Resource already exists at {data.file_path} with entity_id {existing_entity.external_id}. "
-                f"Use PUT /resource/{existing_entity.external_id} to update it.",
-            )
-
-        # Cloud compatibility: avoid assuming a local filesystem path.
-        # Delegate directory creation + writes to FileService (local or S3).
-        await file_service.ensure_directory(PathLib(data.file_path).parent)
-        checksum = await file_service.write_file(data.file_path, data.content)
-
-        # Get file info
-        file_metadata = await file_service.get_file_metadata(data.file_path)
-
-        # Determine file details
-        file_name = PathLib(data.file_path).name
-        content_type = file_service.content_type(data.file_path)
-        entity_type = "canvas" if data.file_path.endswith(".canvas") else "file"
-
-        # Create a new entity model
-        # Explicitly set external_id to ensure NOT NULL constraint is satisfied (fixes #512)
-        entity = EntityModel(
-            external_id=str(uuid.uuid4()),
-            title=file_name,
-            entity_type=entity_type,
-            content_type=content_type,
-            file_path=data.file_path,
-            checksum=checksum,
-            created_at=file_metadata.created_at,
-            updated_at=file_metadata.modified_at,
-        )
-        entity = await entity_repository.add(entity)
-
-        # Index the file for search
-        await search_service.index_entity(entity)  # pyright: ignore
-
-        # Return success response
-        return ResourceResponse(
-            entity_id=entity.id,
-            external_id=entity.external_id,
-            file_path=data.file_path,
-            checksum=checksum,
-            size=file_metadata.size,
-            created_at=file_metadata.created_at.timestamp(),
-            modified_at=file_metadata.modified_at.timestamp(),
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions without wrapping
-        raise
-    except Exception as e:  # pragma: no cover
-        logger.error(f"Error creating resource {data.file_path}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create resource: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:  # pragma: no cover
+            logger.error(f"Error creating resource {data.file_path}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create resource: {str(e)}")
 
 
 @router.put("/{entity_id}", response_model=ResourceResponse)
@@ -211,79 +258,96 @@ async def update_resource(
     Raises:
         HTTPException: 404 if entity not found, 400 for invalid paths
     """
-    try:
-        # Get existing entity by external_id
-        entity = await entity_repository.get_by_external_id(entity_id)
-        if not entity:
-            raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    with logfire.span(
+        "api.request.resource.update",
+        entrypoint="api",
+        domain="resource",
+        action="update",
+    ):
+        try:
+            entity = await entity_repository.get_by_external_id(entity_id)
+            if not entity:
+                raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
 
-        # Determine target file path
-        target_file_path = data.file_path if data.file_path else entity.file_path
+            target_file_path = data.file_path if data.file_path else entity.file_path
 
-        # Validate path to prevent path traversal attacks
-        project_path = PathLib(config.home)
-        if not validate_project_path(target_file_path, project_path):
-            logger.warning(
-                f"Invalid file path attempted: {target_file_path} in project {config.name}"
+            project_path = PathLib(config.home)
+            if not validate_project_path(target_file_path, project_path):
+                logger.warning(
+                    f"Invalid file path attempted: {target_file_path} in project {config.name}"
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file path: {target_file_path}. "
+                    "Path must be relative and stay within project boundaries.",
+                )
+
+            with logfire.span(
+                "api.resource.update.write_file",
+                domain="resource",
+                action="update",
+                phase="write_file",
+            ):
+                if data.file_path and data.file_path != entity.file_path:
+                    await file_service.ensure_directory(PathLib(target_file_path).parent)
+                    if await file_service.exists(entity.file_path):
+                        await file_service.delete_file(entity.file_path)
+                else:
+                    await file_service.ensure_directory(PathLib(target_file_path).parent)
+
+                checksum = await file_service.write_file(target_file_path, data.content)
+
+            with logfire.span(
+                "api.resource.update.read_metadata",
+                domain="resource",
+                action="update",
+                phase="read_metadata",
+            ):
+                file_metadata = await file_service.get_file_metadata(target_file_path)
+
+            file_name = PathLib(target_file_path).name
+            content_type = file_service.content_type(target_file_path)
+            note_type = "canvas" if target_file_path.endswith(".canvas") else "file"
+
+            with logfire.span(
+                "api.resource.update.update_entity",
+                domain="resource",
+                action="update",
+                phase="update_entity",
+            ):
+                updated_entity = await entity_repository.update(
+                    entity.id,
+                    {
+                        "title": file_name,
+                        "note_type": note_type,
+                        "content_type": content_type,
+                        "file_path": target_file_path,
+                        "checksum": checksum,
+                        "updated_at": file_metadata.modified_at,
+                    },
+                )
+            if updated_entity is None:
+                raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+
+            with logfire.span(
+                "api.resource.update.search_index",
+                domain="resource",
+                action="update",
+                phase="search_index",
+            ):
+                await search_service.index_entity(updated_entity)
+
+            return ResourceResponse(
+                entity_id=entity.id,
+                external_id=entity.external_id,
+                file_path=target_file_path,
+                checksum=checksum,
+                size=file_metadata.size,
+                created_at=file_metadata.created_at.timestamp(),
+                modified_at=file_metadata.modified_at.timestamp(),
             )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid file path: {target_file_path}. "
-                "Path must be relative and stay within project boundaries.",
-            )
-
-        # If moving file, handle the move
-        if data.file_path and data.file_path != entity.file_path:
-            # Ensure new parent directory exists (no-op for S3)
-            await file_service.ensure_directory(PathLib(target_file_path).parent)
-
-            # If old file exists, remove it via file_service (for cloud compatibility)
-            if await file_service.exists(entity.file_path):
-                await file_service.delete_file(entity.file_path)
-        else:
-            # Ensure directory exists for in-place update
-            await file_service.ensure_directory(PathLib(target_file_path).parent)
-
-        # Write content to target file
-        checksum = await file_service.write_file(target_file_path, data.content)
-
-        # Get file info
-        file_metadata = await file_service.get_file_metadata(target_file_path)
-
-        # Determine file details
-        file_name = PathLib(target_file_path).name
-        content_type = file_service.content_type(target_file_path)
-        entity_type = "canvas" if target_file_path.endswith(".canvas") else "file"
-
-        # Update entity using internal ID
-        updated_entity = await entity_repository.update(
-            entity.id,
-            {
-                "title": file_name,
-                "entity_type": entity_type,
-                "content_type": content_type,
-                "file_path": target_file_path,
-                "checksum": checksum,
-                "updated_at": file_metadata.modified_at,
-            },
-        )
-
-        # Index the updated file for search
-        await search_service.index_entity(updated_entity)  # pyright: ignore
-
-        # Return success response
-        return ResourceResponse(
-            entity_id=entity.id,
-            external_id=entity.external_id,
-            file_path=target_file_path,
-            checksum=checksum,
-            size=file_metadata.size,
-            created_at=file_metadata.created_at.timestamp(),
-            modified_at=file_metadata.modified_at.timestamp(),
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions without wrapping
-        raise
-    except Exception as e:  # pragma: no cover
-        logger.error(f"Error updating resource {entity_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to update resource: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:  # pragma: no cover
+            logger.error(f"Error updating resource {entity_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to update resource: {str(e)}")

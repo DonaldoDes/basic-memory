@@ -3,12 +3,14 @@
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from watchfiles import Change
 
+from basic_memory.config import BasicMemoryConfig, ProjectMode, WATCH_STATUS_JSON
 from basic_memory.models.project import Project
-from basic_memory.sync.watch_service import WatchServiceState
+from basic_memory.sync.watch_service import WatchService, WatchServiceState
 
 
 async def create_test_file(path: Path, content: str = "test content") -> None:
@@ -23,6 +25,123 @@ async def create_test_file(path: Path, content: str = "test content") -> None:
 def test_watch_service_init(watch_service, project_config):
     """Test watch service initialization."""
     assert watch_service.status_path.parent.exists()
+
+
+def test_watch_service_status_path_honors_basic_memory_config_dir(tmp_path, monkeypatch):
+    """Regression guard for #742: watch-status.json follows BASIC_MEMORY_CONFIG_DIR.
+
+    WatchService previously hardcoded ``Path.home() / ".basic-memory"`` which
+    split state across instances running under an isolated config dir. Ensure
+    the status path now lives under the configured data dir.
+    """
+    custom_dir = tmp_path / "instance-z" / "state"
+    monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", str(custom_dir))
+
+    app_config = BasicMemoryConfig(projects={"main": {"path": str(tmp_path / "project")}})
+    service = WatchService(app_config=app_config, project_repository=MagicMock())
+
+    assert service.status_path == custom_dir / WATCH_STATUS_JSON
+    assert service.status_path.parent.exists()
+
+
+async def _register_local_projects(
+    app_config: BasicMemoryConfig, project_repository, specs
+) -> None:
+    """Register projects as local in both the DB and app_config.
+
+    Projects that aren't present in ``app_config.projects`` are treated as
+    cloud-only by ``get_project_mode`` and get filtered out of the watch
+    cycle, so tests that exercise ``_select_projects_to_watch`` need them
+    added to both sides.
+    """
+    from basic_memory.config import ProjectEntry
+
+    for spec in specs:
+        await project_repository.create(
+            {
+                "name": spec["name"],
+                "description": spec["name"],
+                "path": spec["path"],
+                "is_active": True,
+                "is_default": False,
+            }
+        )
+        app_config.projects[spec["name"]] = ProjectEntry(path=spec["path"], mode=ProjectMode.LOCAL)
+
+
+@pytest.mark.asyncio
+async def test_select_projects_to_watch_returns_all_when_unconstrained(
+    app_config: BasicMemoryConfig, project_repository
+):
+    """Without a --project constraint, every active project is watched."""
+    await _register_local_projects(
+        app_config,
+        project_repository,
+        [
+            {"name": "project-alpha", "path": "/tmp/alpha"},
+            {"name": "project-beta", "path": "/tmp/beta"},
+        ],
+    )
+
+    service = WatchService(app_config=app_config, project_repository=project_repository)
+
+    projects = await service._select_projects_to_watch()
+    names = {p.name for p in projects}
+
+    assert "project-alpha" in names
+    assert "project-beta" in names
+
+
+@pytest.mark.asyncio
+async def test_select_projects_to_watch_filters_to_constrained_project(
+    app_config: BasicMemoryConfig, project_repository
+):
+    """With ``constrained_project`` set, only that project is returned.
+
+    Regression: multiple ``basic-memory mcp --project X`` processes each spawned
+    a watch service over every project, producing duplicate change handlers
+    that raced on file writes and cascaded deletes.
+    """
+    await _register_local_projects(
+        app_config,
+        project_repository,
+        [
+            {"name": "project-alpha", "path": "/tmp/alpha"},
+            {"name": "project-beta", "path": "/tmp/beta"},
+        ],
+    )
+
+    service = WatchService(
+        app_config=app_config,
+        project_repository=project_repository,
+        constrained_project="project-beta",
+    )
+
+    projects = await service._select_projects_to_watch()
+
+    assert [p.name for p in projects] == ["project-beta"]
+
+
+@pytest.mark.asyncio
+async def test_select_projects_to_watch_empty_when_constrained_project_missing(
+    app_config: BasicMemoryConfig, project_repository
+):
+    """An unknown constraint yields an empty watch set rather than watching everything."""
+    await _register_local_projects(
+        app_config,
+        project_repository,
+        [{"name": "project-alpha", "path": "/tmp/alpha"}],
+    )
+
+    service = WatchService(
+        app_config=app_config,
+        project_repository=project_repository,
+        constrained_project="does-not-exist",
+    )
+
+    projects = await service._select_projects_to_watch()
+
+    assert projects == []
 
 
 def test_state_add_event():
@@ -494,7 +613,9 @@ async def test_handle_changes_skips_deleted_project(
 
     # Also add to config
     config = project_service.config_manager.load_config()
-    config.projects["other-project"] = other_project_path
+    from basic_memory.config import ProjectEntry
+
+    config.projects["other-project"] = ProjectEntry(path=other_project_path)
     config.default_project = "other-project"
     project_service.config_manager.save_config(config)
 

@@ -1,6 +1,6 @@
 """Base repository implementation."""
 
-from typing import Type, Optional, Any, Sequence, TypeVar, List, Dict
+from typing import Type, Optional, Any, Sequence, TypeVar, List, Dict, cast
 
 
 from loguru import logger
@@ -13,7 +13,9 @@ from sqlalchemy import (
     Result,
     and_,
     delete,
+    update as sqlalchemy_update,
 )
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from sqlalchemy.orm.interfaces import LoaderOption
@@ -138,6 +140,20 @@ class Repository[T: Base]:
 
             # Query within same session
             return await self.select_by_ids(session, [m.id for m in models])  # pyright: ignore [reportAttributeAccessIssue]
+
+    async def add_all_no_return(self, models: List[T]) -> int:
+        """Insert models without reloading them afterward."""
+        if not models:
+            return 0
+
+        async with db.scoped_session(self.session_maker) as session:
+            for model in models:
+                self._set_project_id_if_needed(model)
+
+            session.add_all(models)
+            await session.flush()
+            logger.debug(f"Added {len(models)} {self.Model.__name__} records")
+            return len(models)
 
     def select(self, *entities: Any) -> Select:
         """Create a new SELECT statement.
@@ -267,7 +283,7 @@ class Repository[T: Base]:
 
             return await self.select_by_ids(session, [model.id for model in model_list])  # pyright: ignore [reportAttributeAccessIssue]
 
-    async def update(self, entity_id: int, entity_data: dict | T) -> Optional[T]:
+    async def update(self, entity_id: int, entity_data: dict[str, Any] | T) -> Optional[T]:
         """Update an entity with the given data."""
         logger.debug(f"Updating {self.Model.__name__} {entity_id} with data: {entity_data}")
         async with db.scoped_session(self.session_maker) as session:
@@ -278,12 +294,13 @@ class Repository[T: Base]:
                 entity = result.scalars().one()
 
                 if isinstance(entity_data, dict):
-                    for key, value in entity_data.items():
-                        if key in self.valid_columns:
-                            setattr(entity, key, value)
+                    update_data = cast(dict[str, Any], entity_data)
+                    for key in self.valid_columns:
+                        if key in update_data:
+                            setattr(entity, key, update_data[key])
 
                 elif isinstance(entity_data, self.Model):
-                    for column in self.Model.__table__.columns.keys():
+                    for column in self.valid_columns:
                         setattr(entity, column, getattr(entity_data, column))
 
                 await session.flush()  # Make sure changes are flushed
@@ -295,6 +312,25 @@ class Repository[T: Base]:
             except NoResultFound:
                 logger.debug(f"No {self.Model.__name__} found to update: {entity_id}")
                 return None
+
+    async def update_fields(self, entity_id: Any, entity_data: dict[str, Any]) -> bool:
+        """Update columns without reloading the model graph afterward."""
+        update_data = {k: v for k, v in entity_data.items() if k in self.valid_columns}
+        if not update_data:
+            return True
+
+        async with db.scoped_session(self.session_maker) as session:
+            conditions = [self.primary_key == entity_id]
+            if self.has_project_id and self.project_id is not None:
+                conditions.append(getattr(self.Model, "project_id") == self.project_id)
+
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    sqlalchemy_update(self.Model).where(and_(*conditions)).values(**update_data)
+                ),
+            )
+            return result.rowcount > 0
 
     async def delete(self, entity_id: int) -> bool:
         """Delete an entity from the database."""
@@ -324,7 +360,7 @@ class Repository[T: Base]:
                 conditions.append(getattr(self.Model, "project_id") == self.project_id)
 
             query = delete(self.Model).where(and_(*conditions))
-            result = await session.execute(query)
+            result = cast(CursorResult[Any], await session.execute(query))
             logger.debug(f"Deleted {result.rowcount} records")
             return result.rowcount
 
@@ -339,7 +375,7 @@ class Repository[T: Base]:
                 conditions.append(getattr(self.Model, "project_id") == self.project_id)
 
             query = delete(self.Model).where(and_(*conditions))
-            result = await session.execute(query)
+            result = cast(CursorResult[Any], await session.execute(query))
             deleted = result.rowcount > 0
             logger.debug(f"Deleted {result.rowcount} records")
             return deleted

@@ -1,24 +1,38 @@
 """List directory tool for Basic Memory MCP server."""
 
-from typing import Optional
+from typing import Annotated, Optional
 
 from loguru import logger
 from fastmcp import Context
+from pydantic import AliasChoices, Field
 
-from basic_memory.mcp.async_client import get_client
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory.mcp.project_context import get_project_client
 from basic_memory.mcp.server import mcp
-from basic_memory.telemetry import track_mcp_tool
 
 
 @mcp.tool(
     description="List directory contents with filtering and depth control.",
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def list_directory(
-    dir_name: str = "/",
+    # `dir_name` is unusual; models reach for directory/folder/path/dir.
+    dir_name: Annotated[
+        str,
+        Field(
+            default="/",
+            validation_alias=AliasChoices("dir_name", "directory", "folder", "path", "dir"),
+        ),
+    ] = "/",
     depth: int = 1,
-    file_name_glob: Optional[str] = None,
+    file_name_glob: Annotated[
+        Optional[str],
+        Field(
+            default=None,
+            validation_alias=AliasChoices("file_name_glob", "glob", "pattern", "filter"),
+        ),
+    ] = None,
     project: Optional[str] = None,
+    project_id: Optional[str] = None,
     context: Context | None = None,
 ) -> str:
     """List directory contents from the knowledge base with optional filtering.
@@ -36,6 +50,9 @@ async def list_directory(
                        Examples: "*.md", "*meeting*", "project_*"
         project: Project name to list directory from. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -63,10 +80,10 @@ async def list_directory(
     Raises:
         ToolError: If project doesn't exist or directory path is invalid
     """
-    track_mcp_tool("list_directory")
-    async with get_client() as client:
-        active_project = await get_active_project(client, project, context)
-
+    async with get_project_client(project, context=context, project_id=project_id) as (
+        client,
+        active_project,
+    ):
         logger.debug(
             f"Listing directory '{dir_name}' in project {project} with depth={depth}, glob='{file_name_glob}'"
         )

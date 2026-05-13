@@ -1,6 +1,7 @@
 """Tests for the MCP server implementation using FastAPI TestClient."""
 
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -16,17 +17,27 @@ from basic_memory.mcp.server import mcp as mcp_server
 
 @pytest.fixture(scope="function")
 def mcp() -> FastMCP:
-    return mcp_server  # pyright: ignore [reportReturnType]
+    return cast(Any, mcp_server)
 
 
 @pytest.fixture(scope="function")
-def app(app_config, project_config, engine_factory, config_manager) -> FastAPI:
+def app(
+    app_config, project_config, engine_factory, config_manager
+) -> Generator[FastAPI, None, None]:
     """Create test FastAPI application."""
     app = fastapi_app
+    previous_overrides = dict(app.dependency_overrides)
     app.dependency_overrides[get_app_config] = lambda: app_config
     app.dependency_overrides[get_project_config] = lambda: project_config
     app.dependency_overrides[get_engine_factory] = lambda: engine_factory
-    return app
+    try:
+        yield app
+    finally:
+        # Trigger: the FastAPI app is a module-level singleton shared across tests.
+        # Why: stale dependency overrides can hold onto a disposed per-test engine
+        # and reopen SQLite connections during later unrelated tests.
+        # Outcome: restore the shared app's override table after each MCP test.
+        app.dependency_overrides = previous_overrides
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -43,7 +54,7 @@ def test_entity_data():
         "entities": [
             {
                 "title": "Test Entity",
-                "entity_type": "test",
+                "note_type": "test",
                 "summary": "",  # Empty string instead of None
             }
         ]

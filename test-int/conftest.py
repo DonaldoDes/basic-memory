@@ -51,19 +51,30 @@ The `app` fixture ensures FastAPI dependency overrides are active, and
 """
 
 import os
-from typing import AsyncGenerator, Literal
+from typing import AsyncGenerator, Generator, Literal
 
 import pytest
 import pytest_asyncio
 from pathlib import Path
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import NullPool
 from testcontainers.postgres import PostgresContainer
 
 from httpx import AsyncClient, ASGITransport
 
-from basic_memory.config import BasicMemoryConfig, ProjectConfig, ConfigManager, DatabaseBackend
+from basic_memory.config import (
+    BasicMemoryConfig,
+    ProjectConfig,
+    ProjectEntry,
+    ConfigManager,
+    DatabaseBackend,
+)
 from basic_memory.db import engine_session_factory, DatabaseType
 from basic_memory.models import Project
 from basic_memory.models.base import Base
@@ -103,12 +114,126 @@ def postgres_container(db_backend):
     Uses testcontainers to spin up a real Postgres instance.
     Only starts if db_backend is "postgres".
     """
+    if db_backend != "postgres" or _configured_postgres_sync_url():
+        yield None
+        return
+
+    # Use pgvector image so CREATE EXTENSION vector succeeds in search repository
+    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
+        yield postgres
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def cleanup_global_db_after_test() -> AsyncGenerator[None, None]:
+    """Close any module-level DB engine created outside fixture ownership."""
+    yield
+
+    # Trigger: integration tests invoke CLI/MCP routes through the production
+    # client fallback, bypassing this file's engine_factory fixture.
+    # Why: those fallback engines live in basic_memory.db module state and can
+    # otherwise leave a non-daemon aiosqlite worker alive after pytest finishes.
+    # Outcome: every test boundary becomes a cleanup point for fallback engines.
+    from basic_memory import db
+
+    await db.shutdown_db()
+
+
+@pytest.fixture(autouse=True)
+def clean_routing_env(monkeypatch) -> None:
+    """Keep CLI routing env mutations from leaking between integration tests."""
+    # Trigger: CLI integration tests exercise long-running MCP entrypoints that set routing env.
+    # Why: those commands normally own the process lifetime, but pytest keeps reusing it.
+    # Outcome: every integration test starts from neutral routing unless it opts in explicitly.
+    monkeypatch.delenv("BASIC_MEMORY_FORCE_LOCAL", raising=False)
+    monkeypatch.delenv("BASIC_MEMORY_FORCE_CLOUD", raising=False)
+    monkeypatch.delenv("BASIC_MEMORY_EXPLICIT_ROUTING", raising=False)
+
+
+POSTGRES_EPHEMERAL_TABLES = [
+    "search_vector_embeddings",
+    "search_vector_chunks",
+    "search_vector_index",
+]
+
+
+def _configured_postgres_sync_url() -> str | None:
+    """Prefer an externally managed Postgres server when CI provides one."""
+    configured_url = os.environ.get("BASIC_MEMORY_TEST_POSTGRES_URL") or os.environ.get(
+        "POSTGRES_TEST_URL"
+    )
+    if not configured_url:
+        return None
+
+    return (
+        configured_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
+        .replace("postgresql://", "postgresql+psycopg2://", 1)
+        .replace("postgres://", "postgresql+psycopg2://", 1)
+    )
+
+
+def _postgres_reset_tables() -> list[str]:
+    """Resolve the current ORM table set at reset time."""
+    return [table.name for table in Base.metadata.sorted_tables] + ["search_index"]
+
+
+def _resolve_postgres_sync_url(postgres_container) -> str:
+    """Use CI's shared service when configured, otherwise fall back to testcontainers."""
+    configured_url = _configured_postgres_sync_url()
+    if configured_url:
+        return configured_url
+    assert postgres_container is not None
+    return postgres_container.get_connection_url()
+
+
+async def _reset_postgres_integration_schema(engine) -> None:
+    """Restore the shared Postgres integration schema to a clean baseline."""
+    from basic_memory.models.search import (
+        CREATE_POSTGRES_SEARCH_INDEX_FTS,
+        CREATE_POSTGRES_SEARCH_INDEX_METADATA,
+        CREATE_POSTGRES_SEARCH_INDEX_PERMALINK,
+        CREATE_POSTGRES_SEARCH_INDEX_TABLE,
+    )
+
+    async with engine.begin() as conn:
+        # Trigger: integration tests may leave behind temporary search/vector tables while
+        # exercising full-stack recovery paths.
+        # Why: recreating only the missing schema is much cheaper than dropping every table.
+        # Outcome: each integration test gets the same baseline without paying repeated full DDL cost.
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_TABLE)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_FTS)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_METADATA)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_PERMALINK)
+
+        for table_name in POSTGRES_EPHEMERAL_TABLES:
+            await conn.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
+
+        await conn.execute(
+            text(f"TRUNCATE TABLE {', '.join(_postgres_reset_tables())} RESTART IDENTITY CASCADE")
+        )
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def postgres_engine(
+    db_backend: Literal["sqlite", "postgres"], postgres_container
+) -> AsyncGenerator[AsyncEngine | None, None]:
+    """Create the shared Postgres engine once per integration test session."""
     if db_backend != "postgres":
         yield None
         return
 
-    with PostgresContainer("postgres:16-alpine") as postgres:
-        yield postgres
+    sync_url = _resolve_postgres_sync_url(postgres_container)
+    async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+    engine = create_async_engine(
+        async_url,
+        echo=False,
+        poolclass=NullPool,
+    )
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
 
 
 @pytest_asyncio.fixture
@@ -117,31 +242,25 @@ async def engine_factory(
     config_manager,
     db_backend: Literal["sqlite", "postgres"],
     postgres_container,
+    postgres_engine,
     tmp_path,
 ) -> AsyncGenerator[tuple, None]:
     """Create engine and session factory for the configured database backend."""
-    from basic_memory.models.search import (
-        CREATE_SEARCH_INDEX,
-        CREATE_POSTGRES_SEARCH_INDEX_TABLE,
-        CREATE_POSTGRES_SEARCH_INDEX_FTS,
-        CREATE_POSTGRES_SEARCH_INDEX_METADATA,
-        CREATE_POSTGRES_SEARCH_INDEX_PERMALINK,
-    )
+    from basic_memory.models.search import CREATE_SEARCH_INDEX
     from basic_memory import db
 
     if db_backend == "postgres":
-        # Postgres mode using testcontainers
-        sync_url = postgres_container.get_connection_url()
-        async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+        assert postgres_engine is not None
 
-        engine = create_async_engine(
-            async_url,
-            echo=False,
-            poolclass=NullPool,
-        )
+        # Trigger: full-stack MCP/CLI tests exercise sync/indexing code that can
+        # recover from DB errors by rolling back and opening later scoped sessions.
+        # Why: one savepoint-backed connection is too brittle for that flow.
+        # Outcome: reuse the engine, but reset rows/schema before each test and
+        # let app code use normal transaction boundaries.
+        await _reset_postgres_integration_schema(postgres_engine)
 
         session_maker = async_sessionmaker(
-            bind=engine,
+            bind=postgres_engine,
             class_=AsyncSession,
             expire_on_commit=False,
             autoflush=False,
@@ -149,26 +268,17 @@ async def engine_factory(
 
         # Set module-level state to prevent MCP lifespan from re-initializing
         # This ensures get_or_create_db() sees an existing engine and skips initialization
-        db._engine = engine
+        db._engine = postgres_engine
         db._session_maker = session_maker
 
-        # Drop and recreate all tables for test isolation
-        async with engine.begin() as conn:
-            await conn.execute(text("DROP TABLE IF EXISTS search_index CASCADE"))
-            await conn.run_sync(Base.metadata.drop_all)
-            await conn.run_sync(Base.metadata.create_all)
-            # asyncpg requires separate execute calls for each statement
-            await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_TABLE)
-            await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_FTS)
-            await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_METADATA)
-            await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_PERMALINK)
-
-        yield engine, session_maker
-
-        # Clean up module-level state
-        await engine.dispose()
-        db._engine = None
-        db._session_maker = None
+        try:
+            yield postgres_engine, session_maker
+        finally:
+            # Clean up module-level state
+            if db._engine is postgres_engine:
+                db._engine = None
+            if db._session_maker is session_maker:
+                db._session_maker = None
 
     else:
         # SQLite: Create fresh database (fast with tmp files)
@@ -208,7 +318,13 @@ async def test_project(config_home, engine_factory) -> Project:
 
 @pytest.fixture
 def config_home(tmp_path, monkeypatch) -> Path:
+    # Patch both HOME and USERPROFILE so Path.home() returns the test dir on
+    # every platform — Path.home() reads HOME on POSIX and USERPROFILE on
+    # Windows, and ConfigManager.data_dir_path now goes through Path.home()
+    # via resolve_data_dir(). Must mirror tests/conftest.py:config_home.
     monkeypatch.setenv("HOME", str(tmp_path))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
     # Set BASIC_MEMORY_HOME to the test directory
     monkeypatch.setenv("BASIC_MEMORY_HOME", str(tmp_path / "basic-memory"))
     return tmp_path
@@ -227,13 +343,15 @@ def app_config(
     monkeypatch.setenv("BASIC_MEMORY_CLOUD_MODE", "false")
 
     # Create a basic config with test-project like unit tests do
-    projects = {"test-project": str(config_home)}
+    projects = {"test-project": ProjectEntry(path=str(config_home))}
 
     # Configure database backend based on env var
     if db_backend == "postgres":
         database_backend = DatabaseBackend.POSTGRES
-        # Get URL from testcontainer and convert to asyncpg driver
-        sync_url = postgres_container.get_connection_url()
+        # Trigger: CI jobs can provide a shared Postgres service instead of per-session containers.
+        # Why: reusing one pgvector-enabled server avoids Docker startup churn on every job.
+        # Outcome: local runs keep using testcontainers, while CI injects a stable service URL.
+        sync_url = _resolve_postgres_sync_url(postgres_container)
         database_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
     else:
         database_backend = DatabaseBackend.SQLITE
@@ -243,9 +361,7 @@ def app_config(
         env="test",
         projects=projects,
         default_project="test-project",
-        default_project_mode=False,  # Match real-world usage - tools must pass explicit project
         update_permalinks_on_move=True,
-        cloud_mode=False,  # Explicitly disable cloud mode
         sync_changes=False,  # Disable file sync in tests - prevents lifespan from starting blocking task
         database_backend=database_backend,
         database_url=database_url,
@@ -259,6 +375,8 @@ def config_manager(app_config: BasicMemoryConfig, config_home) -> ConfigManager:
     from basic_memory import config as config_module
 
     config_module._CONFIG_CACHE = None
+    config_module._CONFIG_MTIME = None
+    config_module._CONFIG_SIZE = None
 
     config_manager = ConfigManager()
     # Update its paths to use the test directory
@@ -284,7 +402,9 @@ def project_config(test_project):
 
 
 @pytest.fixture
-def app(app_config, project_config, engine_factory, test_project, config_manager) -> FastAPI:
+def app(
+    app_config, project_config, engine_factory, test_project, config_manager
+) -> Generator[FastAPI, None, None]:
     """Create test FastAPI application with single project."""
 
     # Import the FastAPI app AFTER the config_manager has written the test config to disk
@@ -292,10 +412,16 @@ def app(app_config, project_config, engine_factory, test_project, config_manager
     from basic_memory.api.app import app as fastapi_app
 
     app = fastapi_app
+    previous_overrides = dict(app.dependency_overrides)
     app.dependency_overrides[get_project_config] = lambda: project_config
     app.dependency_overrides[get_engine_factory] = lambda: engine_factory
     app.dependency_overrides[get_app_config] = lambda: app_config
-    return app
+    try:
+        yield app
+    finally:
+        # Restore overrides so one test's injected dependencies don't leak into
+        # subsequent tests that use the same global FastAPI app instance.
+        app.dependency_overrides = previous_overrides
 
 
 @pytest_asyncio.fixture
@@ -337,6 +463,9 @@ def mcp_server(config_manager, search_service):
 
     # Import mcp tools to register them
     import basic_memory.mcp.tools  # noqa: F401
+
+    # Import resources to register them
+    import basic_memory.mcp.resources  # noqa: F401
 
     # Import prompts to register them
     import basic_memory.mcp.prompts  # noqa: F401

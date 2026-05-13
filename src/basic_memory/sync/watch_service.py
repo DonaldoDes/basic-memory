@@ -10,7 +10,7 @@ from typing import List, Optional, Set, Sequence, Callable, Awaitable, TYPE_CHEC
 if TYPE_CHECKING:
     from basic_memory.sync.sync_service import SyncService
 
-from basic_memory.config import BasicMemoryConfig, WATCH_STATUS_JSON
+from basic_memory.config import BasicMemoryConfig, ProjectMode, WATCH_STATUS_JSON
 from basic_memory.ignore_utils import load_gitignore_patterns, should_ignore_path
 from basic_memory.models import Project
 from basic_memory.repository import ProjectRepository
@@ -85,14 +85,21 @@ class WatchService:
         project_repository: ProjectRepository,
         quiet: bool = False,
         sync_service_factory: Optional[SyncServiceFactory] = None,
+        constrained_project: Optional[str] = None,
     ):
         self.app_config = app_config
         self.project_repository = project_repository
         self.state = WatchServiceState()
-        self.status_path = Path.home() / ".basic-memory" / WATCH_STATUS_JSON
+        self.status_path = app_config.data_dir_path / WATCH_STATUS_JSON
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
         self._ignore_patterns_cache: dict[Path, Set[str]] = {}
+        self._sorted_watch_filter_roots: tuple[Path, ...] | None = None
         self._sync_service_factory = sync_service_factory
+        # When set (typically from BASIC_MEMORY_MCP_PROJECT), the watch cycle
+        # only observes this project. Without it, each `basic-memory mcp --project X`
+        # process spawns a watcher over every project and racing writers collide
+        # on the same files.
+        self.constrained_project = constrained_project
 
         # quiet mode for mcp so it doesn't mess up stdout
         self.console = Console(quiet=quiet)
@@ -120,41 +127,83 @@ class WatchService:
     async def _watch_projects_cycle(self, projects: Sequence[Project], stop_event: asyncio.Event):
         """Run one cycle of watching the given projects until stop_event is set."""
         project_paths = [project.path for project in projects]
+        previous_filter_roots = self._sorted_watch_filter_roots
+        self._sorted_watch_filter_roots = tuple(
+            sorted(
+                (Path(project.path).expanduser().resolve() for project in projects),
+                # Trigger: configured project roots can overlap.
+                # Why: an enclosing project's hidden directory should still hide descendants.
+                # Outcome: choose the outermost matching root when checking hidden path parts.
+                key=lambda project_path: len(project_path.parts),
+            )
+        )
 
-        async for changes in awatch(
-            *project_paths,
-            debounce=self.app_config.sync_delay,
-            watch_filter=self.filter_changes,
-            recursive=True,
-            stop_event=stop_event,
-        ):
-            # group changes by project and filter using ignore patterns
-            project_changes = defaultdict(list)
-            for change, path in changes:
-                for project in projects:
-                    if self.is_project_path(project, path):
-                        # Check if the file should be ignored based on gitignore patterns
-                        project_path = Path(project.path)
-                        file_path = Path(path)
-                        ignore_patterns = self._get_ignore_patterns(project_path)
+        try:
+            async for changes in awatch(
+                *project_paths,
+                debounce=self.app_config.sync_delay,
+                watch_filter=self.filter_changes,
+                recursive=True,
+                stop_event=stop_event,
+            ):
+                # group changes by project and filter using ignore patterns
+                project_changes = defaultdict(list)
+                for change, path in changes:
+                    for project in projects:
+                        if self.is_project_path(project, path):
+                            # Check if the file should be ignored based on gitignore patterns
+                            project_path = Path(project.path)
+                            file_path = Path(path)
+                            ignore_patterns = self._get_ignore_patterns(project_path)
 
-                        if should_ignore_path(file_path, project_path, ignore_patterns):
-                            logger.trace(
-                                f"Ignoring watched file change: {file_path.relative_to(project_path)}"
-                            )
-                            continue
+                            if should_ignore_path(file_path, project_path, ignore_patterns):
+                                logger.trace(
+                                    f"Ignoring watched file change: {file_path.relative_to(project_path)}"
+                                )
+                                continue
 
-                        project_changes[project].append((change, path))
-                        break
+                            project_changes[project].append((change, path))
+                            break
 
-            # create coroutines to handle changes
-            change_handlers = [
-                self.handle_changes(project, changes)  # pyright: ignore
-                for project, changes in project_changes.items()
-            ]
+                # create coroutines to handle changes
+                change_handlers = [
+                    self.handle_changes(project, set(changes))
+                    for project, changes in project_changes.items()
+                ]
 
-            # process changes
-            await asyncio.gather(*change_handlers)
+                # process changes
+                await asyncio.gather(*change_handlers)
+        finally:
+            self._sorted_watch_filter_roots = previous_filter_roots
+
+    async def _select_projects_to_watch(self) -> list[Project]:
+        """Return the set of projects this watch cycle should observe.
+
+        Applies two filters in order:
+          1. ``constrained_project`` — if the MCP server was started with
+             ``--project``, only that project is watched. This keeps concurrent
+             MCP processes from producing duplicate watchers that race on the
+             same files.
+          2. Cloud-only projects without a local bisync copy are skipped so we
+             don't watch a path that does not exist on disk.
+        """
+        projects = await self.project_repository.get_active_projects()
+
+        if self.constrained_project:
+            projects = [p for p in projects if p.name == self.constrained_project]
+
+        cloud_skip: list[str] = []
+        for p in projects:
+            if self.app_config.get_project_mode(p.name) == ProjectMode.CLOUD:
+                entry = self.app_config.projects.get(p.name)
+                if entry and Path(entry.path).is_absolute():
+                    continue  # Cloud project with local bisync copy — keep watching
+                cloud_skip.append(p.name)
+        if cloud_skip:
+            projects = [p for p in projects if p.name not in cloud_skip]
+            logger.debug(f"Skipping cloud-mode projects in watch cycle: {cloud_skip}")
+
+        return list(projects)
 
     async def run(self):  # pragma: no cover
         """Watch for file changes and sync them"""
@@ -174,8 +223,22 @@ class WatchService:
                 # Clear ignore patterns cache to pick up any .gitignore changes
                 self._ignore_patterns_cache.clear()
 
-                # Reload projects to catch any new/removed projects
-                projects = await self.project_repository.get_active_projects()
+                projects = await self._select_projects_to_watch()
+
+                # Trigger: no projects selected (e.g. constrained_project names a
+                #          project not in the DB, or every project was filtered out)
+                # Why: watchfiles.awatch() requires at least one path. Calling it
+                #      with an empty list raises ValueError, which the outer handler
+                #      catches with a 5s sleep — producing a tight error-log loop.
+                # Outcome: sleep the configured reload interval before retrying, so
+                #          newly added projects get picked up on the next cycle.
+                if not projects:
+                    logger.warning(
+                        "No projects to watch; sleeping before retry "
+                        f"(constrained_project={self.constrained_project!r})"
+                    )
+                    await asyncio.sleep(self.app_config.watch_project_reload_interval)
+                    continue
 
                 project_paths = [project.path for project in projects]
                 logger.debug(f"Starting watch cycle for directories: {project_paths}")
@@ -218,15 +281,43 @@ class WatchService:
             self.state.running = False
             await self.write_status()
 
-    def filter_changes(self, change: Change, path: str) -> bool:  # pragma: no cover
+    def filter_changes(self, change: Change, path: str) -> bool:
         """Filter to only watch non-hidden files and directories.
 
         Returns:
             True if the file should be watched, False if it should be ignored
         """
 
-        # Skip hidden directories and files
-        path_parts = Path(path).parts
+        path_obj = Path(path).expanduser().resolve()
+
+        project_paths = self._sorted_watch_filter_roots
+        if project_paths is None:
+            project_paths = tuple(
+                sorted(
+                    (
+                        Path(entry.path).expanduser().resolve()
+                        for entry in self.app_config.projects.values()
+                        if entry.path
+                    ),
+                    # Trigger: direct callers may not run inside a watch cycle.
+                    # Why: tests and one-off calls still need the same hidden-path semantics.
+                    # Outcome: compute the stable outermost-first order only for fallback calls.
+                    key=lambda project_path: len(project_path.parts),
+                )
+            )
+
+        relative_path = None
+        for project_path in project_paths:
+            try:
+                relative_path = path_obj.relative_to(project_path)
+                break
+            except ValueError:
+                continue
+
+        # Trigger: a project may live under a hidden parent such as ~/.claude.
+        # Why: only dotfiles and dot-directories inside the watched project should be ignored.
+        # Outcome: hidden parents outside the project root do not mute legitimate project changes.
+        path_parts = relative_path.parts if relative_path is not None else path_obj.parts
         for part in path_parts:
             if part.startswith("."):
                 return False
@@ -487,19 +578,19 @@ class WatchService:
 
         # Add a concise summary instead of a divider
         if processed:
-            changes = []  # pyright: ignore
+            change_summary: list[str] = []
             if add_count > 0:
-                changes.append(f"[green]{add_count} added[/green]")  # pyright: ignore
+                change_summary.append(f"[green]{add_count} added[/green]")
             if modify_count > 0:
-                changes.append(f"[yellow]{modify_count} modified[/yellow]")  # pyright: ignore
+                change_summary.append(f"[yellow]{modify_count} modified[/yellow]")
             if moved_count > 0:
-                changes.append(f"[blue]{moved_count} moved[/blue]")  # pyright: ignore
+                change_summary.append(f"[blue]{moved_count} moved[/blue]")
             if delete_count > 0:
-                changes.append(f"[red]{delete_count} deleted[/red]")  # pyright: ignore
+                change_summary.append(f"[red]{delete_count} deleted[/red]")
 
-            if changes:
-                self.console.print(f"{', '.join(changes)}", style="dim")  # pyright: ignore
-                logger.info(f"changes: {len(changes)}")
+            if change_summary:
+                self.console.print(f"{', '.join(change_summary)}", style="dim")
+                logger.info(f"changes: {len(change_summary)}")
 
         duration_ms = int((time.time() - start_time) * 1000)
         self.state.last_scan = datetime.now()

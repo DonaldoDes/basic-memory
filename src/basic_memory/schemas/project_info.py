@@ -22,8 +22,8 @@ class ProjectStatistics(BaseModel):
     )
 
     # Entity counts by type
-    entity_types: Dict[str, int] = Field(
-        description="Count of entities by type (e.g., note, conversation)"
+    note_types: Dict[str, int] = Field(
+        description="Count of entities by note type (e.g., note, conversation)"
     )
 
     # Observation counts by category
@@ -79,6 +79,28 @@ class SystemStatus(BaseModel):
     timestamp: datetime = Field(description="Timestamp when the information was collected")
 
 
+class EmbeddingStatus(BaseModel):
+    """Embedding/vector index status for a project."""
+
+    # Config
+    semantic_search_enabled: bool
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dimensions: Optional[int] = None
+
+    # Counts
+    total_indexed_entities: int = 0
+    total_entities_with_chunks: int = 0
+    total_chunks: int = 0
+    total_embeddings: int = 0
+    orphaned_chunks: int = 0
+    vector_tables_exist: bool = False
+
+    # Derived
+    reindex_recommended: bool = False
+    reindex_reason: Optional[str] = None
+
+
 class ProjectInfoResponse(BaseModel):
     """Response for the project_info tool."""
 
@@ -88,7 +110,7 @@ class ProjectInfoResponse(BaseModel):
     available_projects: Dict[str, Dict[str, Any]] = Field(
         description="Map of configured project names to detailed project information"
     )
-    default_project: str = Field(description="Name of the default project")
+    default_project: Optional[str] = Field(description="Name of the default project")
 
     # Statistics
     statistics: ProjectStatistics = Field(description="Statistics about the knowledge base")
@@ -98,6 +120,11 @@ class ProjectInfoResponse(BaseModel):
 
     # System status
     system: SystemStatus = Field(description="System and service status information")
+
+    # Embedding status
+    embedding_status: Optional[EmbeddingStatus] = Field(
+        default=None, description="Embedding/vector index status"
+    )
 
 
 class ProjectInfoRequest(BaseModel):
@@ -178,6 +205,9 @@ class ProjectItem(BaseModel):
     name: str
     path: str
     is_default: bool = False
+    # Optional metadata injected by cloud hosting layer (not stored in DB)
+    display_name: Optional[str] = None
+    is_private: bool = False
 
     @property
     def permalink(self) -> str:  # pragma: no cover
@@ -196,7 +226,7 @@ class ProjectList(BaseModel):
     """Response model for listing projects."""
 
     projects: List[ProjectItem]
-    default_project: str
+    default_project: Optional[str]
 
 
 class ProjectStatusResponse(BaseModel):

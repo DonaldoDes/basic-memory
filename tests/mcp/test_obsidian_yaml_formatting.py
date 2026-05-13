@@ -9,10 +9,10 @@ from basic_memory.mcp.tools import write_note
 async def test_write_note_tags_yaml_format(app, project_config, test_project):
     """Test that write_note creates files with proper YAML list format for tags."""
     # Create a note with tags using write_note
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="YAML Format Test",
-        folder="test",
+        directory="test",
         content="Testing YAML tag formatting",
         tags=["system", "overview", "reference"],
     )
@@ -41,10 +41,10 @@ async def test_write_note_tags_yaml_format(app, project_config, test_project):
 async def test_write_note_stringified_json_tags(app, project_config, test_project):
     """Test that stringified JSON arrays are handled correctly."""
     # This simulates the issue where AI assistants pass tags as stringified JSON
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Stringified JSON Test",
-        folder="test",
+        directory="test",
         content="Testing stringified JSON tag input",
         tags='["python", "testing", "json"]',  # Stringified JSON array
     )
@@ -71,10 +71,10 @@ async def test_write_note_stringified_json_tags(app, project_config, test_projec
 @pytest.mark.asyncio
 async def test_write_note_single_tag_yaml_format(app, project_config, test_project):
     """Test that single tags are still formatted as YAML lists."""
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Single Tag Test",
-        folder="test",
+        directory="test",
         content="Testing single tag formatting",
         tags=["solo-tag"],
     )
@@ -90,10 +90,10 @@ async def test_write_note_single_tag_yaml_format(app, project_config, test_proje
 @pytest.mark.asyncio
 async def test_write_note_no_tags(app, project_config, test_project):
     """Test that notes without tags work normally."""
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="No Tags Test",
-        folder="test",
+        directory="test",
         content="Testing note without tags",
         tags=None,
     )
@@ -109,10 +109,10 @@ async def test_write_note_no_tags(app, project_config, test_project):
 @pytest.mark.asyncio
 async def test_write_note_empty_tags_list(app, project_config, test_project):
     """Test that empty tag lists are handled properly."""
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Empty Tags Test",
-        folder="test",
+        directory="test",
         content="Testing empty tag list",
         tags=[],
     )
@@ -128,21 +128,22 @@ async def test_write_note_empty_tags_list(app, project_config, test_project):
 async def test_write_note_update_preserves_yaml_format(app, project_config, test_project):
     """Test that updating a note preserves the YAML list format."""
     # First, create the note
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Update Format Test",
-        folder="test",
+        directory="test",
         content="Initial content",
         tags=["initial", "tag"],
     )
 
     # Then update it with new tags
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Update Format Test",
-        folder="test",
+        directory="test",
         content="Updated content",
         tags=["updated", "new-tag", "format"],
+        overwrite=True,
     )
 
     # Should be an update, not a new creation
@@ -170,10 +171,10 @@ async def test_write_note_update_preserves_yaml_format(app, project_config, test
 @pytest.mark.asyncio
 async def test_complex_tags_yaml_format(app, project_config, test_project):
     """Test that complex tags with special characters format correctly."""
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Complex Tags Test",
-        folder="test",
+        directory="test",
         content="Testing complex tag formats",
         tags=["python-3.9", "api_integration", "v2.0", "nested/category", "under_score"],
     )

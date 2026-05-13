@@ -4,10 +4,10 @@ from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
-import sqlalchemy
+from sqlalchemy.exc import IntegrityError
 
 from basic_memory import db
-from basic_memory.models import Entity, Relation, Project
+from basic_memory.models import Entity, Project, Relation
 from basic_memory.repository.relation_repository import RelationRepository
 
 
@@ -17,7 +17,7 @@ async def source_entity(session_maker, test_project: Project):
     entity = Entity(
         project_id=test_project.id,
         title="test_source",
-        entity_type="test",
+        note_type="test",
         permalink="source/test-source",
         file_path="source/test_source.md",
         content_type="text/markdown",
@@ -36,7 +36,7 @@ async def target_entity(session_maker, test_project: Project):
     entity = Entity(
         project_id=test_project.id,
         title="test_target",
-        entity_type="test",
+        note_type="test",
         permalink="target/test-target",
         file_path="target/test_target.md",
         content_type="text/markdown",
@@ -79,7 +79,7 @@ async def related_entity(entity_repository):
     """Create a second entity for testing relations"""
     entity_data = {
         "title": "Related Entity",
-        "entity_type": "test",
+        "note_type": "test",
         "permalink": "test/related-entity",
         "file_path": "test/related_entity.md",
         "summary": "A related test entity",
@@ -168,7 +168,7 @@ async def test_create_relation_entity_does_not_exist(
         "relation_type": "test_relation",
         "context": "test-context",
     }
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
+    with pytest.raises(IntegrityError):
         await relation_repository.create(relation_data)
 
 
@@ -194,6 +194,7 @@ async def test_find_relation(relation_repository: RelationRepository, sample_rel
         to_permalink=sample_relation.to_entity.permalink,
         relation_type=sample_relation.relation_type,
     )
+    assert relation is not None
     assert relation.id == sample_relation.id
 
 

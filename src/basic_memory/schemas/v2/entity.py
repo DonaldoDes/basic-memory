@@ -15,6 +15,9 @@ class EntityResolveRequest(BaseModel):
     - Permalinks (e.g., "specs/search")
     - Titles (e.g., "Search Specification")
     - File paths (e.g., "specs/search.md")
+
+    When source_path is provided, resolution prefers notes closer to the source
+    (context-aware resolution for duplicate titles).
     """
 
     identifier: str = Field(
@@ -22,6 +25,15 @@ class EntityResolveRequest(BaseModel):
         description="Entity identifier to resolve (permalink, title, or file path)",
         min_length=1,
         max_length=500,
+    )
+    source_path: Optional[str] = Field(
+        None,
+        description="Path of the source file containing the link (for context-aware resolution)",
+        max_length=500,
+    )
+    strict: bool = Field(
+        False,
+        description="If True, only exact matches are allowed (no fuzzy search fallback)",
     )
 
 
@@ -56,6 +68,42 @@ class MoveEntityRequestV2(BaseModel):
     )
 
 
+class MoveDirectoryRequestV2(BaseModel):
+    """V2 request schema for moving an entire directory to a new location.
+
+    This moves all entities within a source directory to a destination directory
+    while maintaining project consistency and updating database references.
+    """
+
+    source_directory: str = Field(
+        ...,
+        description="Source directory path (relative to project root)",
+        min_length=1,
+        max_length=500,
+    )
+    destination_directory: str = Field(
+        ...,
+        description="Destination directory path (relative to project root)",
+        min_length=1,
+        max_length=500,
+    )
+
+
+class DeleteDirectoryRequestV2(BaseModel):
+    """V2 request schema for deleting all entities in a directory.
+
+    This deletes all entities within a directory, removing them from the
+    database and file system.
+    """
+
+    directory: str = Field(
+        ...,
+        description="Directory path to delete (relative to project root)",
+        min_length=1,
+        max_length=500,
+    )
+
+
 class EntityResponseV2(BaseModel):
     """V2 entity response with external_id as the primary API identifier.
 
@@ -70,7 +118,7 @@ class EntityResponseV2(BaseModel):
 
     # Core entity fields
     title: str = Field(..., description="Entity title")
-    entity_type: str = Field(..., description="Entity type")
+    note_type: str = Field(..., description="Note type (from frontmatter 'type' field)")
     content_type: str = Field(default="text/markdown", description="Content MIME type")
 
     # Secondary identifiers (for compatibility and convenience)
@@ -90,6 +138,10 @@ class EntityResponseV2(BaseModel):
     # Timestamps
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
+
+    # User tracking (cloud only, null for local/CLI usage)
+    created_by: Optional[str] = Field(None, description="User profile ID of creator")
+    last_updated_by: Optional[str] = Field(None, description="User profile ID of last editor")
 
     # V2-specific metadata
     api_version: Literal["v2"] = Field(

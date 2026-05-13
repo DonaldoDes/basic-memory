@@ -7,6 +7,7 @@ Composition roots (containers) read ConfigManager and use this module
 to resolve the runtime mode, then pass the result downstream.
 """
 
+import os
 from enum import Enum, auto
 
 
@@ -31,7 +32,6 @@ class RuntimeMode(Enum):
 
 
 def resolve_runtime_mode(
-    cloud_mode_enabled: bool,
     is_test_env: bool,
 ) -> RuntimeMode:
     """Resolve the runtime mode from configuration flags.
@@ -40,22 +40,21 @@ def resolve_runtime_mode(
     Composition roots call this with config values they've read.
 
     Args:
-        cloud_mode_enabled: Whether cloud mode is enabled in config
         is_test_env: Whether running in test environment
 
     Returns:
         The resolved RuntimeMode
     """
-    # Trigger: test environment is detected
-    # Why: tests need special handling (no file sync, isolated DB)
-    # Outcome: returns TEST mode, skipping cloud mode check
     if is_test_env:
         return RuntimeMode.TEST
 
-    # Trigger: cloud mode is enabled in config
-    # Why: cloud mode changes auth, sync, and API behavior
-    # Outcome: returns CLOUD mode for remote-first behavior
-    if cloud_mode_enabled:
+    # Trigger: BASIC_MEMORY_CLOUD_MODE env var is set
+    # Why: cloud deployments must not start local file sync — cloud handles
+    #      file storage via S3/Tigris, and the local sync tries to open a
+    #      SQLite/Postgres DB that doesn't exist in the cloud container
+    # Outcome: returns CLOUD mode, skipping file sync initialization
+    cloud_mode = os.getenv("BASIC_MEMORY_CLOUD_MODE", "").lower() in ("1", "true")
+    if cloud_mode:
         return RuntimeMode.CLOUD
 
     return RuntimeMode.LOCAL

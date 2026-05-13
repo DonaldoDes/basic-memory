@@ -1,8 +1,11 @@
 """Tests for note tools that exercise the full stack with SQLite."""
 
 from textwrap import dedent
+from typing import Any
+
 import pytest
 
+from basic_memory import config as config_module
 from basic_memory.mcp.tools import write_note, read_note, delete_note
 from basic_memory.utils import normalize_newlines
 
@@ -17,10 +20,10 @@ async def test_write_note(app, test_project):
     - Handle tags correctly
     - Return valid permalink
     """
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Test Note",
-        folder="test",
+        directory="test",
         content="# Test\nThis is a test note",
         tags=["test", "documentation"],
     )
@@ -29,62 +32,62 @@ async def test_write_note(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Test Note.md" in result
-    assert "permalink: test/test-note" in result
+    assert f"permalink: {test_project.name}/test/test-note" in result
     assert "## Tags" in result
     assert "- test, documentation" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
     # Try reading it back via permalink
-    content = await read_note.fn("test/test-note", project=test_project.name)
-    assert (
-        normalize_newlines(
-            dedent("""
+    content = await read_note("test/test-note", project=test_project.name)
+    expected = normalize_newlines(
+        dedent("""
         ---
         title: Test Note
         type: note
-        permalink: test/test-note
+        permalink: {permalink}
         tags:
         - test
         - documentation
         ---
-        
+
         # Test
         This is a test note
-        """).strip()
-        )
-        in content
+        """)
+        .format(permalink=f"{test_project.name}/test/test-note")
+        .strip()
     )
+    assert expected in content
 
 
 @pytest.mark.asyncio
 async def test_write_note_no_tags(app, test_project):
     """Test creating a note without tags."""
-    result = await write_note.fn(
-        project=test_project.name, title="Simple Note", folder="test", content="Just some text"
+    result = await write_note(
+        project=test_project.name, title="Simple Note", directory="test", content="Just some text"
     )
 
     assert result
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Simple Note.md" in result
-    assert "permalink: test/simple-note" in result
+    assert f"permalink: {test_project.name}/test/simple-note" in result
     assert f"[Session: Using project '{test_project.name}']" in result
     # Should be able to read it back
-    content = await read_note.fn("test/simple-note", project=test_project.name)
-    assert (
-        normalize_newlines(
-            dedent("""
+    content = await read_note("test/simple-note", project=test_project.name)
+    expected = normalize_newlines(
+        dedent("""
         ---
         title: Simple Note
         type: note
-        permalink: test/simple-note
+        permalink: {permalink}
         ---
-        
+
         Just some text
-        """).strip()
-        )
-        in content
+        """)
+        .format(permalink=f"{test_project.name}/test/simple-note")
+        .strip()
     )
+    assert expected in content
 
 
 @pytest.mark.asyncio
@@ -97,10 +100,10 @@ async def test_write_note_update_existing(app, test_project):
     - Handle tags correctly
     - Return valid permalink
     """
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Test Note",
-        folder="test",
+        directory="test",
         content="# Test\nThis is a test note",
         tags=["test", "documentation"],
     )
@@ -109,28 +112,29 @@ async def test_write_note_update_existing(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Test Note.md" in result
-    assert "permalink: test/test-note" in result
+    assert f"permalink: {test_project.name}/test/test-note" in result
     assert "## Tags" in result
     assert "- test, documentation" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Test Note",
-        folder="test",
+        directory="test",
         content="# Test\nThis is an updated note",
         tags=["test", "documentation"],
+        overwrite=True,
     )
     assert "# Updated note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Test Note.md" in result
-    assert "permalink: test/test-note" in result
+    assert f"permalink: {test_project.name}/test/test-note" in result
     assert "## Tags" in result
     assert "- test, documentation" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
     # Try reading it back
-    content = await read_note.fn("test/test-note", project=test_project.name)
+    content = await read_note("test/test-note", project=test_project.name)
     assert (
         normalize_newlines(
             dedent(
@@ -138,16 +142,18 @@ async def test_write_note_update_existing(app, test_project):
         ---
         title: Test Note
         type: note
-        permalink: test/test-note
+        permalink: {permalink}
         tags:
         - test
         - documentation
         ---
-        
+
         # Test
         This is an updated note
         """
-            ).strip()
+            )
+            .format(permalink=f"{test_project.name}/test/test-note")
+            .strip()
         )
         == content
     )
@@ -170,10 +176,10 @@ async def test_issue_93_write_note_respects_custom_permalink_new_note(app, test_
         - [note] Testing if custom permalink is respected
     """).strip()
 
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="My New Note",
-        folder="notes",
+        directory="notes",
         content=content_with_custom_permalink,
     )
 
@@ -190,15 +196,16 @@ async def test_issue_93_write_note_respects_custom_permalink_existing_note(app, 
     """Test that write_note respects custom permalinks when updating existing notes (Issue #93)"""
 
     # Step 1: Create initial note (auto-generated permalink)
-    result1 = await write_note.fn(
+    result1 = await write_note(
         project=test_project.name,
         title="Existing Note",
-        folder="test",
+        directory="test",
         content="Initial content without custom permalink",
     )
 
     assert "# Created note" in result1
     assert f"project: {test_project.name}" in result1
+    assert isinstance(result1, str)
 
     # Extract the auto-generated permalink
     initial_permalink = None
@@ -222,11 +229,12 @@ async def test_issue_93_write_note_respects_custom_permalink_existing_note(app, 
         - [note] Custom permalink should be respected on update
     """).strip()
 
-    result2 = await write_note.fn(
+    result2 = await write_note(
         project=test_project.name,
         title="Existing Note",
-        folder="test",
+        directory="test",
         content=updated_content,
+        overwrite=True,
     )
 
     # Verify the custom permalink is respected
@@ -246,10 +254,10 @@ async def test_delete_note_existing(app, test_project):
     - Return valid permalink
     - Delete the note
     """
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Test Note",
-        folder="test",
+        directory="test",
         content="# Test\nThis is a test note",
         tags=["test", "documentation"],
     )
@@ -257,7 +265,7 @@ async def test_delete_note_existing(app, test_project):
     assert result
     assert f"project: {test_project.name}" in result
 
-    deleted = await delete_note.fn("test/test-note", project=test_project.name)
+    deleted = await delete_note("test/test-note", project=test_project.name)
     assert deleted is True
 
 
@@ -269,7 +277,7 @@ async def test_delete_note_doesnt_exist(app, test_project):
     - Delete the note
     - verify returns false
     """
-    deleted = await delete_note.fn("doesnt-exist", project=test_project.name)
+    deleted = await delete_note("doesnt-exist", project=test_project.name)
     assert deleted is False
 
 
@@ -281,20 +289,20 @@ async def test_write_note_with_tag_array_from_bug_report(app, test_project):
     was passing an array of tags and getting a type mismatch error.
     """
     # This is the exact payload from the bug report
-    bug_payload = {
+    bug_payload: dict[str, Any] = {
         "project": test_project.name,
         "title": "Title",
-        "folder": "folder",
+        "directory": "folder",
         "content": "CONTENT",
         "tags": ["hipporag", "search", "fallback", "symfony", "error-handling"],
     }
 
     # Try to call the function with this data directly
-    result = await write_note.fn(**bug_payload)
+    result = await write_note(**bug_payload)
 
     assert result
     assert f"project: {test_project.name}" in result
-    assert "permalink: folder/title" in result
+    assert f"permalink: {test_project.name}/folder/title" in result
     assert "Tags" in result
     assert "hipporag" in result
     assert f"[Session: Using project '{test_project.name}']" in result
@@ -310,10 +318,10 @@ async def test_write_note_verbose(app, test_project):
     - Handle tags correctly
     - Return valid permalink
     """
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Test Note",
-        folder="test",
+        directory="test",
         content="""
 # Test\nThis is a test note
 
@@ -327,7 +335,7 @@ async def test_write_note_verbose(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Test Note.md" in result
-    assert "permalink: test/test-note" in result
+    assert f"permalink: {test_project.name}/test/test-note" in result
     assert "## Observations" in result
     assert "- note: 1" in result
     assert "## Relations" in result
@@ -349,16 +357,16 @@ async def test_write_note_preserves_custom_metadata(app, project_config, test_pr
     - Verify custom frontmatter is preserved
     """
     # First, create a note with custom metadata using write_note
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Custom Metadata Note",
-        folder="test",
+        directory="test",
         content="# Initial content",
         tags=["test"],
     )
 
     # Read the note to get its permalink
-    content = await read_note.fn("test/custom-metadata-note", project=test_project.name)
+    content = await read_note("test/custom-metadata-note", project=test_project.name)
 
     # Now directly update the file with custom frontmatter
     # We need to use a direct file update to add custom frontmatter
@@ -377,12 +385,13 @@ async def test_write_note_preserves_custom_metadata(app, project_config, test_pr
         f.write(frontmatter.dumps(post))
 
     # Now update the note using write_note
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Custom Metadata Note",
-        folder="test",
+        directory="test",
         content="# Updated content",
         tags=["test", "updated"],
+        overwrite=True,
     )
 
     # Verify the update was successful
@@ -392,7 +401,7 @@ async def test_write_note_preserves_custom_metadata(app, project_config, test_pr
     assert f"project: {test_project.name}" in result
 
     # Read the note back and check if custom frontmatter is preserved
-    content = await read_note.fn("test/custom-metadata-note", project=test_project.name)
+    content = await read_note("test/custom-metadata-note", project=test_project.name)
 
     # Custom frontmatter should be preserved
     assert "Status: In Progress" in content
@@ -412,10 +421,10 @@ async def test_write_note_preserves_custom_metadata(app, project_config, test_pr
 @pytest.mark.asyncio
 async def test_write_note_preserves_content_frontmatter(app, test_project):
     """Test creating a new note."""
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Test Note",
-        folder="test",
+        directory="test",
         content=dedent(
             """
             ---
@@ -433,7 +442,7 @@ async def test_write_note_preserves_content_frontmatter(app, test_project):
     )
 
     # Try reading it back via permalink
-    content = await read_note.fn("test/test-note", project=test_project.name)
+    content = await read_note("test/test-note", project=test_project.name)
     assert (
         normalize_newlines(
             dedent(
@@ -441,7 +450,7 @@ async def test_write_note_preserves_content_frontmatter(app, test_project):
             ---
             title: Test Note
             type: note
-            permalink: test/test-note
+            permalink: {permalink}
             version: 1.0
             author: name
             tags:
@@ -453,7 +462,9 @@ async def test_write_note_preserves_content_frontmatter(app, test_project):
 
             This is a test note
             """
-            ).strip()
+            )
+            .format(permalink=f"{test_project.name}/test/test-note")
+            .strip()
         )
         in content
     )
@@ -472,31 +483,32 @@ async def test_write_note_permalink_collision_fix_issue_139(app, test_project):
     After the fix, it should either update the existing note or create with unique permalink.
     """
     # Step 1: Create first note
-    result1 = await write_note.fn(
+    result1 = await write_note(
         project=test_project.name,
         title="Note 1",
-        folder="test",
+        directory="test",
         content="Original content for note 1",
     )
     assert "# Created note" in result1
     assert f"project: {test_project.name}" in result1
-    assert "permalink: test/note-1" in result1
+    assert f"permalink: {test_project.name}/test/note-1" in result1
 
     # Step 2: Create second note with different title
-    result2 = await write_note.fn(
-        project=test_project.name, title="Note 2", folder="test", content="Content for note 2"
+    result2 = await write_note(
+        project=test_project.name, title="Note 2", directory="test", content="Content for note 2"
     )
     assert "# Created note" in result2
     assert f"project: {test_project.name}" in result2
-    assert "permalink: test/note-2" in result2
+    assert f"permalink: {test_project.name}/test/note-2" in result2
 
     # Step 3: Try to create/replace first note again
     # This scenario would trigger the UNIQUE constraint failure before the fix
-    result3 = await write_note.fn(
+    result3 = await write_note(
         project=test_project.name,
         title="Note 1",  # Same title as first note
-        folder="test",  # Same folder as first note
+        directory="test",  # Same folder as first note
         content="Replacement content for note 1",  # Different content
+        overwrite=True,
     )
 
     # This should not raise a UNIQUE constraint failure error
@@ -509,33 +521,36 @@ async def test_write_note_permalink_collision_fix_issue_139(app, test_project):
     assert "Updated note" in result3 or "Created note" in result3
 
     # The result should contain either the original permalink or a unique one
-    assert "permalink: test/note-1" in result3 or "permalink: test/note-1-1" in result3
+    assert (
+        f"permalink: {test_project.name}/test/note-1" in result3
+        or f"permalink: {test_project.name}/test/note-1-1" in result3
+    )
 
     # Verify we can read back the content
-    if "permalink: test/note-1" in result3:
+    if f"permalink: {test_project.name}/test/note-1" in result3:
         # Updated existing note case
-        content = await read_note.fn("test/note-1", project=test_project.name)
+        content = await read_note("test/note-1", project=test_project.name)
         assert "Replacement content for note 1" in content
     else:
         # Created new note with unique permalink case
-        content = await read_note.fn(test_project.name, "test/note-1-1")
+        content = await read_note(test_project.name, "test/note-1-1")
         assert "Replacement content for note 1" in content
         # Original note should still exist
-        original_content = await read_note.fn(test_project.name, "test/note-1")
+        original_content = await read_note(test_project.name, "test/note-1")
         assert "Original content for note 1" in original_content
 
 
 @pytest.mark.asyncio
-async def test_write_note_with_custom_entity_type(app, test_project):
-    """Test creating a note with custom entity_type parameter.
+async def test_write_note_with_custom_note_type(app, test_project):
+    """Test creating a note with custom note_type parameter.
 
-    This test verifies the fix for Issue #144 where entity_type parameter
+    This test verifies the fix for Issue #144 where note_type parameter
     was hardcoded to "note" instead of allowing custom types.
     """
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Test Guide",
-        folder="guides",
+        directory="guides",
         content="# Guide Content\nThis is a guide",
         tags=["guide", "documentation"],
         note_type="guide",
@@ -545,20 +560,19 @@ async def test_write_note_with_custom_entity_type(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: guides/Test Guide.md" in result
-    assert "permalink: guides/test-guide" in result
+    assert f"permalink: {test_project.name}/guides/test-guide" in result
     assert "## Tags" in result
     assert "- guide, documentation" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
-    # Verify the entity type is correctly set in the frontmatter
-    content = await read_note.fn("guides/test-guide", project=test_project.name)
-    assert (
-        normalize_newlines(
-            dedent("""
+    # Verify the note type is correctly set in the frontmatter
+    content = await read_note("guides/test-guide", project=test_project.name)
+    expected = normalize_newlines(
+        dedent("""
         ---
         title: Test Guide
         type: guide
-        permalink: guides/test-guide
+        permalink: {permalink}
         tags:
         - guide
         - documentation
@@ -566,19 +580,20 @@ async def test_write_note_with_custom_entity_type(app, test_project):
 
         # Guide Content
         This is a guide
-        """).strip()
-        )
-        in content
+        """)
+        .format(permalink=f"{test_project.name}/guides/test-guide")
+        .strip()
     )
+    assert expected in content
 
 
 @pytest.mark.asyncio
-async def test_write_note_with_report_entity_type(app, test_project):
+async def test_write_note_with_report_note_type(app, test_project):
     """Test creating a note with note_type="report"."""
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Monthly Report",
-        folder="reports",
+        directory="reports",
         content="# Monthly Report\nThis is a monthly report",
         tags=["report", "monthly"],
         note_type="report",
@@ -588,22 +603,22 @@ async def test_write_note_with_report_entity_type(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: reports/Monthly Report.md" in result
-    assert "permalink: reports/monthly-report" in result
+    assert f"permalink: {test_project.name}/reports/monthly-report" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
-    # Verify the entity type is correctly set in the frontmatter
-    content = await read_note.fn("reports/monthly-report", project=test_project.name)
+    # Verify the note type is correctly set in the frontmatter
+    content = await read_note("reports/monthly-report", project=test_project.name)
     assert "type: report" in content
     assert "# Monthly Report" in content
 
 
 @pytest.mark.asyncio
-async def test_write_note_with_config_entity_type(app, test_project):
+async def test_write_note_with_config_note_type(app, test_project):
     """Test creating a note with note_type="config"."""
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="System Config",
-        folder="config",
+        directory="config",
         content="# System Configuration\nThis is a config file",
         note_type="config",
     )
@@ -612,26 +627,26 @@ async def test_write_note_with_config_entity_type(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: config/System Config.md" in result
-    assert "permalink: config/system-config" in result
+    assert f"permalink: {test_project.name}/config/system-config" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
-    # Verify the entity type is correctly set in the frontmatter
-    content = await read_note.fn("config/system-config", project=test_project.name)
+    # Verify the note type is correctly set in the frontmatter
+    content = await read_note("config/system-config", project=test_project.name)
     assert "type: config" in content
     assert "# System Configuration" in content
 
 
 @pytest.mark.asyncio
-async def test_write_note_entity_type_default_behavior(app, test_project):
-    """Test that the entity_type parameter defaults to "note" when not specified.
+async def test_write_note_note_type_default_behavior(app, test_project):
+    """Test that the note_type parameter defaults to "note" when not specified.
 
     This ensures backward compatibility - existing code that doesn't specify
-    entity_type should continue to work as before.
+    note_type should continue to work as before.
     """
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Default Type Test",
-        folder="test",
+        directory="test",
         content="# Default Type Test\nThis should be type 'note'",
         tags=["test"],
     )
@@ -640,23 +655,23 @@ async def test_write_note_entity_type_default_behavior(app, test_project):
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Default Type Test.md" in result
-    assert "permalink: test/default-type-test" in result
+    assert f"permalink: {test_project.name}/test/default-type-test" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
-    # Verify the entity type defaults to "note"
-    content = await read_note.fn("test/default-type-test", project=test_project.name)
+    # Verify the note type defaults to "note"
+    content = await read_note("test/default-type-test", project=test_project.name)
     assert "type: note" in content
     assert "# Default Type Test" in content
 
 
 @pytest.mark.asyncio
-async def test_write_note_update_existing_with_different_entity_type(app, test_project):
-    """Test updating an existing note with a different entity_type."""
+async def test_write_note_update_existing_with_different_note_type(app, test_project):
+    """Test updating an existing note with a different note_type."""
     # Create initial note as "note" type
-    result1 = await write_note.fn(
+    result1 = await write_note(
         project=test_project.name,
         title="Changeable Type",
-        folder="test",
+        directory="test",
         content="# Initial Content\nThis starts as a note",
         tags=["test"],
         note_type="note",
@@ -667,31 +682,32 @@ async def test_write_note_update_existing_with_different_entity_type(app, test_p
     assert f"project: {test_project.name}" in result1
 
     # Update the same note with a different note_type
-    result2 = await write_note.fn(
+    result2 = await write_note(
         project=test_project.name,
         title="Changeable Type",
-        folder="test",
+        directory="test",
         content="# Updated Content\nThis is now a guide",
         tags=["guide"],
         note_type="guide",
+        overwrite=True,
     )
 
     assert result2
     assert "# Updated note" in result2
     assert f"project: {test_project.name}" in result2
 
-    # Verify the entity type was updated
-    content = await read_note.fn("test/changeable-type", project=test_project.name)
+    # Verify the note type was updated
+    content = await read_note("test/changeable-type", project=test_project.name)
     assert "type: guide" in content
     assert "# Updated Content" in content
     assert "- guide" in content
 
 
 @pytest.mark.asyncio
-async def test_write_note_respects_frontmatter_entity_type(app, test_project):
-    """Test that entity_type in frontmatter is respected when parameter is not provided.
+async def test_write_note_respects_frontmatter_note_type(app, test_project):
+    """Test that note_type in frontmatter is respected when parameter is not provided.
 
-    This verifies that when write_note is called without entity_type parameter,
+    This verifies that when write_note is called without note_type parameter,
     but the content includes frontmatter with a 'type' field, that type is respected
     instead of defaulting to 'note'.
     """
@@ -709,9 +725,9 @@ async def test_write_note_respects_frontmatter_entity_type(app, test_project):
         This is a guide
         """).strip()
 
-    # Call write_note without entity_type parameter - it should respect frontmatter type
-    result = await write_note.fn(
-        project=test_project.name, title="Test Guide", folder="guides", content=note
+    # Call write_note without note_type parameter - it should respect frontmatter type
+    result = await write_note(
+        project=test_project.name, title="Test Guide", directory="guides", content=note
     )
 
     assert result
@@ -721,8 +737,8 @@ async def test_write_note_respects_frontmatter_entity_type(app, test_project):
     assert "permalink: guides/test-guide" in result
     assert f"[Session: Using project '{test_project.name}']" in result
 
-    # Verify the entity type from frontmatter is respected (should be "guide", not "note")
-    content = await read_note.fn("guides/test-guide", project=test_project.name)
+    # Verify the note type from frontmatter is respected (should be "guide", not "note")
+    content = await read_note("guides/test-guide", project=test_project.name)
     assert "type: guide" in content
     assert "# Guide Content" in content
     assert "- guide" in content
@@ -749,10 +765,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for attack_folder in attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Test Note",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Test Content\nThis should be blocked by security validation.",
             )
 
@@ -778,10 +794,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for attack_folder in attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Test Note",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Test Content\nThis should be blocked by security validation.",
             )
 
@@ -807,10 +823,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for attack_folder in attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Test Note",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Test Content\nThis should be blocked by security validation.",
             )
 
@@ -835,10 +851,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for attack_folder in attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Test Note",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Test Content\nThis should be blocked by security validation.",
             )
 
@@ -861,10 +877,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for attack_folder in attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Test Note",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Test Content\nThis should be blocked by security validation.",
             )
 
@@ -888,10 +904,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for safe_folder in safe_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title=f"Test Note in {safe_folder.replace('/', '-')}",
-                folder=safe_folder,
+                directory=safe_folder,
                 content="# Test Content\nThis should work normally with security validation.",
                 tags=["test", "security"],
             )
@@ -908,10 +924,10 @@ class TestWriteNoteSecurityValidation:
     async def test_write_note_empty_folder_security(self, app, test_project):
         """Test that empty folder parameter is handled securely."""
         # Empty folder should be allowed (creates in root)
-        result = await write_note.fn(
+        result = await write_note(
             project=test_project.name,
             title="Root Note",
-            folder="",
+            directory="",
             content="# Root Note\nThis note should be created in the project root.",
         )
 
@@ -927,10 +943,10 @@ class TestWriteNoteSecurityValidation:
         """Test that default folder behavior works securely when folder is omitted."""
         # The write_note function requires folder parameter, but we can test with empty string
         # which effectively creates in project root
-        result = await write_note.fn(
+        result = await write_note(
             project=test_project.name,
             title="Root Folder Note",
-            folder="",  # Empty string instead of None since folder is required
+            directory="",  # Empty string instead of None since folder is required
             content="# Root Folder Note\nThis note should be created in the project root.",
         )
 
@@ -952,10 +968,10 @@ class TestWriteNoteSecurityValidation:
         ]
 
         for safe_folder in safe_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title=f"Current Dir Test {safe_folder.replace('/', '-').replace('.', 'dot')}",
-                folder=safe_folder,
+                directory=safe_folder,
                 content="# Current Directory Test\nThis should work with current directory references.",
             )
 
@@ -970,10 +986,10 @@ class TestWriteNoteSecurityValidation:
     async def test_write_note_security_with_all_parameters(self, app, test_project):
         """Test security validation works with all write_note parameters."""
         # Test that security validation is applied even when all other parameters are provided
-        result = await write_note.fn(
+        result = await write_note(
             project=test_project.name,
             title="Security Test with All Params",
-            folder="../../../etc/malicious",
+            directory="../../../etc/malicious",
             content="# Malicious Content\nThis should be blocked by security validation.",
             tags=["malicious", "test"],
             note_type="guide",
@@ -988,10 +1004,10 @@ class TestWriteNoteSecurityValidation:
     async def test_write_note_security_logging(self, app, test_project, caplog):
         """Test that security violations are properly logged."""
         # Attempt path traversal attack
-        result = await write_note.fn(
+        result = await write_note(
             project=test_project.name,
             title="Security Logging Test",
-            folder="../../../etc/passwd_folder",
+            directory="../../../etc/passwd_folder",
             content="# Test Content\nThis should trigger security logging.",
         )
 
@@ -1006,10 +1022,10 @@ class TestWriteNoteSecurityValidation:
     async def test_write_note_preserves_functionality_with_security(self, app, test_project):
         """Test that security validation doesn't break normal note creation functionality."""
         # Create a note with all features to ensure security validation doesn't interfere
-        result = await write_note.fn(
+        result = await write_note(
             project=test_project.name,
             title="Full Feature Security Test",
-            folder="security-tests",
+            directory="security-tests",
             content=dedent("""
                 # Full Feature Security Test
 
@@ -1035,7 +1051,7 @@ class TestWriteNoteSecurityValidation:
         assert "paths must stay within project boundaries" not in result
         assert "# Created note" in result
         assert "file_path: security-tests/Full Feature Security Test.md" in result
-        assert "permalink: security-tests/full-feature-security-test" in result
+        assert f"permalink: {test_project.name}/security-tests/full-feature-security-test" in result
 
         # Should process observations and relations
         assert "## Observations" in result
@@ -1061,10 +1077,10 @@ class TestWriteNoteSecurityEdgeCases:
         ]
 
         for attack_folder in unicode_attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Unicode Attack Test",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Unicode Attack\nThis should be blocked.",
             )
 
@@ -1078,10 +1094,10 @@ class TestWriteNoteSecurityEdgeCases:
         # Create a very long path traversal attack
         long_attack_folder = "../" * 1000 + "etc/malicious"
 
-        result = await write_note.fn(
+        result = await write_note(
             project=test_project.name,
             title="Long Attack Test",
-            folder=long_attack_folder,
+            directory=long_attack_folder,
             content="# Long Attack\nThis should be blocked.",
         )
 
@@ -1101,10 +1117,10 @@ class TestWriteNoteSecurityEdgeCases:
         ]
 
         for attack_folder in case_attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Case Variation Attack Test",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Case Attack\nThis should be blocked.",
             )
 
@@ -1124,10 +1140,10 @@ class TestWriteNoteSecurityEdgeCases:
         ]
 
         for attack_folder in whitespace_attack_folders:
-            result = await write_note.fn(
+            result = await write_note(
                 project=test_project.name,
                 title="Whitespace Attack Test",
-                folder=attack_folder,
+                directory=attack_folder,
                 content="# Whitespace Attack\nThis should be blocked.",
             )
 
@@ -1136,3 +1152,156 @@ class TestWriteNoteSecurityEdgeCases:
             if ".." in attack_folder.strip() or "~" in attack_folder.strip():
                 assert "# Error" in result
                 assert "paths must stay within project boundaries" in result
+
+
+class TestWriteNoteOverwriteGuard:
+    """Test the write_note overwrite guard feature (Issue #625)."""
+
+    @pytest.mark.asyncio
+    async def test_write_note_blocks_overwrite_by_default(self, app, test_project):
+        """Second write_note to same title/directory returns error, original content untouched."""
+        # Create initial note
+        result1 = await write_note(
+            project=test_project.name,
+            title="Guard Test",
+            directory="guard",
+            content="# Guard Test\n\nOriginal content",
+        )
+        assert "# Created note" in result1
+
+        # Second write without overwrite should be blocked
+        result2 = await write_note(
+            project=test_project.name,
+            title="Guard Test",
+            directory="guard",
+            content="# Guard Test\n\nReplacement content",
+        )
+        assert "# Error: Note already exists" in result2
+        assert "Guard Test" in result2
+        assert "edit_note" in result2
+
+        # Original content should be untouched
+        content = await read_note("guard/guard-test", project=test_project.name)
+        assert "Original content" in content
+        assert "Replacement content" not in content
+
+    @pytest.mark.asyncio
+    async def test_write_note_overwrite_false_explicit(self, app, test_project):
+        """Explicit overwrite=False behaves same as default."""
+        await write_note(
+            project=test_project.name,
+            title="Explicit False",
+            directory="guard",
+            content="# Explicit False\n\nOriginal",
+        )
+
+        result = await write_note(
+            project=test_project.name,
+            title="Explicit False",
+            directory="guard",
+            content="# Explicit False\n\nReplacement",
+            overwrite=False,
+        )
+        assert "# Error: Note already exists" in result
+
+    @pytest.mark.asyncio
+    async def test_write_note_overwrite_true_replaces(self, app, test_project):
+        """Explicit overwrite=True performs the update."""
+        await write_note(
+            project=test_project.name,
+            title="Overwrite True",
+            directory="guard",
+            content="# Overwrite True\n\nOriginal content",
+        )
+
+        result = await write_note(
+            project=test_project.name,
+            title="Overwrite True",
+            directory="guard",
+            content="# Overwrite True\n\nReplacement content",
+            overwrite=True,
+        )
+        assert "# Updated note" in result
+
+        # Verify content was replaced
+        content = await read_note("guard/overwrite-true", project=test_project.name)
+        assert "Replacement content" in content
+        assert "Original content" not in content
+
+    @pytest.mark.asyncio
+    async def test_write_note_overwrite_error_json_format(self, app, test_project):
+        """JSON output returns structured error with NOTE_ALREADY_EXISTS."""
+        await write_note(
+            project=test_project.name,
+            title="JSON Guard",
+            directory="guard",
+            content="# JSON Guard\n\nOriginal",
+        )
+
+        result = await write_note(
+            project=test_project.name,
+            title="JSON Guard",
+            directory="guard",
+            content="# JSON Guard\n\nReplacement",
+            output_format="json",
+        )
+        assert isinstance(result, dict)
+        assert result["error"] == "NOTE_ALREADY_EXISTS"
+        assert result["action"] == "conflict"
+        assert result["title"] == "JSON Guard"
+        assert result["permalink"] is not None
+
+    @pytest.mark.asyncio
+    async def test_write_note_config_overwrite_default_true(
+        self, app, test_project, app_config, config_manager
+    ):
+        """Config write_note_overwrite_default=True restores old upsert behavior."""
+        # Set config to allow overwrites by default
+        app_config.write_note_overwrite_default = True
+        config_module._CONFIG_CACHE = app_config
+        # Pin mtime+size to the on-disk file so the cache guard sees a match
+        # and keeps our injected config instead of re-reading from disk.
+        _st = config_manager.config_file.stat()
+        config_module._CONFIG_MTIME = _st.st_mtime
+        config_module._CONFIG_SIZE = _st.st_size
+
+        try:
+            await write_note(
+                project=test_project.name,
+                title="Config Default",
+                directory="guard",
+                content="# Config Default\n\nOriginal",
+            )
+
+            result = await write_note(
+                project=test_project.name,
+                title="Config Default",
+                directory="guard",
+                content="# Config Default\n\nReplacement via config default",
+            )
+            # Should succeed as update because config default is True
+            assert "# Updated note" in result
+
+            content = await read_note("guard/config-default", project=test_project.name)
+            assert "Replacement via config default" in content
+        finally:
+            # Restore config
+            app_config.write_note_overwrite_default = False
+            config_module._CONFIG_CACHE = app_config
+            _st = config_manager.config_file.stat()
+            config_module._CONFIG_MTIME = _st.st_mtime
+            config_module._CONFIG_SIZE = _st.st_size
+
+    @pytest.mark.asyncio
+    async def test_write_note_new_note_unaffected(self, app, test_project):
+        """Guard only triggers on conflict — new notes are created normally."""
+        result = await write_note(
+            project=test_project.name,
+            title="Brand New Note",
+            directory="guard",
+            content="# Brand New Note\n\nFresh content",
+            tags=["new"],
+        )
+        assert "# Created note" in result
+        assert f"project: {test_project.name}" in result
+        assert "file_path: guard/Brand New Note.md" in result

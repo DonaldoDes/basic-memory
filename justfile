@@ -2,7 +2,6 @@
 
 # Install dependencies
 install:
-    uv pip install -e ".[dev]"
     uv sync
     @echo ""
     @echo "💡 Remember to activate the virtual environment by running: source .venv/bin/activate"
@@ -43,9 +42,9 @@ test-unit-sqlite:
 test-unit-postgres:
     BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov tests
 
-# Run integration tests against SQLite
+# Run integration tests against SQLite (excludes semantic benchmarks — use just test-semantic)
 test-int-sqlite:
-    uv run pytest -p pytest_mock -v --no-cov test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int
 
 # Run integration tests against Postgres
 # Note: Uses timeout due to FastMCP Client + asyncpg cleanup hang (tests pass, process hangs on exit)
@@ -56,11 +55,27 @@ test-int-postgres:
     # Use gtimeout (macOS/Homebrew) or timeout (Linux)
     TIMEOUT_CMD=$(command -v gtimeout || command -v timeout || echo "")
     if [[ -n "$TIMEOUT_CMD" ]]; then
-        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov test-int' || test $? -eq 137
+        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int' || test $? -eq 137
     else
         echo "⚠️  No timeout command found, running without timeout..."
-        BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov test-int
+        BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int
     fi
+
+# Run tests impacted by recent changes (requires pytest-testmon)
+# Pass paths or node ids after `just testmon` to limit the candidate set further.
+testmon *args:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov --testmon {{args}}
+
+# Run MCP smoke test (fast end-to-end loop)
+test-smoke:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m smoke test-int/mcp/test_smoke_integration.py
+
+# Fast local loop: lint, format, typecheck, impacted tests via pytest-testmon
+fast-check:
+    just fix
+    just format
+    just typecheck
+    just testmon
 
 # Reset Postgres test database (drops and recreates schema)
 # Useful when Alembic migration state gets out of sync during development
@@ -83,18 +98,43 @@ postgres-migrate:
 # These tests verify Windows-specific database optimizations (locking mode, NullPool)
 # Will be skipped automatically on non-Windows platforms
 test-windows:
-    uv run pytest -p pytest_mock -v --no-cov -m windows tests test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m windows tests test-int
 
 # Run benchmark tests only (performance testing)
 # These are slow tests that measure sync performance with various file counts
 # Excluded from default test runs to keep CI fast
 test-benchmark:
-    uv run pytest -p pytest_mock -v --no-cov -m benchmark tests test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m benchmark tests test-int
+
+# Run semantic search quality benchmarks (all combos)
+test-semantic:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m semantic test-int/semantic/
+
+# Run semantic benchmarks with JSON artifact output, then show report
+test-semantic-report:
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_BENCHMARK_OUTPUT=.benchmarks/semantic-quality.jsonl uv run pytest -p pytest_mock -v -s --no-cov -m semantic test-int/semantic/
+    uv run python test-int/semantic/report.py .benchmarks/semantic-quality.jsonl
+
+# Run semantic benchmarks (Postgres combos only)
+test-semantic-postgres:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m semantic -k postgres test-int/semantic/
+
+# View semantic benchmark results (rich formatted table)
+# Usage: just semantic-report [--filter-combo sqlite] [--filter-suite paraphrase] [--sort-by avg_latency_ms]
+semantic-report *args:
+    uv run python test-int/semantic/report.py .benchmarks/semantic-quality.jsonl {{args}}
+
+# Compare two search benchmark JSONL outputs
+# Usage:
+#   just benchmark-compare .benchmarks/search-baseline.jsonl .benchmarks/search-candidate.jsonl
+#   just benchmark-compare .benchmarks/search-baseline.jsonl .benchmarks/search-candidate.jsonl --format markdown --show-missing
+benchmark-compare baseline candidate *args:
+    uv run python test-int/compare_search_benchmarks.py "{{baseline}}" "{{candidate}}" --format table {{args}}
 
 # Run all tests including Windows, Postgres, and Benchmarks (for CI/comprehensive testing)
 # Use this before releasing to ensure everything works across all backends and platforms
 test-all:
-    uv run pytest -p pytest_mock -v --no-cov tests test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov tests test-int
 
 # Generate HTML coverage report
 coverage:
@@ -130,9 +170,17 @@ lint: fix
 fix:
     uv run ruff check --fix --unsafe-fixes src tests test-int
 
-# Type check code
+# Type check code (ty)
 typecheck:
+    uv run ty check src tests test-int
+
+# Type check code (pyright)
+typecheck-pyright:
     uv run pyright
+
+# Type check code (ty)
+typecheck-ty:
+    just typecheck
 
 # Clean build artifacts and cache files
 clean:
@@ -149,6 +197,63 @@ format:
 run-inspector:
     npx @modelcontextprotocol/inspector
 
+# Run doctor checks in an isolated temp home/config
+doctor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TMP_HOME=$(mktemp -d)
+    TMP_CONFIG=$(mktemp -d)
+    HOME="$TMP_HOME" \
+    BASIC_MEMORY_ENV=test \
+    BASIC_MEMORY_HOME="$TMP_HOME/basic-memory" \
+    BASIC_MEMORY_CONFIG_DIR="$TMP_CONFIG" \
+    ./.venv/bin/python -m basic_memory.cli.main doctor --local
+
+# Run an isolated Logfire smoke workflow for local trace inspection
+telemetry-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TMP_HOME=$(mktemp -d)
+    TMP_CONFIG=$(mktemp -d)
+    TMP_PROJECT=$(mktemp -d)
+    export HOME="$TMP_HOME"
+    export BASIC_MEMORY_ENV="${BASIC_MEMORY_ENV:-dev}"
+    export BASIC_MEMORY_HOME="$TMP_PROJECT/home-root"
+    export BASIC_MEMORY_CONFIG_DIR="$TMP_CONFIG"
+    export BASIC_MEMORY_NO_PROMOS=1
+    export BASIC_MEMORY_LOG_LEVEL="${BASIC_MEMORY_LOG_LEVEL:-INFO}"
+    export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED="${BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED:-false}"
+    export BASIC_MEMORY_LOGFIRE_ENABLED="${BASIC_MEMORY_LOGFIRE_ENABLED:-true}"
+    export BASIC_MEMORY_LOGFIRE_ENVIRONMENT="${BASIC_MEMORY_LOGFIRE_ENVIRONMENT:-telemetry-smoke}"
+    if [[ -z "${BASIC_MEMORY_LOGFIRE_SEND_TO_LOGFIRE:-}" ]]; then
+        if [[ -n "${LOGFIRE_TOKEN:-}" ]]; then
+            export BASIC_MEMORY_LOGFIRE_SEND_TO_LOGFIRE=true
+        else
+            export BASIC_MEMORY_LOGFIRE_SEND_TO_LOGFIRE=false
+        fi
+    fi
+    mkdir -p "$BASIC_MEMORY_HOME"
+    echo "Telemetry smoke setup:"
+    echo "  logfire_enabled=$BASIC_MEMORY_LOGFIRE_ENABLED"
+    echo "  send_to_logfire=$BASIC_MEMORY_LOGFIRE_SEND_TO_LOGFIRE"
+    echo "  log_level=$BASIC_MEMORY_LOG_LEVEL"
+    echo "  semantic_search_enabled=$BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED"
+    echo "  logfire_environment=$BASIC_MEMORY_LOGFIRE_ENVIRONMENT"
+    echo "  project_path=$TMP_PROJECT"
+    ./.venv/bin/python -m basic_memory.cli.main project add telemetry-smoke "$TMP_PROJECT" --default --local
+    ./.venv/bin/python -m basic_memory.cli.main tool write-note --title "Telemetry Smoke" --folder notes --content "hello from smoke" --project telemetry-smoke --local
+    ./.venv/bin/python -m basic_memory.cli.main tool read-note notes/telemetry-smoke --project telemetry-smoke --local
+    ./.venv/bin/python -m basic_memory.cli.main tool edit-note notes/telemetry-smoke --operation append --content $'\n\nsmoke edit line' --project telemetry-smoke --local
+    ./.venv/bin/python -m basic_memory.cli.main tool build-context notes/telemetry-smoke --project telemetry-smoke --local --page-size 5 --max-related 5
+    ./.venv/bin/python -m basic_memory.cli.main tool search-notes telemetry --project telemetry-smoke --local
+    ./.venv/bin/python -m basic_memory.cli.main doctor --local
+    echo ""
+    echo "Telemetry smoke complete."
+    echo "Search Logfire for:"
+    echo "  service_name: basic-memory-cli"
+    echo "  environment: $BASIC_MEMORY_LOGFIRE_ENVIRONMENT"
+    echo "  span names: mcp.tool.write_note, mcp.tool.read_note, mcp.tool.edit_note, mcp.tool.build_context, mcp.tool.search_notes, sync.project.run"
+
 
 # Update all dependencies to latest versions
 update-deps:
@@ -156,6 +261,9 @@ update-deps:
 
 # Run all code quality checks and tests
 check: lint format typecheck test
+
+# Run all code quality checks and all test suites, including semantic benchmarks
+check-all: lint format typecheck test test-semantic
 
 # Generate Alembic migration with descriptive message
 migration message:

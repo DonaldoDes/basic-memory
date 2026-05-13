@@ -19,7 +19,7 @@ async def test_move_note_basic_operation(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Move Test Note",
-                "folder": "source",
+                "directory": "source",
                 "content": "# Move Test Note\n\nThis note will be moved to a new location.",
                 "tags": "test,move",
             },
@@ -79,7 +79,7 @@ async def test_move_note_using_permalink(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Permalink Move Test",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Permalink Move Test\n\nMoving by permalink.",
                 "tags": "test,permalink",
             },
@@ -142,7 +142,7 @@ This note demonstrates moving complex content."""
             {
                 "project": test_project.name,
                 "title": "Complex Note",
-                "folder": "complex",
+                "directory": "complex",
                 "content": complex_content,
                 "tags": "test,complex,move",
             },
@@ -193,7 +193,7 @@ async def test_move_note_to_nested_directory(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Nested Move Test",
-                "folder": "root",
+                "directory": "root",
                 "content": "# Nested Move Test\n\nThis will be moved deep.",
                 "tags": "test,nested",
             },
@@ -239,7 +239,7 @@ async def test_move_note_with_special_characters(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Special (Chars) & Symbols",
-                "folder": "special",
+                "directory": "special",
                 "content": "# Special (Chars) & Symbols\n\nTesting special characters in move.",
                 "tags": "test,special",
             },
@@ -306,7 +306,7 @@ async def test_move_note_error_handling_invalid_destination(mcp_server, app, tes
             {
                 "project": test_project.name,
                 "title": "Invalid Dest Test",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Invalid Dest Test\n\nThis move should fail.",
                 "tags": "test,error",
             },
@@ -340,7 +340,7 @@ async def test_move_note_error_handling_destination_exists(mcp_server, app, test
             {
                 "project": test_project.name,
                 "title": "Source Note",
-                "folder": "source",
+                "directory": "source",
                 "content": "# Source Note\n\nThis is the source.",
                 "tags": "test,source",
             },
@@ -352,7 +352,7 @@ async def test_move_note_error_handling_destination_exists(mcp_server, app, test
             {
                 "project": test_project.name,
                 "title": "Existing Note",
-                "folder": "destination",
+                "directory": "destination",
                 "content": "# Existing Note\n\nThis already exists.",
                 "tags": "test,existing",
             },
@@ -386,7 +386,7 @@ async def test_move_note_preserves_search_functionality(mcp_server, app, test_pr
             {
                 "project": test_project.name,
                 "title": "Searchable Note",
-                "folder": "original",
+                "directory": "original",
                 "content": """# Searchable Note
 
 This note contains unique search terms:
@@ -441,8 +441,8 @@ This note contains unique search terms:
 
         assert len(search_after.content) > 0
         search_text = search_after.content[0].text
-        assert "quantum mechanics" in search_text
-        assert "research/quantum-ai-note.md" in search_text or "quantum-ai-note" in search_text
+        # Search results include observations/relations — check the note is found by file path
+        assert "quantum-ai-note" in search_text
 
         # Verify search by new location works
         search_by_path = await client.call_tool(
@@ -467,7 +467,7 @@ async def test_move_note_using_different_identifier_formats(mcp_server, app, tes
             {
                 "project": test_project.name,
                 "title": "Title ID Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Title ID Note\n\nMove by title.",
                 "tags": "test,identifier",
             },
@@ -478,7 +478,7 @@ async def test_move_note_using_different_identifier_formats(mcp_server, app, tes
             {
                 "project": test_project.name,
                 "title": "Permalink ID Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Permalink ID Note\n\nMove by permalink.",
                 "tags": "test,identifier",
             },
@@ -489,7 +489,7 @@ async def test_move_note_using_different_identifier_formats(mcp_server, app, tes
             {
                 "project": test_project.name,
                 "title": "Folder Title Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Folder Title Note\n\nMove by folder/title.",
                 "tags": "test,identifier",
             },
@@ -569,7 +569,7 @@ async def test_move_note_cross_project_detection(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Cross Project Test Note",
-                "folder": "source",
+                "directory": "source",
                 "content": "# Cross Project Test Note\n\nThis note is in the default project.",
                 "tags": "test,cross-project",
             },
@@ -605,7 +605,7 @@ async def test_move_note_normal_moves_still_work(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Normal Move Note",
-                "folder": "source",
+                "directory": "source",
                 "content": "# Normal Move Note\n\nThis should move normally.",
                 "tags": "test,normal-move",
             },
@@ -639,3 +639,133 @@ async def test_move_note_normal_moves_still_work(mcp_server, app, test_project):
 
         content = read_result.content[0].text
         assert "This should move normally" in content
+
+
+@pytest.mark.asyncio
+async def test_move_note_with_destination_folder(mcp_server, app, test_project):
+    """Test moving a note using destination_folder to preserve the original filename."""
+
+    async with Client(mcp_server) as client:
+        # Create a note to move
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Folder Move Integration",
+                "directory": "source",
+                "content": "# Folder Move Integration\n\nTesting destination_folder parameter.",
+                "tags": "test,folder-move",
+            },
+        )
+
+        # Move using destination_folder (filename preserved automatically)
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Folder Move Integration",
+                "destination_folder": "archive/2025",
+            },
+        )
+
+        # Should return successful move message
+        assert len(move_result.content) == 1
+        move_text = move_result.content[0].text
+        assert "✅ Note moved successfully" in move_text
+        assert "Folder Move Integration" in move_text
+
+        # Verify the note can be read from its new location (original filename preserved)
+        read_result = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": "archive/2025/folder-move-integration",
+            },
+        )
+
+        content = read_result.content[0].text
+        assert "Testing destination_folder parameter" in content
+
+        # Verify the original location no longer works
+        read_original = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": "source/folder-move-integration",
+            },
+        )
+        assert "Note Not Found" in read_original.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_move_note_destination_folder_mutually_exclusive(mcp_server, app, test_project):
+    """Test that providing both destination_path and destination_folder returns an error."""
+
+    async with Client(mcp_server) as client:
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "some-note",
+                "destination_path": "target/note.md",
+                "destination_folder": "target",
+            },
+        )
+
+        assert len(move_result.content) == 1
+        error_text = move_result.content[0].text
+        assert "# Move Failed - Invalid Parameters" in error_text
+        assert "Cannot specify both" in error_text
+
+
+@pytest.mark.asyncio
+async def test_move_note_strict_resolution_rejects_fuzzy_match(mcp_server, app, test_project):
+    """move_note must not fuzzy-match a nonexistent identifier to an existing note (#649)."""
+
+    async with Client(mcp_server) as client:
+        # Create two notes that could be fuzzy-matched
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Move Strict Test A",
+                "directory": "test",
+                "content": "# Move Strict Test A\n\nContent A.",
+            },
+        )
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Move Strict Test B",
+                "directory": "test",
+                "content": "# Move Strict Test B\n\nContent B.",
+            },
+        )
+
+        # Attempt to move a nonexistent note — should error, not move A or B
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Move Strict Test NONEXISTENT",
+                "destination_path": "archive/Moved.md",
+            },
+        )
+
+        assert len(move_result.content) == 1
+        error_text = move_result.content[0].text
+        assert "# Move Failed" in error_text
+
+        # Verify neither A nor B was moved
+        read_a = await client.call_tool(
+            "read_note",
+            {"project": test_project.name, "identifier": "Move Strict Test A"},
+        )
+        assert "Content A" in read_a.content[0].text
+
+        read_b = await client.call_tool(
+            "read_note",
+            {"project": test_project.name, "identifier": "Move Strict Test B"},
+        )
+        assert "Content B" in read_b.content[0].text

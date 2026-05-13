@@ -1,13 +1,16 @@
 """Service for building rich context from the knowledge graph."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 
 from loguru import logger
 from sqlalchemy import text
 
+import logfire
 from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.repository.observation_repository import ObservationRepository
 from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
@@ -15,6 +18,9 @@ from basic_memory.repository.search_repository import SearchRepository, SearchIn
 from basic_memory.schemas.memory import MemoryUrl, memory_url_path
 from basic_memory.schemas.search import SearchItemType
 from basic_memory.utils import generate_permalink, parse_datetime
+
+if TYPE_CHECKING:
+    from basic_memory.services.link_resolver import LinkResolver
 
 
 @dataclass
@@ -58,6 +64,7 @@ class ContextMetadata:
     related_count: int = 0
     total_observations: int = 0
     total_relations: int = 0
+    has_more: bool = False
 
 
 @dataclass
@@ -82,10 +89,12 @@ class ContextService:
         search_repository: SearchRepository,
         entity_repository: EntityRepository,
         observation_repository: ObservationRepository,
+        link_resolver: Optional[LinkResolver] = None,
     ):
         self.search_repository = search_repository
         self.entity_repository = entity_repository
         self.observation_repository = observation_repository
+        self.link_resolver = link_resolver
 
     async def build_context(
         self,
@@ -103,119 +112,162 @@ class ContextService:
             f"Building context for URI: '{memory_url}' depth: '{depth}' since: '{since}' limit: '{limit}' offset: '{offset}'  max_related: '{max_related}'"
         )
 
-        normalized_path: Optional[str] = None
-        if memory_url:
-            path = memory_url_path(memory_url)
-            # Check for wildcards before normalization
-            has_wildcard = "*" in path
+        with logfire.span(
+            "memory.build_context",
+            domain="memory",
+            action="build_context",
+            phase="build_context",
+            limit=limit,
+            offset=offset,
+        ):
+            fetch_limit = limit + 1
 
-            if has_wildcard:
-                # For wildcard patterns, normalize each segment separately to preserve the *
-                parts = path.split("*")
-                normalized_parts = [
-                    generate_permalink(part, split_extension=False) if part else ""
-                    for part in parts
-                ]
-                normalized_path = "*".join(normalized_parts)
-                logger.debug(f"Pattern search for '{normalized_path}'")
-                primary = await self.search_repository.search(
-                    permalink_match=normalized_path, limit=limit, offset=offset
+            normalized_path: Optional[str] = None
+            with logfire.span(
+                "memory.build_context.resolve_primary",
+                domain="memory",
+                action="build_context",
+                phase="resolve_primary",
+            ):
+                if memory_url:
+                    path = memory_url_path(memory_url)
+                    has_wildcard = "*" in path
+
+                    if has_wildcard:
+                        parts = path.split("*")
+                        normalized_parts = [
+                            generate_permalink(part, split_extension=False) if part else ""
+                            for part in parts
+                        ]
+                        normalized_path = "*".join(normalized_parts)
+                        logger.debug(f"Pattern search for '{normalized_path}'")
+                        primary = await self.search_repository.search(
+                            permalink_match=normalized_path, limit=fetch_limit, offset=offset
+                        )
+                    else:
+                        normalized_path = generate_permalink(path, split_extension=False)
+                        logger.debug(f"Direct lookup for '{normalized_path}'")
+                        primary = await self.search_repository.search(
+                            permalink=normalized_path, limit=fetch_limit, offset=offset
+                        )
+
+                        if not primary and self.link_resolver:
+                            entity = await self.link_resolver.resolve_link(
+                                path, use_search=True, strict=False
+                            )
+                            if entity:
+                                logger.debug(
+                                    f"LinkResolver resolved '{path}' to permalink '{entity.permalink}'"
+                                )
+                                normalized_path = entity.permalink
+                                primary = await self.search_repository.search(
+                                    permalink=entity.permalink,
+                                    limit=fetch_limit,
+                                    offset=offset,
+                                )
+                else:
+                    logger.debug(f"Build context for '{types}'")
+                    primary = await self.search_repository.search(
+                        search_item_types=types,
+                        after_date=since,
+                        limit=fetch_limit,
+                        offset=offset,
+                    )
+
+            has_more = len(primary) > limit
+            if has_more:
+                primary = primary[:limit]
+
+            type_id_pairs = [(r.type, r.id) for r in primary] if primary else []
+            logger.debug(f"found primary type_id_pairs: {len(type_id_pairs)}")
+
+            with logfire.span(
+                "memory.build_context.find_related",
+                domain="memory",
+                action="build_context",
+                phase="find_related",
+            ):
+                related = await self.find_related(
+                    type_id_pairs, max_depth=depth, since=since, max_results=max_related
                 )
-            else:
-                # For exact paths, normalize the whole thing
-                normalized_path = generate_permalink(path, split_extension=False)
-                logger.debug(f"Direct lookup for '{normalized_path}'")
-                primary = await self.search_repository.search(
-                    permalink=normalized_path, limit=limit, offset=offset
-                )
-        else:
-            logger.debug(f"Build context for '{types}'")
-            primary = await self.search_repository.search(
-                search_item_types=types, after_date=since, limit=limit, offset=offset
+            logger.debug(f"Found {len(related)} related results")
+
+            entity_ids = []
+            for result in primary:
+                if result.type == SearchItemType.ENTITY.value:
+                    entity_ids.append(result.id)
+
+            for result in related:
+                if result.type == SearchItemType.ENTITY.value:
+                    entity_ids.append(result.id)
+
+            observations_by_entity = {}
+            if include_observations and entity_ids:
+                with logfire.span(
+                    "memory.build_context.load_observations",
+                    domain="memory",
+                    action="build_context",
+                    phase="load_observations",
+                    result_count=len(entity_ids),
+                ):
+                    observations_by_entity = await self.observation_repository.find_by_entities(
+                        entity_ids
+                    )
+                logger.debug(f"Found observations for {len(observations_by_entity)} entities")
+
+            metadata = ContextMetadata(
+                uri=normalized_path if memory_url else None,
+                types=types,
+                depth=depth,
+                timeframe=since.isoformat() if since else None,
+                primary_count=len(primary),
+                related_count=len(related),
+                total_observations=sum(len(obs) for obs in observations_by_entity.values()),
+                total_relations=sum(1 for r in related if r.type == SearchItemType.RELATION),
+                has_more=has_more,
             )
 
-        # Get type_id pairs for traversal
+            with logfire.span(
+                "memory.build_context.shape_results",
+                domain="memory",
+                action="build_context",
+                phase="shape_results",
+                result_count=len(primary),
+            ):
+                context_results = []
+                for primary_item in primary:
+                    related_to_primary = [r for r in related if r.root_id == primary_item.id]
 
-        type_id_pairs = [(r.type, r.id) for r in primary] if primary else []
-        logger.debug(f"found primary type_id_pairs: {len(type_id_pairs)}")
+                    item_observations = []
+                    if primary_item.type == SearchItemType.ENTITY.value and include_observations:
+                        for obs in observations_by_entity.get(primary_item.id, []):
+                            item_observations.append(
+                                ContextResultRow(
+                                    type="observation",
+                                    id=obs.id,
+                                    title=f"{obs.category}: {obs.content[:50]}...",
+                                    permalink=generate_permalink(
+                                        f"{primary_item.permalink}/observations/{obs.category}/{obs.content}"
+                                    ),
+                                    file_path=primary_item.file_path,
+                                    content=obs.content,
+                                    category=obs.category,
+                                    entity_id=primary_item.id,
+                                    depth=0,
+                                    root_id=primary_item.id,
+                                    created_at=parse_datetime(primary_item.created_at),
+                                )
+                            )
 
-        # Find related content
-        related = await self.find_related(
-            type_id_pairs, max_depth=depth, since=since, max_results=max_related
-        )
-        logger.debug(f"Found {len(related)} related results")
-
-        # Collect entity IDs from primary and related results
-        entity_ids = []
-        for result in primary:
-            if result.type == SearchItemType.ENTITY.value:
-                entity_ids.append(result.id)
-
-        for result in related:
-            if result.type == SearchItemType.ENTITY.value:
-                entity_ids.append(result.id)
-
-        # Fetch observations for all entities if requested
-        observations_by_entity = {}
-        if include_observations and entity_ids:
-            # Use our observation repository to get observations for all entities at once
-            observations_by_entity = await self.observation_repository.find_by_entities(entity_ids)
-            logger.debug(f"Found observations for {len(observations_by_entity)} entities")
-
-        # Create metadata dataclass
-        metadata = ContextMetadata(
-            uri=normalized_path if memory_url else None,
-            types=types,
-            depth=depth,
-            timeframe=since.isoformat() if since else None,
-            primary_count=len(primary),
-            related_count=len(related),
-            total_observations=sum(len(obs) for obs in observations_by_entity.values()),
-            total_relations=sum(1 for r in related if r.type == SearchItemType.RELATION),
-        )
-
-        # Build context results list directly with ContextResultItem objects
-        context_results = []
-
-        # For each primary result
-        for primary_item in primary:
-            # Find all related items with this primary item as root
-            related_to_primary = [r for r in related if r.root_id == primary_item.id]
-
-            # Get observations for this item if it's an entity
-            item_observations = []
-            if primary_item.type == SearchItemType.ENTITY.value and include_observations:
-                # Convert Observation models to ContextResultRows
-                for obs in observations_by_entity.get(primary_item.id, []):
-                    item_observations.append(
-                        ContextResultRow(
-                            type="observation",
-                            id=obs.id,
-                            title=f"{obs.category}: {obs.content[:50]}...",
-                            permalink=generate_permalink(
-                                f"{primary_item.permalink}/observations/{obs.category}/{obs.content}"
-                            ),
-                            file_path=primary_item.file_path,
-                            content=obs.content,
-                            category=obs.category,
-                            entity_id=primary_item.id,
-                            depth=0,
-                            root_id=primary_item.id,
-                            created_at=parse_datetime(primary_item.created_at),
+                    context_results.append(
+                        ContextResultItem(
+                            primary_result=primary_item,
+                            observations=item_observations,
+                            related_results=related_to_primary,
                         )
                     )
 
-            # Create ContextResultItem directly
-            context_item = ContextResultItem(
-                primary_result=primary_item,
-                observations=item_observations,
-                related_results=related_to_primary,
-            )
-
-            context_results.append(context_item)
-
-        # Return the structured ContextResult
-        return ContextResult(results=context_results, metadata=metadata)
+            return ContextResult(results=context_results, metadata=metadata)
 
     async def find_related(
         self,
@@ -268,7 +320,9 @@ class ContextService:
             if isinstance(self.search_repository, PostgresSearchRepository):  # pragma: no cover
                 # asyncpg expects timezone-NAIVE datetime in UTC for DateTime(timezone=True) columns
                 # even though the column stores timezone-aware values
-                since_utc = since.astimezone(timezone.utc) if since.tzinfo else since  # pragma: no cover
+                since_utc = (
+                    since.astimezone(timezone.utc) if since.tzinfo else since
+                )  # pragma: no cover
                 params["since_date"] = since_utc.replace(tzinfo=None)  # pyright: ignore  # pragma: no cover
             else:
                 params["since_date"] = since.isoformat()  # pyright: ignore
@@ -557,9 +611,7 @@ class ContextService:
                 {relation_date_filter}
                 {relation_project_filter}
             )
-            LEFT JOIN entity e_to ON (r.to_id = e_to.id)
             WHERE eg.depth < :max_depth
-            AND (r.to_id IS NULL OR e_to.project_id = :project_id)
 
             UNION ALL
 

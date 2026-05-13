@@ -65,7 +65,14 @@ class EditEntityRequest(BaseModel):
     Supports various operation types for different editing scenarios.
     """
 
-    operation: Literal["append", "prepend", "find_replace", "replace_section"]
+    operation: Literal[
+        "append",
+        "prepend",
+        "find_replace",
+        "replace_section",
+        "insert_before_section",
+        "insert_after_section",
+    ]
     content: str
     section: Optional[str] = None
     find_text: Optional[str] = None
@@ -75,8 +82,16 @@ class EditEntityRequest(BaseModel):
     @classmethod
     def validate_section_for_replace_section(cls, v, info):
         """Ensure section is provided for replace_section operation."""
-        if info.data.get("operation") == "replace_section" and not v:
-            raise ValueError("section parameter is required for replace_section operation")
+        if (
+            info.data.get("operation")
+            in (
+                "replace_section",
+                "insert_before_section",
+                "insert_after_section",
+            )
+            and not v
+        ):
+            raise ValueError("section parameter is required for section-based operations")
         return v
 
     @field_validator("find_text")
@@ -109,4 +124,28 @@ class MoveEntityRequest(BaseModel):
             raise ValueError("destination_path cannot contain '..' path components")
         if not v.strip():
             raise ValueError("destination_path cannot be empty or whitespace only")
+        return v.strip()
+
+
+class MoveDirectoryRequest(BaseModel):
+    """Request schema for moving an entire directory to a new location.
+
+    This moves all entities within a directory to a new location while
+    maintaining project consistency and updating database references.
+    """
+
+    source_directory: Annotated[str, MinLen(1), MaxLen(500)]
+    destination_directory: Annotated[str, MinLen(1), MaxLen(500)]
+    project: Optional[str] = None
+
+    @field_validator("source_directory", "destination_directory")
+    @classmethod
+    def validate_directory_path(cls, v):
+        """Ensure directory path is relative and valid."""
+        if v.startswith("/"):  # pragma: no cover
+            raise ValueError("directory path must be relative, not absolute")
+        if ".." in v:  # pragma: no cover
+            raise ValueError("directory path cannot contain '..' path components")
+        if not v.strip():  # pragma: no cover
+            raise ValueError("directory path cannot be empty or whitespace only")
         return v.strip()

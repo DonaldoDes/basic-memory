@@ -91,10 +91,11 @@ SQLite Database (Index)
 # List all projects
 projects = await list_memory_projects()
 
-# Response structure:
+# Response structure (each entry includes external_id you can pass as project_id):
 # [
 #   {
 #     "name": "main",
+#     "external_id": "550e8400-e29b-41d4-a716-446655440000",
 #     "path": "/Users/name/notes",
 #     "is_default": True,
 #     "note_count": 156,
@@ -102,6 +103,7 @@ projects = await list_memory_projects()
 #   },
 #   {
 #     "name": "work",
+#     "external_id": "9f86d081-884c-42a3-b5e3-1c0c5b4c8e52",
 #     "path": "/Users/name/work-notes",
 #     "is_default": False,
 #     "note_count": 89,
@@ -163,6 +165,44 @@ active_project = "main"
 # 4. Use in all subsequent calls
 results = await search_notes(query="topic", project=active_project)
 ```
+
+### `project` vs `project_id`
+
+Every project has two identifiers:
+
+- **`project`** — human-readable name (e.g., `"main"`). Easy to use, but can collide across cloud workspaces.
+- **`project_id`** — stable `external_id` UUID. Always unambiguous; takes precedence over `project` when both are passed.
+
+**When to prefer `project_id`:**
+
+1. **Cloud multi-workspace setups.** If the user belongs to more than one workspace (personal + organization, or several organizations) and the same project name might exist in more than one of them, pass `project_id` to route to the exact project. Without it, name resolution falls back to the default workspace, which may not be the one the user means.
+2. **After `list_memory_projects()`.** Once you have the `external_id`, prefer using it — it's the same number of characters in JSON and saves a name-resolution round-trip.
+3. **When persisting a project choice across a long session.** UUIDs are stable; names can be renamed.
+
+**When `project` (name) is fine:**
+
+- Local single-workspace setups (no collision risk).
+- One-off operations where the name is clearly visible to the user (e.g., quick `search_notes(project="main", ...)`).
+- The user explicitly references a project by name in their message.
+
+**Example — cloud multi-workspace pattern:**
+
+```python
+# Discover and pick the right project for this user
+projects = await list_memory_projects()
+target = next(p for p in projects if p["name"] == "research" and p["workspace"]["slug"] == "acme")
+
+# Use the UUID for all subsequent operations — no ambiguity
+await write_note(
+    title="Meeting Notes",
+    content="...",
+    folder="meetings",
+    project_id=target["external_id"],
+)
+results = await search_notes(query="kickoff", project_id=target["external_id"])
+```
+
+**Precedence rule:** When both are passed, `project_id` wins. This lets you safely supply `project="main"` for backward compatibility while still routing precisely with `project_id`.
 
 ### Cross-Project Operations
 
@@ -426,6 +466,8 @@ await write_note(
     project="main"
 )
 ```
+
+> **Important**: `write_note` errors if the note already exists. Use `edit_note` for incremental changes, or pass `overwrite=True` to replace.
 
 **Well-structured note**:
 
@@ -760,6 +802,9 @@ notes = await read_note(
     identifier="memory://specs/*",
     project="main"
 )
+
+# Cross-project URL (auto-routes to the correct project)
+note = await read_note(identifier="memory://research/specs/api-design")
 ```
 
 ```python
@@ -1038,9 +1083,41 @@ recent_decisions = await search_notes(
 )
 ```
 
+**Structured frontmatter filters**:
+
+```python
+# Filter by tags and status
+results = await search_notes(
+    query="authentication",
+    tags=["security"],
+    status="in-progress",
+    project="main"
+)
+
+# Complex metadata filters (supports $in, $gt, $gte, $lt, $lte, $between)
+results = await search_notes(
+    query="api design",
+    metadata_filters={
+        "type": "spec",
+        "priority": {"$in": ["high", "critical"]},
+        "tags": ["architecture"]
+    },
+    project="main"
+)
+
+# Metadata-only search (no query needed)
+results = await search_notes(
+    metadata_filters={"type": "spec", "status": "in-progress"},
+    project="main"
+)
+```
+
 ### Search Types
 
-**Text search (default)**:
+Available types: `"text"`, `"title"`, `"permalink"`, `"vector"`/`"semantic"`, `"hybrid"`.
+Default is `"hybrid"` when semantic search is enabled, `"text"` otherwise.
+
+**Text search**:
 
 ```python
 # Full-text search across all content
@@ -1051,15 +1128,50 @@ results = await search_notes(
 )
 ```
 
-**Semantic search**:
+**Title and permalink search**:
+
+```python
+# Search by title only
+results = await search_notes(query="API Design", search_type="title", project="main")
+
+# Search by permalink
+results = await search_notes(query="specs/api-design", search_type="permalink", project="main")
+```
+
+**Semantic/vector search**:
 
 ```python
 # Semantic/vector search (if enabled)
 results = await search_notes(
     query="user login security",
-    search_type="semantic",
+    search_type="semantic",  # or "vector"
     project="main"
 )
+
+# Override similarity threshold
+results = await search_notes(
+    query="user login security",
+    search_type="semantic",
+    min_similarity=0.5,
+    project="main"
+)
+```
+
+**Hybrid search** (combines text + semantic):
+
+```python
+results = await search_notes(
+    query="authentication best practices",
+    search_type="hybrid",
+    project="main"
+)
+```
+
+**Tag shorthand in query**:
+
+```python
+# Use tag: prefix as shorthand
+results = await search_notes(query="tag:security", project="main")
 ```
 
 ### Search Response
@@ -2132,6 +2244,31 @@ active_project = projects[0]["name"]
 results = await search_notes(query="test", project=active_project)
 ```
 
+### Note Already Exists
+
+**Error**: `write_note` called for a note that already exists
+
+**Solution**:
+
+```python
+# Preferred: use edit_note for incremental updates
+await edit_note(
+    identifier="Existing Topic",
+    operation="append",
+    content="\n- [update] new information",
+    project="main"
+)
+
+# Alternative: replace the entire note
+await write_note(
+    title="Existing Topic",
+    content="# Existing Topic\n...",
+    folder="notes",
+    overwrite=True,
+    project="main"
+)
+```
+
 ### Entity Not Found
 
 **Error**: Note doesn't exist
@@ -2687,14 +2824,15 @@ await write_note(
 
 ### Content Management
 
-**write_note(title, content, folder, tags, note_type, project)**
-- Create or update markdown notes
+**write_note(title, content, folder, tags, note_type, overwrite, project)**
+- Create new markdown notes (errors if note already exists unless overwrite=True)
 - Parameters:
   - `title` (required): Note title
   - `content` (required): Markdown content
   - `folder` (required): Destination folder
   - `tags` (optional): List of tags
   - `note_type` (optional): Type of note (stored in frontmatter). Can be "note", "person", "meeting", "guide", etc.
+  - `overwrite` (optional): Set to True to replace an existing note (default: error if exists)
   - `project` (required unless default_project_mode): Target project
 - Returns: Created/updated entity with permalink
 - Example:
@@ -2861,16 +2999,20 @@ contents = await list_directory(
 
 ### Search & Discovery
 
-**search_notes(query, page, page_size, search_type, types, entity_types, after_date, project)**
+**search_notes(query, page, page_size, search_type, types, entity_types, after_date, metadata_filters, tags, status, min_similarity, project)**
 - Search across knowledge base
 - Parameters:
-  - `query` (required): Search query
+  - `query` (optional): Search query (not required for filter-only searches)
   - `page` (optional): Page number (default: 1)
   - `page_size` (optional): Results per page (default: 10)
-  - `search_type` (optional): "text" or "semantic"
+  - `search_type` (optional): "text", "title", "permalink", "vector"/"semantic", "hybrid" (default: "hybrid" when semantic enabled, "text" otherwise)
   - `types` (optional): Entity type filter
   - `entity_types` (optional): Observation category filter
   - `after_date` (optional): Date filter (ISO format)
+  - `metadata_filters` (optional): Structured frontmatter filters (dict, supports `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$between` operators)
+  - `tags` (optional): Frontmatter tags filter (list); also available via `tag:` query shorthand
+  - `status` (optional): Frontmatter status filter (string)
+  - `min_similarity` (optional): Override similarity threshold for vector/hybrid search
   - `project` (required unless default_project_mode): Target project
 - Returns: Matching entities with scores
 - Example:
@@ -2879,6 +3021,15 @@ results = await search_notes(
     query="authentication",
     types=["spec", "decision"],
     after_date="2025-01-01",
+    project="main"
+)
+```
+
+**Metadata-only search (via search_notes)**
+- Use `search_notes` with `metadata_filters` and no `query` for metadata-only searches:
+```python
+results = await search_notes(
+    metadata_filters={"type": "spec", "status": "in-progress"},
     project="main"
 )
 ```
@@ -2928,6 +3079,15 @@ await delete_project(project_name="old-project")
 - Example:
 ```python
 status = await sync_status(project="main")
+```
+
+**list_workspaces()**
+- List available workspaces (cloud)
+- Parameters: None
+- Returns: List of workspaces with metadata
+- Example:
+```python
+workspaces = await list_workspaces()
 ```
 
 ### Visualization
@@ -3198,8 +3358,8 @@ await edit_note(
     project="main"
 )
 
-# Avoid: Complete rewrite
-# (unless necessary for major restructuring)
+# When full rewrite is needed, use overwrite=True
+await write_note(title="Note", content="...", folder="notes", overwrite=True)
 ```
 
 ### 14. Tagging Strategy

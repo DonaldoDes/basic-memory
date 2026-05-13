@@ -1,268 +1,143 @@
-"""Tests for telemetry module (minimal mocking).
-
-We avoid standard-library mocks and instead use small stub objects + pytest monkeypatch.
-"""
+"""Tests for Logfire telemetry bootstrap."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from basic_memory.config import BasicMemoryConfig
-
-
-class _StubOpenPanel:
-    def __init__(self, *, client_id: str, client_secret: str, disabled: bool = False):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.disabled = disabled
-        self.global_properties: dict | None = None
-        self.events: list[tuple[str, dict]] = []
-        self.raise_on_track: Exception | None = None
-
-    def set_global_properties(self, props: dict) -> None:
-        self.global_properties = props
-
-    def track(self, event: str, properties: dict) -> None:
-        if self.raise_on_track:
-            raise self.raise_on_track
-        self.events.append((event, properties))
-
-
-class _StubConsole:
-    def __init__(self, *args, **kwargs):
-        self.print_calls: list[tuple[tuple, dict]] = []
-
-    def print(self, *args, **kwargs):
-        self.print_calls.append((args, kwargs))
-
-
-class TestGetInstallId:
-    def test_creates_install_id_on_first_call(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        from basic_memory.telemetry import get_install_id
-
-        install_id = get_install_id()
-        assert len(install_id) == 36
-        assert install_id.count("-") == 4
-
-        id_file = tmp_path / ".basic-memory" / ".install_id"
-        assert id_file.exists()
-        assert id_file.read_text().strip() == install_id
-
-    def test_returns_existing_install_id(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        id_file = tmp_path / ".basic-memory" / ".install_id"
-        id_file.parent.mkdir(parents=True, exist_ok=True)
-        id_file.write_text("test-uuid-12345")
-
-        from basic_memory.telemetry import get_install_id
-
-        assert get_install_id() == "test-uuid-12345"
-
-
-class TestTelemetryConfig:
-    def test_telemetry_enabled_defaults_to_true(self, config_home, monkeypatch):
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        assert BasicMemoryConfig().telemetry_enabled is True
-
-    def test_telemetry_notice_shown_defaults_to_false(self, config_home, monkeypatch):
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        assert BasicMemoryConfig().telemetry_notice_shown is False
-
-    def test_telemetry_enabled_via_env_var(self, config_home, monkeypatch):
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        monkeypatch.setenv("BASIC_MEMORY_TELEMETRY_ENABLED", "false")
-        assert BasicMemoryConfig().telemetry_enabled is False
-
-
-class TestTrack:
-    def test_track_does_not_raise_on_error(self, config_home, monkeypatch):
-        import basic_memory.telemetry as telemetry
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        telemetry.reset_client()
-
-        # Replace OpenPanel with a stub that raises on track
-        stub_client = _StubOpenPanel(client_id="id", client_secret="sec", disabled=False)
-        stub_client.raise_on_track = Exception("Network error")
-
-        def openpanel_factory(*, client_id, client_secret, disabled=False):
-            stub_client.client_id = client_id
-            stub_client.client_secret = client_secret
-            stub_client.disabled = disabled
-            return stub_client
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-
-        # Should not raise
-        telemetry.track("test_event", {"key": "value"})
-
-    def test_track_respects_disabled_config(self, config_home, monkeypatch):
-        import basic_memory.telemetry as telemetry
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        telemetry.reset_client()
-
-        monkeypatch.setenv("BASIC_MEMORY_TELEMETRY_ENABLED", "false")
-
-        created: list[_StubOpenPanel] = []
-
-        def openpanel_factory(*, client_id, client_secret, disabled=False):
-            client = _StubOpenPanel(client_id=client_id, client_secret=client_secret, disabled=disabled)
-            created.append(client)
-            return client
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-
-        telemetry.track("test_event")
-        assert len(created) == 1
-        assert created[0].disabled is True
-
-
-class TestShowNoticeIfNeeded:
-    def test_shows_notice_when_enabled_and_not_shown(self, config_manager, monkeypatch):
-        import basic_memory.telemetry as telemetry
-
-        telemetry.reset_client()
-
-        # Ensure config state: enabled + not yet shown
-        cfg = config_manager.load_config()
-        cfg.telemetry_enabled = True
-        cfg.telemetry_notice_shown = False
-        config_manager.save_config(cfg)
-
-        instances: list[_StubConsole] = []
-
-        def console_factory(*_args, **_kwargs):
-            c = _StubConsole()
-            instances.append(c)
-            return c
-
-        monkeypatch.setattr("rich.console.Console", console_factory)
-
-        telemetry.show_notice_if_needed()
-
-        assert len(instances) == 1
-        assert len(instances[0].print_calls) == 1
-
-        cfg2 = config_manager.load_config()
-        assert cfg2.telemetry_notice_shown is True
-
-    def test_does_not_show_notice_when_disabled(self, config_manager, monkeypatch):
-        import basic_memory.telemetry as telemetry
-
-        telemetry.reset_client()
-
-        cfg = config_manager.load_config()
-        cfg.telemetry_enabled = False
-        cfg.telemetry_notice_shown = False
-        config_manager.save_config(cfg)
-
-        def console_factory(*_args, **_kwargs):
-            raise AssertionError("Console should not be constructed when telemetry is disabled")
-
-        monkeypatch.setattr("rich.console.Console", console_factory)
-
-        telemetry.show_notice_if_needed()
-
-
-class TestConvenienceFunctions:
-    def test_track_app_started(self, config_home, monkeypatch):
-        import basic_memory.telemetry as telemetry
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        telemetry.reset_client()
-
-        created: list[_StubOpenPanel] = []
-
-        def openpanel_factory(*, client_id, client_secret, disabled=False):
-            client = _StubOpenPanel(client_id=client_id, client_secret=client_secret, disabled=disabled)
-            created.append(client)
-            return client
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-
-        telemetry.track_app_started("cli")
-        assert created
-        assert created[0].events[-1] == ("app_started", {"mode": "cli"})
-
-    def test_track_mcp_tool(self, config_home, monkeypatch):
-        import basic_memory.telemetry as telemetry
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        telemetry.reset_client()
-
-        created: list[_StubOpenPanel] = []
-
-        def openpanel_factory(*, client_id, client_secret, disabled=False):
-            client = _StubOpenPanel(client_id=client_id, client_secret=client_secret, disabled=disabled)
-            created.append(client)
-            return client
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-
-        telemetry.track_mcp_tool("write_note")
-        assert created
-        assert created[0].events[-1] == ("mcp_tool_called", {"tool": "write_note"})
-
-    def test_track_error_truncates_message(self, config_home, monkeypatch):
-        import basic_memory.telemetry as telemetry
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        telemetry.reset_client()
-
-        created: list[_StubOpenPanel] = []
-
-        def openpanel_factory(*, client_id, client_secret, disabled=False):
-            client = _StubOpenPanel(client_id=client_id, client_secret=client_secret, disabled=disabled)
-            created.append(client)
-            return client
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-
-        telemetry.track_error("ValueError", "x" * 500)
-        _, props = created[0].events[-1]
-        assert len(props["message"]) == 200
-
-    def test_track_error_sanitizes_file_paths(self, config_home, monkeypatch):
-        import basic_memory.telemetry as telemetry
-        import basic_memory.config
-
-        basic_memory.config._CONFIG_CACHE = None
-        telemetry.reset_client()
-
-        created: list[_StubOpenPanel] = []
-
-        def openpanel_factory(*, client_id, client_secret, disabled=False):
-            client = _StubOpenPanel(client_id=client_id, client_secret=client_secret, disabled=disabled)
-            created.append(client)
-            return client
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-
-        telemetry.track_error("FileNotFoundError", "No such file: /Users/john/notes/secret.md")
-        _, props = created[0].events[-1]
-        assert "/Users/john" not in props["message"]
-        assert "[FILE]" in props["message"]
-
-        telemetry.reset_client()
-        created.clear()
-
-        monkeypatch.setattr(telemetry, "OpenPanel", openpanel_factory)
-        telemetry.track_error("FileNotFoundError", "Cannot open C:\\Users\\john\\docs\\private.txt")
-        _, props = created[0].events[-1]
-        assert "C:\\Users\\john" not in props["message"]
-        assert "[FILE]" in props["message"]
-
-
+from basic_memory import __version__, telemetry
+from basic_memory.config import init_api_logging, init_cli_logging, init_mcp_logging
+
+
+class FakeLogfire:
+    """Minimal fake of the logfire module surface configure_telemetry touches."""
+
+    class CodeSource:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def __init__(self, *, fail_on_send_to_logfire: bool = False) -> None:
+        self.fail_on_send_to_logfire = fail_on_send_to_logfire
+        self.configure_calls: list[dict] = []
+
+    def configure(self, **kwargs) -> None:
+        self.configure_calls.append(kwargs)
+        if self.fail_on_send_to_logfire and "send_to_logfire" in kwargs:
+            raise TypeError("send_to_logfire not supported")
+
+    def loguru_handler(self) -> dict:
+        return {"sink": "fake-logfire", "level": "INFO"}
+
+
+def test_configure_telemetry_disabled_is_noop() -> None:
+    enabled = telemetry.configure_telemetry(
+        "basic-memory-cli",
+        environment="dev",
+        enable_logfire=False,
+    )
+
+    assert enabled is False
+    assert telemetry.get_logfire_handler() is None
+
+
+def test_configure_telemetry_configures_logfire(monkeypatch) -> None:
+    fake_logfire = FakeLogfire()
+    monkeypatch.setattr(telemetry, "logfire", fake_logfire)
+
+    enabled = telemetry.configure_telemetry(
+        "basic-memory-api",
+        environment="prod",
+        service_version="abc123",
+        enable_logfire=True,
+        send_to_logfire=True,
+    )
+
+    assert enabled is True
+    assert telemetry.get_logfire_handler() == {"sink": "fake-logfire", "level": "INFO"}
+    assert len(fake_logfire.configure_calls) == 1
+    assert fake_logfire.configure_calls[0]["send_to_logfire"] is True
+
+
+def test_configure_telemetry_retries_without_send_to_logfire(monkeypatch) -> None:
+    fake_logfire = FakeLogfire(fail_on_send_to_logfire=True)
+    monkeypatch.setattr(telemetry, "logfire", fake_logfire)
+
+    enabled = telemetry.configure_telemetry(
+        "basic-memory-api",
+        environment="prod",
+        enable_logfire=True,
+        send_to_logfire=True,
+    )
+
+    assert enabled is True
+    assert len(fake_logfire.configure_calls) == 2
+    assert fake_logfire.configure_calls[0]["send_to_logfire"] is True
+    assert "send_to_logfire" not in fake_logfire.configure_calls[1]
+
+
+def test_configure_telemetry_clears_handler_when_disabled(monkeypatch) -> None:
+    """A prior enabled configure must not leak its handler into a later disabled one."""
+    fake_logfire = FakeLogfire()
+    monkeypatch.setattr(telemetry, "logfire", fake_logfire)
+
+    telemetry.configure_telemetry("basic-memory-cli", environment="dev", enable_logfire=True)
+    assert telemetry.get_logfire_handler() is not None
+
+    telemetry.configure_telemetry("basic-memory-cli", environment="dev", enable_logfire=False)
+    assert telemetry.get_logfire_handler() is None
+
+
+def test_init_logging_functions_configure_telemetry_and_logging(monkeypatch) -> None:
+    telemetry_calls: list[dict] = []
+    setup_calls: list[dict] = []
+
+    class StubConfig:
+        logfire_enabled = True
+        logfire_send_to_logfire = False
+        logfire_service_name = "basic-memory"
+        logfire_environment = "staging"
+        env = "dev"
+
+    monkeypatch.setattr(
+        "basic_memory.config.ConfigManager", lambda: type("CM", (), {"config": StubConfig()})()
+    )
+    monkeypatch.setattr(
+        "basic_memory.config.configure_telemetry",
+        lambda **kwargs: telemetry_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        "basic_memory.config.setup_logging",
+        lambda **kwargs: setup_calls.append(kwargs),
+    )
+    monkeypatch.setenv("BASIC_MEMORY_LOG_LEVEL", "DEBUG")
+    monkeypatch.delenv("BASIC_MEMORY_CLOUD_MODE", raising=False)
+
+    init_cli_logging()
+    init_mcp_logging()
+    init_api_logging()
+
+    assert telemetry_calls == [
+        {
+            "service_name": "basic-memory-cli",
+            "environment": "staging",
+            "service_version": __version__,
+            "enable_logfire": True,
+            "send_to_logfire": False,
+        },
+        {
+            "service_name": "basic-memory-mcp",
+            "environment": "staging",
+            "service_version": __version__,
+            "enable_logfire": True,
+            "send_to_logfire": False,
+        },
+        {
+            "service_name": "basic-memory-api",
+            "environment": "staging",
+            "service_version": __version__,
+            "enable_logfire": True,
+            "send_to_logfire": False,
+        },
+    ]
+    assert setup_calls == [
+        {"log_level": "DEBUG", "log_to_file": True},
+        {"log_level": "DEBUG", "log_to_file": True},
+        {"log_level": "DEBUG", "log_to_file": True},
+    ]

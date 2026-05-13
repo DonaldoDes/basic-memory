@@ -1,6 +1,7 @@
 *.py[cod]
 __pycache__/
 .pytest_cache/
+.testmondata*
 .coverage
 htmlcov/
 
@@ -55,3 +56,5 @@ claude-output
 **/.claude/settings.local.json
 .mcp.json
 .mcpregistry_*
+/.testmondata
+.benchmarks/

@@ -7,6 +7,7 @@ from typing import Optional
 
 from httpx import AsyncClient
 
+import logfire
 from basic_memory.mcp.tools.utils import call_get
 from basic_memory.schemas.memory import GraphContext
 
@@ -71,11 +72,21 @@ class MemoryClient:
         if timeframe:
             params["timeframe"] = timeframe
 
-        response = await call_get(
-            self.http_client,
-            f"{self._base_path}/{path}",
-            params=params,
-        )
+        with logfire.span(
+            "mcp.client.memory.build_context",
+            client_name="memory",
+            operation="build_context",
+            page=page,
+            page_size=page_size,
+        ):
+            response = await call_get(
+                self.http_client,
+                f"{self._base_path}/{path}",
+                params=params,
+                client_name="memory",
+                operation="build_context",
+                path_template="/v2/projects/{project_id}/memory/{path}",
+            )
         return GraphContext.model_validate(response.json())
 
     async def recent(
@@ -112,9 +123,19 @@ class MemoryClient:
             # Join types as comma-separated string if provided
             params["type"] = ",".join(types) if isinstance(types, list) else types
 
-        response = await call_get(
-            self.http_client,
-            f"{self._base_path}/recent",
-            params=params,
-        )
+        with logfire.span(
+            "mcp.client.memory.recent_activity",
+            client_name="memory",
+            operation="recent_activity",
+            page=page,
+            page_size=page_size,
+        ):
+            response = await call_get(
+                self.http_client,
+                f"{self._base_path}/recent",
+                params=params,
+                client_name="memory",
+                operation="recent_activity",
+                path_template="/v2/projects/{project_id}/memory/recent",
+            )
         return GraphContext.model_validate(response.json())

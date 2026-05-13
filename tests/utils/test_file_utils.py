@@ -4,6 +4,7 @@ import random
 import string
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -19,7 +20,7 @@ from basic_memory.file_utils import (
     parse_frontmatter,
     remove_frontmatter,
     sanitize_for_filename,
-    sanitize_for_folder,
+    sanitize_for_directory,
     write_file_atomic,
 )
 
@@ -55,7 +56,7 @@ async def test_compute_checksum_error():
     """Test checksum error handling."""
     with pytest.raises(FileError):
         # Try to hash an object that can't be encoded
-        await compute_checksum(object())  # pyright: ignore [reportArgumentType]
+        await compute_checksum(cast(Any, object()))
 
 
 @pytest.mark.asyncio
@@ -198,30 +199,43 @@ def test_sanitize_for_filename_removes_invalid_characters():
         assert char not in sanitized_text
 
 
+def test_sanitize_for_filename_strips_trailing_periods():
+    """Trailing periods cause double-dot filenames like 'hi-everyone..md'.
+
+    This was a production bug where title "Hi everyone." produced file path
+    "hi-everyone..md" which failed path traversal validation.
+    """
+    assert sanitize_for_filename("Hi everyone.") == "Hi everyone"
+    assert sanitize_for_filename("test...") == "test"
+    assert sanitize_for_filename(".hidden") == "hidden"
+    assert sanitize_for_filename("...dots...") == "dots"
+    assert sanitize_for_filename("normal title") == "normal title"
+
+
 @pytest.mark.parametrize(
-    "input_folder,expected",
+    "input_directory,expected",
     [
         ("", ""),  # Empty string
         ("   ", ""),  # Whitespace only
-        ("my-folder", "my-folder"),  # Simple folder
-        ("my/folder", "my/folder"),  # Nested folder
-        ("my//folder", "my/folder"),  # Double slash compressed
-        ("my\\\\folder", "my/folder"),  # Windows-style double backslash compressed
-        ("my/folder/", "my/folder"),  # Trailing slash removed
-        ("/my/folder", "my/folder"),  # Leading slash removed
-        ("./my/folder", "my/folder"),  # Leading ./ removed
-        ("my<>folder", "myfolder"),  # Special chars removed
-        ("my:folder|test", "myfoldertest"),  # More special chars removed
-        ("my_folder-1", "my_folder-1"),  # Allowed chars preserved
-        ("my folder", "my folder"),  # Space preserved
-        ("my/folder//sub//", "my/folder/sub"),  # Multiple compressions and trims
-        ("my\\folder\\sub", "my/folder/sub"),  # Windows-style separators normalized
-        ("my/folder<>:|?*sub", "my/foldersub"),  # All invalid chars removed
-        ("////my////folder////", "my/folder"),  # Excessive leading/trailing/multiple slashes
+        ("my-directory", "my-directory"),  # Simple directory
+        ("my/directory", "my/directory"),  # Nested directory
+        ("my//directory", "my/directory"),  # Double slash compressed
+        ("my\\\\directory", "my/directory"),  # Windows-style double backslash compressed
+        ("my/directory/", "my/directory"),  # Trailing slash removed
+        ("/my/directory", "my/directory"),  # Leading slash removed
+        ("./my/directory", "my/directory"),  # Leading ./ removed
+        ("my<>directory", "mydirectory"),  # Special chars removed
+        ("my:directory|test", "mydirectorytest"),  # More special chars removed
+        ("my_directory-1", "my_directory-1"),  # Allowed chars preserved
+        ("my directory", "my directory"),  # Space preserved
+        ("my/directory//sub//", "my/directory/sub"),  # Multiple compressions and trims
+        ("my\\directory\\sub", "my/directory/sub"),  # Windows-style separators normalized
+        ("my/directory<>:|?*sub", "my/directorysub"),  # All invalid chars removed
+        ("////my////directory////", "my/directory"),  # Excessive leading/trailing/multiple slashes
     ],
 )
-def test_sanitize_for_folder_edge_cases(input_folder, expected):
-    assert sanitize_for_folder(input_folder) == expected
+def test_sanitize_for_directory_edge_cases(input_directory, expected):
+    assert sanitize_for_directory(input_directory) == expected
 
 
 # =============================================================================

@@ -3,16 +3,14 @@
 These prompts help users search and explore their knowledge base.
 """
 
+from textwrap import dedent
 from typing import Annotated, Optional
 
 from loguru import logger
 from pydantic import Field
 
-from basic_memory.config import get_project_config
-from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.tools.utils import call_post
-from basic_memory.schemas.prompt import SearchPromptRequest
+from basic_memory.mcp.tools.search import search_notes
 
 
 @mcp.prompt(
@@ -40,17 +38,60 @@ async def search_prompt(
     """
     logger.info(f"Searching knowledge base, query: {query}, timeframe: {timeframe}")
 
-    async with get_client() as client:
-        # Create request model
-        request = SearchPromptRequest(query=query, timeframe=timeframe)
+    # Use json format to get structured data for result counting and formatting
+    result = await search_notes(query=query, after_date=timeframe, output_format="json")
 
-        project_url = get_project_config().project_url
+    # Format the tool output into a prompt with guidance
+    if isinstance(result, dict):
+        results = result.get("results", [])
+        result_count = len(results)
+        result_text = _format_search_results(results, query)
+    else:
+        # Error string from search tool
+        result_count = 0
+        result_text = str(result)
 
-        # Call the prompt API endpoint
-        response = await call_post(
-            client, f"{project_url}/prompt/search", json=request.model_dump(exclude_none=True)
-        )
+    return dedent(f"""
+        # Search Results: "{query}"
 
-        # Extract the rendered prompt from the response
-        result = response.json()
-        return result["prompt"]
+        This is a memory retrieval session showing search results.
+
+        {result_text}
+
+        ---
+
+        ## Next Steps
+
+        Based on these {result_count} results, you can:
+
+        1. **Read a specific note** - Use `read_note("permalink")` to see full content
+        2. **Build context** - Use `build_context("memory://path")` to see relationships
+        3. **Refine search** - Use `search_notes("refined query")` to narrow results
+        4. **Check recent activity** - Use `recent_activity(timeframe="7d")` for recent changes
+    """)
+
+
+def _format_search_results(results: list[dict], query: str) -> str:
+    """Format search result dicts into readable markdown."""
+    if not results:
+        return f"No results found for '{query}'."
+
+    lines = [f"Found {len(results)} results:\n"]
+
+    for item in results:
+        title = item.get("title", "Untitled")
+        permalink = item.get("permalink", "")
+        score = item.get("score")
+        score_text = f" (score: {score:.2f})" if score else ""
+
+        lines.append(f"- **{title}**{score_text}")
+        if permalink:
+            lines.append(f"  permalink: {permalink}")
+        content = item.get("content")
+        if content:
+            # Truncate content snippet
+            content = content[:200] + "..." if len(content) > 200 else content
+            lines.append(f"  {content}")
+        lines.append("")
+
+    return "\n".join(lines)

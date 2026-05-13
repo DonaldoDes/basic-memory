@@ -11,13 +11,19 @@ from basic_memory.mcp.tools.read_content import read_content
 from basic_memory.mcp.tools.build_context import build_context
 from basic_memory.mcp.tools.recent_activity import recent_activity
 from basic_memory.mcp.tools.read_note import read_note
+
+# TODO: re-enable once MCP client rendering is working
+# from basic_memory.mcp.tools.ui_sdk import read_note_ui, search_notes_ui
 from basic_memory.mcp.tools.view_note import view_note
 from basic_memory.mcp.tools.write_note import write_note
+from basic_memory.mcp.tools.cloud_info import cloud_info
+from basic_memory.mcp.tools.release_notes import release_notes
 from basic_memory.mcp.tools.search import search_notes
 from basic_memory.mcp.tools.canvas import canvas
 from basic_memory.mcp.tools.list_directory import list_directory
 from basic_memory.mcp.tools.edit_note import edit_note
 from basic_memory.mcp.tools.move_note import move_note
+from basic_memory.mcp.tools.workspaces import list_workspaces
 from basic_memory.mcp.tools.project_management import (
     list_memory_projects,
     create_memory_project,
@@ -30,9 +36,13 @@ from basic_memory.mcp.tools.reindex import force_reindex
 # ChatGPT-compatible tools
 from basic_memory.mcp.tools.chatgpt_tools import search, fetch
 
+# Schema tools
+from basic_memory.mcp.tools.schema import schema_validate, schema_infer, schema_diff
+
 __all__ = [
     "build_context",
     "canvas",
+    "cloud_info",
     "create_memory_project",
     "delete_note",
     "delete_project",
@@ -41,12 +51,19 @@ __all__ = [
     "force_reindex",
     "list_directory",
     "list_memory_projects",
+    "list_workspaces",
     "move_note",
     "read_content",
     "read_note",
+    "release_notes",
+    # "read_note_ui",
     "recent_activity",
+    "schema_diff",
+    "schema_infer",
+    "schema_validate",
     "search",
     "search_notes",
+    # "search_notes_ui",
     "view_note",
     "write_note",
 ]

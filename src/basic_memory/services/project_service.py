@@ -6,22 +6,34 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Optional, Sequence
 
 
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError as SAOperationalError
 
 from basic_memory.models import Project
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.schemas import (
     ActivityMetrics,
+    EmbeddingStatus,
     ProjectInfoResponse,
     ProjectStatistics,
     SystemStatus,
 )
-from basic_memory.config import WATCH_STATUS_JSON, ConfigManager, get_project_config, ProjectConfig
+from basic_memory.config import (
+    DatabaseBackend,
+    WATCH_STATUS_JSON,
+    ConfigManager,
+    ProjectEntry,
+    get_project_config,
+    ProjectConfig,
+)
 from basic_memory.utils import generate_permalink
+
+if TYPE_CHECKING:  # pragma: no cover
+    from basic_memory.services.file_service import FileService
 
 
 class ProjectService:
@@ -29,10 +41,11 @@ class ProjectService:
 
     repository: ProjectRepository
 
-    def __init__(self, repository: ProjectRepository):
+    def __init__(self, repository: ProjectRepository, file_service: Optional["FileService"] = None):
         """Initialize the project service."""
         super().__init__()
         self.repository = repository
+        self.file_service = file_service
 
     @property
     def config_manager(self) -> ConfigManager:
@@ -62,20 +75,35 @@ class ProjectService:
         return self.config_manager.projects
 
     @property
-    def default_project(self) -> str:
+    def default_project(self) -> Optional[str]:
         """Get the name of the default project.
 
         Returns:
-            The name of the default project
+            The name of the default project, or None if not set
         """
         return self.config_manager.default_project
 
+    async def get_default_project_name(self) -> str:
+        """Get the default project name, falling back to the database.
+
+        ConfigManager reads from the local config file, which doesn't exist
+        in cloud mode. When it returns None, fall back to the is_default
+        flag stored in the database.
+        """
+        default = self.config_manager.default_project
+        if default is not None:
+            return default
+        db_default = await self.repository.get_default_project()
+        if db_default is not None:
+            return db_default.name
+        raise ValueError("No default project configured")
+
     @property
-    def current_project(self) -> str:
+    def current_project(self) -> Optional[str]:
         """Get the name of the currently active project.
 
         Returns:
-            The name of the current project
+            The name of the current project, or None if not set
         """
         return os.environ.get("BASIC_MEMORY_PROJECT", self.config_manager.default_project)
 
@@ -198,9 +226,19 @@ class ProjectService:
                         f"Projects cannot share directory trees."
                     )
 
-        if not self.config_manager.config.cloud_mode:
-            # First add to config file (this will validate the project doesn't exist)
-            self.config_manager.add_project(name, resolved_path)
+        # Ensure the project directory exists on disk.
+        # Trigger: project_root not set means local filesystem mode (not S3/cloud)
+        # Why: FileService (or future S3FileService) provides cloud-compatible directory creation;
+        #      direct Path.mkdir() bypasses this abstraction
+        # Outcome: directory exists before config/DB entries are written
+        if not self.config_manager.config.project_root:
+            if self.file_service is None:
+                raise ValueError("file_service is required for local project directory creation")
+            await self.file_service.ensure_directory(Path(resolved_path))
+
+        # First add to config file (this validates project uniqueness and keeps
+        # config + database aligned for all backends).
+        self.config_manager.add_project(name, resolved_path)
 
         # Then add to database
         project_data = {
@@ -245,7 +283,7 @@ class ProjectService:
         # In cloud mode: database is source of truth
         # In local mode: also check config file
         is_default = project.is_default
-        if not self.config_manager.config.cloud_mode:
+        if self.config_manager.config.database_backend != DatabaseBackend.POSTGRES:
             is_default = is_default or name == self.config_manager.config.default_project
         if is_default:
             raise ValueError(f"Cannot remove the default project '{name}'")  # pragma: no cover
@@ -300,9 +338,8 @@ class ProjectService:
         # Update database
         await self.repository.set_as_default(project.id)
 
-        # Update config file only in local mode (cloud mode uses database only)
-        if not self.config_manager.config.cloud_mode:
-            self.config_manager.set_default_project(name)
+        # Keep config and database default project in sync for all backends.
+        self.config_manager.set_default_project(name)
 
         logger.info(f"Project '{name}' set as default in configuration and database")
 
@@ -340,7 +377,9 @@ class ProjectService:
             # No default project - set the config default as default
             # This is defensive code for edge cases where no default exists
             config_default = self.config_manager.default_project  # pragma: no cover
-            config_project = await self.repository.get_by_name(config_default)  # pragma: no cover
+            config_project = (
+                await self.repository.get_by_name(config_default) if config_default else None
+            )  # pragma: no cover
             if config_project:  # pragma: no cover
                 await self.repository.set_as_default(config_project.id)  # pragma: no cover
                 logger.info(
@@ -364,11 +403,12 @@ class ProjectService:
         db_projects_by_permalink = {p.permalink: p for p in db_projects}
 
         # Get all projects from configuration and normalize names if needed
-        config_projects = self.config_manager.projects.copy()
-        updated_config = {}
+        # Use .config property (not load_config()) so tests can patch ConfigManager.config
+        config = self.config_manager.config
+        updated_config: Dict[str, ProjectEntry] = {}
         config_updated = False
 
-        for name, path in config_projects.items():
+        for name, entry in config.projects.items():
             # Generate normalized name (what the database expects)
             normalized_name = generate_permalink(name)
 
@@ -376,25 +416,24 @@ class ProjectService:
                 logger.info(f"Normalizing project name in config: '{name}' -> '{normalized_name}'")
                 config_updated = True
 
-            updated_config[normalized_name] = path
+            updated_config[normalized_name] = entry
 
         # Update the configuration if any changes were made
         if config_updated:
-            config = self.config_manager.load_config()
             config.projects = updated_config
             self.config_manager.save_config(config)
             logger.info("Config updated with normalized project names")
 
-        # Use the normalized config for further processing
-        config_projects = updated_config
+        # Use the normalized config for further processing — keys are now project names
+        config_project_names = updated_config
 
         # Add projects that exist in config but not in DB
-        for name, path in config_projects.items():
+        for name, entry in config_project_names.items():
             if name not in db_projects_by_permalink:
                 logger.info(f"Adding project '{name}' to database")
                 project_data = {
                     "name": name,
-                    "path": path,
+                    "path": entry.path,
                     "permalink": generate_permalink(name),
                     "is_active": True,
                     # Don't set is_default here - let the enforcement logic handle it
@@ -405,7 +444,7 @@ class ProjectService:
         # Config is the source of truth - if a project was deleted from config,
         # it should be deleted from DB too (fixes issue #193)
         for name, project in db_projects_by_permalink.items():
-            if name not in config_projects:
+            if name not in config_project_names:
                 logger.info(
                     f"Removing project '{name}' from database (deleted from config, source of truth)"
                 )
@@ -451,13 +490,19 @@ class ProjectService:
         if name not in self.config_manager.projects:
             raise ValueError(f"Project '{name}' not found in configuration")
 
-        # Create the new directory if it doesn't exist
-        Path(resolved_path).mkdir(parents=True, exist_ok=True)
+        # Create the new directory if it doesn't exist (skip in cloud mode where storage is S3)
+        # Trigger: project_root not set means local filesystem mode
+        # Why: FileService (or future S3FileService) provides cloud-compatible directory creation
+        # Outcome: destination directory exists before config/DB are updated
+        if not self.config_manager.config.project_root:
+            if self.file_service is None:
+                raise ValueError("file_service is required for local project directory creation")
+            await self.file_service.ensure_directory(Path(resolved_path))
 
         # Update in configuration
         config = self.config_manager.load_config()
-        old_path = config.projects[name]
-        config.projects[name] = resolved_path
+        old_path = config.projects[name].path
+        config.projects[name].path = resolved_path
         self.config_manager.save_config(config)
 
         # Update in database using robust lookup
@@ -468,7 +513,7 @@ class ProjectService:
         else:
             logger.error(f"Project '{name}' exists in config but not in database")
             # Restore the old path in config since DB update failed
-            config.projects[name] = old_path
+            config.projects[name].path = old_path
             self.config_manager.save_config(config)
             raise ValueError(f"Project '{name}' not found in database")
 
@@ -504,7 +549,7 @@ class ProjectService:
 
             # Update in config
             config = self.config_manager.load_config()
-            config.projects[name] = resolved_path
+            config.projects[name].path = resolved_path
             self.config_manager.save_config(config)
 
             # Update in database
@@ -544,25 +589,33 @@ class ProjectService:
             raise ValueError("Repository is required for get_project_info")
 
         # Use specified project or fall back to config project
-        project_name = project_name or self.config.project
-        # Get project path from configuration
-        name, project_path = self.config_manager.get_project(project_name)
-        if not name:  # pragma: no cover
-            raise ValueError(f"Project '{project_name}' not found in configuration")
-
-        assert project_path is not None
-        project_permalink = generate_permalink(project_name)
+        requested_project_name = project_name or self.config.project
+        project_permalink = generate_permalink(requested_project_name)
 
         # Get project from database to get project_id
         db_project = await self.repository.get_by_permalink(project_permalink)
         if not db_project:  # pragma: no cover
-            raise ValueError(f"Project '{project_name}' not found in database")
+            raise ValueError(f"Project '{requested_project_name}' not found in database")
+
+        # Trigger: cloud-only projects may exist in DB but not in local config.
+        # Why: cloud routing should not require local config entries for project info.
+        # Outcome: prefer config path when available, otherwise use DB path.
+        config_name, config_path = self.config_manager.get_project(db_project.name)
+        if config_name and config_path:
+            resolved_project_name = config_name
+            resolved_project_path = config_path
+        else:
+            resolved_project_name = db_project.name
+            resolved_project_path = db_project.path
 
         # Get statistics for the specified project
         statistics = await self.get_statistics(db_project.id)
 
         # Get activity metrics for the specified project
         activity = await self.get_activity_metrics(db_project.id)
+
+        # Get embedding status for the specified project
+        embedding_status = await self.get_embedding_status(db_project.id)
 
         # Get system status
         system = self.get_system_status()
@@ -573,29 +626,51 @@ class ProjectService:
 
         # Get default project info
         default_project = self.config_manager.default_project
+        if default_project is None:
+            for project in db_projects:
+                if project.is_default:
+                    default_project = project.name
+                    break
 
         # Convert config projects to include database info
         enhanced_projects = {}
-        for name, path in self.config_manager.projects.items():
-            config_permalink = generate_permalink(name)
-            db_project = db_projects_by_permalink.get(config_permalink)
-            enhanced_projects[name] = {
-                "path": path,
-                "active": db_project.is_active if db_project else True,
-                "id": db_project.id if db_project else None,
-                "is_default": (name == default_project),
-                "permalink": db_project.permalink if db_project else name.lower().replace(" ", "-"),
+        for config_project_name, config_project_path in self.config_manager.projects.items():
+            config_permalink = generate_permalink(config_project_name)
+            config_db_project = db_projects_by_permalink.get(config_permalink)
+            enhanced_projects[config_project_name] = {
+                "path": config_project_path,
+                "active": config_db_project.is_active if config_db_project else True,
+                "id": config_db_project.id if config_db_project else None,
+                "is_default": (config_project_name == default_project),
+                "permalink": (
+                    config_db_project.permalink
+                    if config_db_project
+                    else config_project_name.lower().replace(" ", "-")
+                ),
+            }
+
+        # Include active DB projects that are not present in local config (cloud-only).
+        for active_db_project in db_projects:
+            if active_db_project.name in enhanced_projects:
+                continue
+            enhanced_projects[active_db_project.name] = {
+                "path": active_db_project.path,
+                "active": active_db_project.is_active,
+                "id": active_db_project.id,
+                "is_default": bool(active_db_project.is_default),
+                "permalink": active_db_project.permalink,
             }
 
         # Construct the response
         return ProjectInfoResponse(
-            project_name=project_name,
-            project_path=project_path,
+            project_name=resolved_project_name,
+            project_path=resolved_project_path,
             available_projects=enhanced_projects,
             default_project=default_project,
             statistics=statistics,
             activity=activity,
             system=system,
+            embedding_status=embedding_status,
         )
 
     async def get_statistics(self, project_id: int) -> ProjectStatistics:
@@ -638,14 +713,14 @@ class ProjectService:
         )
         total_unresolved = unresolved_count_result.scalar() or 0
 
-        # Get entity counts by type
-        entity_types_result = await self.repository.execute_query(
+        # Get entity counts by note type
+        note_types_result = await self.repository.execute_query(
             text(
-                "SELECT entity_type, COUNT(*) FROM entity WHERE project_id = :project_id GROUP BY entity_type"
+                "SELECT note_type, COUNT(*) FROM entity WHERE project_id = :project_id GROUP BY note_type"
             ),
             {"project_id": project_id},
         )
-        entity_types = {row[0]: row[1] for row in entity_types_result.fetchall()}
+        note_types = {row[0]: row[1] for row in note_types_result.fetchall()}
 
         # Get observation counts by category
         category_result = await self.repository.execute_query(
@@ -707,7 +782,7 @@ class ProjectService:
             total_observations=total_observations,
             total_relations=total_relations,
             total_unresolved_relations=total_unresolved,
-            entity_types=entity_types,
+            note_types=note_types,
             observation_categories=observation_categories,
             relation_types=relation_types,
             most_connected_entities=most_connected,
@@ -726,7 +801,7 @@ class ProjectService:
         # Get recently created entities (project filtered)
         created_result = await self.repository.execute_query(
             text("""
-            SELECT id, title, permalink, entity_type, created_at, file_path 
+            SELECT id, title, permalink, note_type, created_at, file_path
             FROM entity
             WHERE project_id = :project_id
             ORDER BY created_at DESC
@@ -739,7 +814,7 @@ class ProjectService:
                 "id": row[0],
                 "title": row[1],
                 "permalink": row[2],
-                "entity_type": row[3],
+                "note_type": row[3],
                 "created_at": row[4],
                 "file_path": row[5],
             }
@@ -749,7 +824,7 @@ class ProjectService:
         # Get recently updated entities (project filtered)
         updated_result = await self.repository.execute_query(
             text("""
-            SELECT id, title, permalink, entity_type, updated_at, file_path 
+            SELECT id, title, permalink, note_type, updated_at, file_path
             FROM entity
             WHERE project_id = :project_id
             ORDER BY updated_at DESC
@@ -762,7 +837,7 @@ class ProjectService:
                 "id": row[0],
                 "title": row[1],
                 "permalink": row[2],
-                "entity_type": row[3],
+                "note_type": row[3],
                 "updated_at": row[4],
                 "file_path": row[5],
             }
@@ -864,6 +939,193 @@ class ProjectService:
             monthly_growth=monthly_growth,
         )
 
+    async def get_embedding_status(self, project_id: int) -> EmbeddingStatus:
+        """Get embedding/vector index status for the specified project.
+
+        Reports config, counts, and whether a reindex is recommended.
+        """
+        config = self.config_manager.config
+        semantic_enabled = config.semantic_search_enabled
+
+        # When semantic search is disabled, return minimal status
+        if not semantic_enabled:
+            return EmbeddingStatus(semantic_search_enabled=False)
+
+        provider = config.semantic_embedding_provider
+        model = config.semantic_embedding_model
+        dimensions = config.semantic_embedding_dimensions
+
+        is_postgres = config.database_backend == DatabaseBackend.POSTGRES
+
+        # --- Check vector table existence ---
+        # Both search_vector_chunks and search_vector_embeddings must exist
+        # for the detailed stats queries (JOINs between them) to work.
+        if is_postgres:
+            table_check_sql = text(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_name IN ('search_vector_chunks', 'search_vector_embeddings')"
+            )
+        else:
+            table_check_sql = text(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ('search_vector_chunks', 'search_vector_embeddings')"
+            )
+
+        table_result = await self.repository.execute_query(table_check_sql, {})
+        vector_tables_exist = (table_result.scalar() or 0) == 2
+
+        if not vector_tables_exist:
+            # Count distinct entities in search index for the recommendation message
+            si_result = await self.repository.execute_query(
+                text(
+                    "SELECT COUNT(DISTINCT entity_id) FROM search_index "
+                    "WHERE project_id = :project_id"
+                ),
+                {"project_id": project_id},
+            )
+            total_indexed_entities = si_result.scalar() or 0
+
+            return EmbeddingStatus(
+                semantic_search_enabled=True,
+                embedding_provider=provider,
+                embedding_model=model,
+                embedding_dimensions=dimensions,
+                total_indexed_entities=total_indexed_entities,
+                vector_tables_exist=False,
+                reindex_recommended=True,
+                reindex_reason=("Vector tables not initialized — run: bm reindex --embeddings"),
+            )
+
+        # --- Count queries (tables exist) ---
+        # Filter by entity existence to exclude stale rows from deleted entities
+        # that remain in derived search tables (search_index, search_vector_chunks)
+        entity_exists = "AND entity_id IN (SELECT id FROM entity WHERE project_id = :project_id)"
+        # Same filter for aliased chunks table (used in JOIN queries below)
+        chunk_entity_exists = (
+            "AND c.entity_id IN (SELECT id FROM entity WHERE project_id = :project_id)"
+        )
+
+        si_result = await self.repository.execute_query(
+            text(
+                "SELECT COUNT(DISTINCT entity_id) FROM search_index "
+                f"WHERE project_id = :project_id {entity_exists}"
+            ),
+            {"project_id": project_id},
+        )
+        total_indexed_entities = si_result.scalar() or 0
+
+        try:
+            chunks_result = await self.repository.execute_query(
+                text(
+                    "SELECT COUNT(*) FROM search_vector_chunks "
+                    f"WHERE project_id = :project_id {entity_exists}"
+                ),
+                {"project_id": project_id},
+            )
+            total_chunks = chunks_result.scalar() or 0
+
+            entities_with_chunks_result = await self.repository.execute_query(
+                text(
+                    "SELECT COUNT(DISTINCT entity_id) FROM search_vector_chunks "
+                    f"WHERE project_id = :project_id {entity_exists}"
+                ),
+                {"project_id": project_id},
+            )
+            total_entities_with_chunks = entities_with_chunks_result.scalar() or 0
+
+            # Embeddings count — join pattern differs between SQLite and Postgres
+            if is_postgres:
+                embeddings_sql = text(
+                    "SELECT COUNT(*) FROM search_vector_chunks c "
+                    "JOIN search_vector_embeddings e ON e.chunk_id = c.id "
+                    f"WHERE c.project_id = :project_id {chunk_entity_exists}"
+                )
+            else:
+                embeddings_sql = text(
+                    "SELECT COUNT(*) FROM search_vector_chunks c "
+                    "JOIN search_vector_embeddings e ON e.rowid = c.id "
+                    f"WHERE c.project_id = :project_id {chunk_entity_exists}"
+                )
+
+            embeddings_result = await self.repository.execute_query(
+                embeddings_sql, {"project_id": project_id}
+            )
+            total_embeddings = embeddings_result.scalar() or 0
+
+            # Orphaned chunks (chunks without embeddings — indicates interrupted indexing)
+            if is_postgres:
+                orphan_sql = text(
+                    "SELECT COUNT(*) FROM search_vector_chunks c "
+                    "LEFT JOIN search_vector_embeddings e ON e.chunk_id = c.id "
+                    f"WHERE c.project_id = :project_id AND e.chunk_id IS NULL {chunk_entity_exists}"
+                )
+            else:
+                orphan_sql = text(
+                    "SELECT COUNT(*) FROM search_vector_chunks c "
+                    "LEFT JOIN search_vector_embeddings e ON e.rowid = c.id "
+                    f"WHERE c.project_id = :project_id AND e.rowid IS NULL {chunk_entity_exists}"
+                )
+
+            orphan_result = await self.repository.execute_query(
+                orphan_sql, {"project_id": project_id}
+            )
+            orphaned_chunks = orphan_result.scalar() or 0
+        except SAOperationalError as exc:
+            # Trigger: sqlite_master can list vec0 virtual tables even when sqlite-vec
+            # is not loaded in the current Python runtime.
+            # Why: project info should degrade gracefully instead of crashing on stats queries.
+            # Outcome: report vector tables as unavailable and point the user to install the
+            # missing dependency before rebuilding embeddings.
+            if is_postgres or "no such module: vec0" not in str(exc).lower():
+                raise
+
+            return EmbeddingStatus(
+                semantic_search_enabled=True,
+                embedding_provider=provider,
+                embedding_model=model,
+                embedding_dimensions=dimensions,
+                total_indexed_entities=total_indexed_entities,
+                vector_tables_exist=False,
+                reindex_recommended=True,
+                reindex_reason=(
+                    "SQLite vector tables exist but sqlite-vec is unavailable in this Python "
+                    "environment — install/update basic-memory, then run: bm reindex --embeddings"
+                ),
+            )
+
+        # --- Reindex recommendation logic (priority order) ---
+        reindex_recommended = False
+        reindex_reason = None
+
+        if total_indexed_entities > 0 and total_chunks == 0:
+            reindex_recommended = True
+            reindex_reason = "Embeddings have never been built — run: bm reindex --embeddings"
+        elif orphaned_chunks > 0:
+            reindex_recommended = True
+            reindex_reason = (
+                f"{orphaned_chunks} orphaned chunks found (interrupted indexing) "
+                "— run: bm reindex --embeddings"
+            )
+        elif total_indexed_entities > total_entities_with_chunks:
+            missing = total_indexed_entities - total_entities_with_chunks
+            reindex_recommended = True
+            reindex_reason = f"{missing} entities missing embeddings — run: bm reindex --embeddings"
+
+        return EmbeddingStatus(
+            semantic_search_enabled=True,
+            embedding_provider=provider,
+            embedding_model=model,
+            embedding_dimensions=dimensions,
+            total_indexed_entities=total_indexed_entities,
+            total_entities_with_chunks=total_entities_with_chunks,
+            total_chunks=total_chunks,
+            total_embeddings=total_embeddings,
+            orphaned_chunks=orphaned_chunks,
+            vector_tables_exist=True,
+            reindex_recommended=reindex_recommended,
+            reindex_reason=reindex_reason,
+        )
+
     def get_system_status(self) -> SystemStatus:
         """Get system status information."""
         import basic_memory
@@ -875,12 +1137,10 @@ class ProjectService:
 
         # Get watch service status if available
         watch_status = None
-        watch_status_path = Path.home() / ".basic-memory" / WATCH_STATUS_JSON
+        watch_status_path = self.config_manager.config.data_dir_path / WATCH_STATUS_JSON
         if watch_status_path.exists():
-            try:  # pragma: no cover
-                watch_status = json.loads(  # pragma: no cover
-                    watch_status_path.read_text(encoding="utf-8")
-                )
+            try:
+                watch_status = json.loads(watch_status_path.read_text(encoding="utf-8"))
             except Exception:  # pragma: no cover
                 pass
 

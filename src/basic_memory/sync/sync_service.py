@@ -8,16 +8,31 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import aiofiles.os
 
 from loguru import logger
 from sqlalchemy.exc import IntegrityError
 
+import logfire
 from basic_memory import db
 from basic_memory.config import BasicMemoryConfig, ConfigManager
-from basic_memory.file_utils import has_frontmatter
+from basic_memory.file_utils import ParseError, compute_checksum, remove_frontmatter
+from basic_memory.indexing import (
+    BatchIndexer,
+    IndexFileMetadata,
+    IndexInputFile,
+    IndexProgress,
+    SyncedMarkdownFile,
+)
+from basic_memory.indexing.batching import build_index_batches
+from basic_memory.indexing.models import (
+    IndexedEntity,
+    IndexFileWriter,
+    IndexFrontmatterUpdate,
+    IndexFrontmatterWriteResult,
+)
 from basic_memory.ignore_utils import load_bmignore_patterns, should_ignore_path
 from basic_memory.markdown import EntityParser, MarkdownProcessor
 from basic_memory.models import Entity, Project
@@ -29,12 +44,14 @@ from basic_memory.repository import (
 )
 from basic_memory.repository.search_repository import create_search_repository
 from basic_memory.services import EntityService, FileService
-from basic_memory.services.exceptions import SyncFatalError
+from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+from basic_memory.services.exceptions import FileOperationError, SyncFatalError
 from basic_memory.services.link_resolver import LinkResolver
 from basic_memory.services.search_service import SearchService
 
 # Circuit breaker configuration
 MAX_CONSECUTIVE_FAILURES = 3
+SLOW_FILE_SYNC_WARNING_MS = 500
 
 
 @dataclass
@@ -93,6 +110,7 @@ class SyncReport:
     deleted: Set[str] = field(default_factory=set)
     moves: Dict[str, str] = field(default_factory=dict)  # old_path -> new_path
     checksums: Dict[str, str] = field(default_factory=dict)  # path -> checksum
+    scanned_paths: Set[str] = field(default_factory=set)
     skipped_files: List[SkippedFile] = field(default_factory=list)
 
     @property
@@ -113,6 +131,23 @@ class ScanResult:
 
     # file_path -> error message
     errors: Dict[str, str] = field(default_factory=dict)
+
+
+class _FileServiceIndexWriter(IndexFileWriter):
+    """Adapt FileService frontmatter updates to the indexing writer protocol."""
+
+    def __init__(self, file_service: FileService) -> None:
+        self.file_service = file_service
+
+    async def write_frontmatter(
+        self, update: IndexFrontmatterUpdate
+    ) -> IndexFrontmatterWriteResult:
+        # Why: IndexFrontmatterWriteResult lives in indexing/models.py so the indexing
+        # layer does not need to import FileService. This adapter keeps that boundary intact.
+        result = await self.file_service.update_frontmatter_with_result(
+            update.path, update.metadata
+        )
+        return IndexFrontmatterWriteResult(checksum=result.checksum, content=result.content)
 
 
 class SyncService:
@@ -143,6 +178,14 @@ class SyncService:
         # Use OrderedDict for LRU behavior with bounded size to prevent unbounded memory growth
         self._file_failures: OrderedDict[str, FileFailureInfo] = OrderedDict()
         self._max_tracked_failures = 100  # Limit failure cache size
+        self.batch_indexer = BatchIndexer(
+            app_config=app_config,
+            entity_service=entity_service,
+            entity_repository=entity_repository,
+            relation_repository=relation_repository,
+            search_service=search_service,
+            file_writer=_FileServiceIndexWriter(file_service),
+        )
 
     async def _should_skip_file(self, path: str) -> bool:
         """Check if file should be skipped due to repeated failures.
@@ -252,7 +295,12 @@ class SyncService:
             del self._file_failures[path]
 
     async def sync(
-        self, directory: Path, project_name: Optional[str] = None, force_full: bool = False
+        self,
+        directory: Path,
+        project_name: Optional[str] = None,
+        force_full: bool = False,
+        sync_embeddings: bool = True,
+        progress_callback: Callable[[IndexProgress], Awaitable[None]] | None = None,
     ) -> SyncReport:
         """Sync all files with database and update scan watermark.
 
@@ -260,120 +308,427 @@ class SyncService:
             directory: Directory to sync
             project_name: Optional project name
             force_full: If True, force a full scan bypassing watermark optimization
+            sync_embeddings: If True, generate vectors for entities indexed during this sync
+            progress_callback: Optional callback for typed indexing progress updates
         """
 
         start_time = time.time()
         sync_start_timestamp = time.time()  # Capture at start for watermark
-        logger.info(f"Sync operation started for directory: {directory} (force_full={force_full})")
+        with logfire.span(
+            "sync.project.run",
+            project_name=project_name,
+            force_full=force_full,
+        ):
+            logger.info(
+                f"Sync operation started for directory: {directory} (force_full={force_full})"
+            )
 
-        # initial paths from db to sync
-        # path -> checksum
-        report = await self.scan(directory, force_full=force_full)
+            # initial paths from db to sync
+            # path -> checksum
+            with logfire.span("sync.project.scan", force_full=force_full):
+                report = await self.scan(directory, force_full=force_full)
 
-        # order of sync matters to resolve relations effectively
-        logger.info(
-            f"Sync changes detected: new_files={len(report.new)}, modified_files={len(report.modified)}, "
-            + f"deleted_files={len(report.deleted)}, moved_files={len(report.moves)}"
+            # order of sync matters to resolve relations effectively
+            logger.info(
+                f"Sync changes detected: new_files={len(report.new)}, modified_files={len(report.modified)}, "
+                + f"deleted_files={len(report.deleted)}, moved_files={len(report.moves)}"
+            )
+
+            with logfire.span(
+                "sync.project.apply_changes",
+                new_count=len(report.new),
+                modified_count=len(report.modified),
+                deleted_count=len(report.deleted),
+                move_count=len(report.moves),
+            ):
+                # sync moves first
+                for old_path, new_path in report.moves.items():
+                    # in the case where a file has been deleted and replaced by another file
+                    # it will show up in the move and modified lists, so handle it in modified
+                    if new_path in report.modified:
+                        report.modified.remove(new_path)
+                        logger.debug(
+                            f"File marked as moved and modified: old_path={old_path}, new_path={new_path}"
+                        )
+                    else:
+                        await self.handle_move(old_path, new_path)
+
+                # deleted next
+                for path in report.deleted:
+                    await self.handle_delete(path)
+
+                # Trigger: the caller requested a full reindex pass through the sync path.
+                # Why: cloud-style "full" semantics should rebuild every current file-backed
+                #      search row, not only the files that differ from the last watermark.
+                # Outcome: progress reflects the whole project and unchanged files are
+                #          re-indexed without inflating the change report itself.
+                changed_paths = (
+                    sorted(report.scanned_paths)
+                    if force_full
+                    else sorted(report.new | report.modified)
+                )
+                indexed_entities, skipped_files = await self._index_changed_files(
+                    changed_paths,
+                    report.checksums,
+                    progress_callback=progress_callback,
+                )
+                report.skipped_files.extend(skipped_files)
+                synced_entity_ids = [indexed.entity_id for indexed in indexed_entities]
+
+            # Trigger: either the filesystem diff found changes, or the caller forced a
+            # full reindex and we just reprocessed the current files.
+            # Why: relation resolution should follow the file-processing work that just ran,
+            #      not only the lightweight diff summary.
+            # Outcome: full reindex can heal relation state even when the diff report is empty.
+            if report.total > 0 or (force_full and indexed_entities):
+                with logfire.span("sync.project.resolve_relations", relation_scope="all_pending"):
+                    synced_entity_ids.extend(await self.resolve_relations())
+            else:
+                logger.info("Skipping relation resolution - no file changes detected")
+
+            # Clean up any legacy dataview_link relations from previous versions.
+            # Runs unconditionally to catch leftovers regardless of file changes.
+            await self._cleanup_legacy_dataview_links()
+
+            # Batch-generate vector embeddings for all synced entities
+            synced_entity_ids = list(dict.fromkeys(synced_entity_ids))
+            if synced_entity_ids and sync_embeddings and self.app_config.semantic_search_enabled:
+                try:
+                    with logfire.span(
+                        "sync.project.sync_embeddings",
+                        entity_count=len(synced_entity_ids),
+                    ):
+                        logger.info(
+                            f"Generating semantic embeddings for {len(synced_entity_ids)} entities..."
+                        )
+                        batch_result = await self.search_service.sync_entity_vectors_batch(
+                            synced_entity_ids
+                        )
+                        logger.info(
+                            f"Semantic embeddings complete: "
+                            f"synced={batch_result.entities_synced}, "
+                            f"failed={batch_result.entities_failed}"
+                        )
+                except SemanticDependenciesMissingError:
+                    logger.warning(
+                        "Semantic search dependencies missing — vector embeddings skipped. "
+                        "Run 'bm reindex --embeddings' after resolving the dependency issue."
+                    )
+
+            # Update scan watermark after successful sync
+            # Use the timestamp from sync start (not end) to ensure we catch files
+            # created during the sync on the next iteration
+            with logfire.span("sync.project.update_watermark"):
+                current_file_count = await self._quick_count_files(directory)
+                if self.entity_repository.project_id is not None:
+                    project = await self.project_repository.find_by_id(
+                        self.entity_repository.project_id
+                    )
+                    if project:
+                        await self.project_repository.update(
+                            project.id,
+                            {
+                                "last_scan_timestamp": sync_start_timestamp,
+                                "last_file_count": current_file_count,
+                            },
+                        )
+                        logger.debug(
+                            f"Updated scan watermark: timestamp={sync_start_timestamp}, "
+                            f"file_count={current_file_count}"
+                        )
+
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # Log summary with skipped files if any
+            if report.skipped_files:
+                logger.warning(
+                    f"Sync completed with {len(report.skipped_files)} skipped files: "
+                    f"directory={directory}, total_changes={report.total}, "
+                    f"skipped={len(report.skipped_files)}, duration_ms={duration_ms}"
+                )
+                for skipped in report.skipped_files:
+                    logger.warning(
+                        f"Skipped file: path={skipped.path}, "
+                        f"failures={skipped.failure_count}, reason={skipped.reason}"
+                    )
+            else:
+                logger.info(
+                    f"Sync operation completed: directory={directory}, "
+                    f"total_changes={report.total}, duration_ms={duration_ms}"
+                )
+
+            return report
+
+    async def _index_changed_files(
+        self,
+        changed_paths: list[str],
+        checksums_by_path: dict[str, str],
+        *,
+        progress_callback: Callable[[IndexProgress], Awaitable[None]] | None = None,
+    ) -> tuple[list[IndexedEntity], list[SkippedFile]]:
+        """Load, batch, and index changed files without processing them serially."""
+        if not changed_paths:
+            if progress_callback is not None:
+                await progress_callback(
+                    IndexProgress(
+                        files_total=0,
+                        files_processed=0,
+                        batches_total=0,
+                        batches_completed=0,
+                    )
+                )
+            return [], []
+
+        started_at = time.monotonic()
+        files_total = len(changed_paths)
+        files_processed = 0
+        batches_completed = 0
+        skipped_files: list[SkippedFile] = []
+        skipped_paths: set[str] = set()
+        candidate_paths: list[str] = []
+
+        # Trigger: a file exceeded the retry threshold in a previous sync.
+        # Why: repeated retries on unchanged broken files waste the entire batch budget.
+        # Outcome: skip it up front and still count it in progress.
+        for path in changed_paths:
+            if await self._should_skip_file(path):
+                self._append_skipped_file(path, skipped_files, skipped_paths)
+                files_processed += 1
+            else:
+                candidate_paths.append(path)
+
+        (
+            metadata_by_path,
+            metadata_errors,
+            missing_metadata_paths,
+        ) = await self._load_index_file_metadata(
+            candidate_paths,
+            checksums_by_path,
+        )
+        files_processed += len(missing_metadata_paths)
+        files_processed += len(metadata_errors)
+        for path, error in metadata_errors:
+            await self._record_index_failure(path, error, skipped_files, skipped_paths)
+
+        batch_paths = sorted(metadata_by_path)
+        batches = build_index_batches(
+            batch_paths,
+            metadata_by_path,
+            max_files=self.app_config.index_batch_size,
+            max_bytes=self.app_config.index_batch_max_bytes,
         )
 
-        # sync moves first
-        for old_path, new_path in report.moves.items():
-            # in the case where a file has been deleted and replaced by another file
-            # it will show up in the move and modified lists, so handle it in modified
-            if new_path in report.modified:
-                report.modified.remove(new_path)
-                logger.debug(
-                    f"File marked as moved and modified: old_path={old_path}, new_path={new_path}"
-                )
-            else:
-                await self.handle_move(old_path, new_path)
+        await self._emit_index_progress(
+            progress_callback,
+            files_total=files_total,
+            files_processed=files_processed,
+            batches_total=len(batches),
+            batches_completed=0,
+            current_batch_bytes=0,
+            started_at=started_at,
+        )
 
-        # deleted next
-        for path in report.deleted:
-            await self.handle_delete(path)
-
-        # then new and modified
-        for path in report.new:
-            entity, _ = await self.sync_file(path, new=True)
-
-            # Track if file was skipped
-            if entity is None and await self._should_skip_file(path):
-                failure_info = self._file_failures[path]
-                report.skipped_files.append(
-                    SkippedFile(
-                        path=path,
-                        reason=failure_info.last_error,
-                        failure_count=failure_info.count,
-                        first_failed=failure_info.first_failure,
-                    )
-                )
-
-        for path in report.modified:
-            entity, _ = await self.sync_file(path, new=False)
-
-            # Track if file was skipped
-            if entity is None and await self._should_skip_file(path):
-                failure_info = self._file_failures[path]
-                report.skipped_files.append(
-                    SkippedFile(
-                        path=path,
-                        reason=failure_info.last_error,
-                        failure_count=failure_info.count,
-                        first_failed=failure_info.first_failure,
-                    )
-                )
-
-        # Only resolve relations if there were actual changes
-        # If no files changed, no new unresolved relations could have been created
-        if report.total > 0:
-            await self.resolve_relations()
-        else:
-            logger.info("Skipping relation resolution - no file changes detected")
-
-        # Clean up any legacy dataview_link relations from previous versions
-        # Runs unconditionally to catch leftovers regardless of file changes
-        await self._cleanup_legacy_dataview_links()
-
-        # Update scan watermark after successful sync
-        # Use the timestamp from sync start (not end) to ensure we catch files
-        # created during the sync on the next iteration
-        current_file_count = await self._quick_count_files(directory)
-        if self.entity_repository.project_id is not None:
-            project = await self.project_repository.find_by_id(self.entity_repository.project_id)
-            if project:
-                await self.project_repository.update(
-                    project.id,
-                    {
-                        "last_scan_timestamp": sync_start_timestamp,
-                        "last_file_count": current_file_count,
-                    },
-                )
-                logger.debug(
-                    f"Updated scan watermark: timestamp={sync_start_timestamp}, "
-                    f"file_count={current_file_count}"
-                )
-
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        # Log summary with skipped files if any
-        if report.skipped_files:
-            logger.warning(
-                f"Sync completed with {len(report.skipped_files)} skipped files: "
-                f"directory={directory}, total_changes={report.total}, "
-                f"skipped={len(report.skipped_files)}, duration_ms={duration_ms}"
+        indexed_entities: list[IndexedEntity] = []
+        shared_permalink_by_path: dict[str, str | None] | None = None
+        if any(
+            metadata.content_type == "text/markdown"
+            or (
+                metadata.content_type is None
+                and Path(metadata.path).suffix.lower() in {".md", ".markdown"}
             )
-            for skipped in report.skipped_files:
-                logger.warning(
-                    f"Skipped file: path={skipped.path}, "
-                    f"failures={skipped.failure_count}, reason={skipped.reason}"
+            for metadata in metadata_by_path.values()
+        ):
+            shared_permalink_by_path = {
+                path: permalink
+                for path, permalink in (
+                    await self.entity_repository.get_file_path_to_permalink_map()
+                ).items()
+            }
+
+        for batch in batches:
+            loaded_files, load_errors = await self._load_index_batch_files(
+                batch.paths, metadata_by_path
+            )
+            for path, error in load_errors:
+                await self._record_index_failure(path, error, skipped_files, skipped_paths)
+
+            if loaded_files:
+                batch_result = await self.batch_indexer.index_files(
+                    loaded_files,
+                    max_concurrent=self.app_config.index_entity_max_concurrent,
+                    parse_max_concurrent=self.app_config.index_parse_max_concurrent,
+                    existing_permalink_by_path=shared_permalink_by_path,
                 )
-        else:
-            logger.info(
-                f"Sync operation completed: directory={directory}, "
-                f"total_changes={report.total}, duration_ms={duration_ms}"
+                indexed_entities.extend(batch_result.indexed)
+
+                indexed_paths = {indexed.path for indexed in batch_result.indexed}
+                for path in indexed_paths:
+                    self._clear_failure(path)
+
+                for path, error in batch_result.errors:
+                    await self._record_index_failure(path, error, skipped_files, skipped_paths)
+
+            files_processed += len(batch.paths)
+            batches_completed += 1
+            await self._emit_index_progress(
+                progress_callback,
+                files_total=files_total,
+                files_processed=files_processed,
+                batches_total=len(batches),
+                batches_completed=batches_completed,
+                current_batch_bytes=batch.total_bytes,
+                started_at=started_at,
             )
 
-        return report
+        return indexed_entities, skipped_files
+
+    async def _load_index_file_metadata(
+        self,
+        paths: list[str],
+        checksums_by_path: dict[str, str],
+    ) -> tuple[dict[str, IndexFileMetadata], list[tuple[str, str]], list[str]]:
+        """Load typed metadata for batch planning before any file content is read."""
+        if not paths:
+            return {}, [], []
+
+        semaphore = asyncio.Semaphore(self.app_config.sync_max_concurrent_files)
+        metadata_by_path: dict[str, IndexFileMetadata] = {}
+        errors: dict[str, str] = {}
+        missing_paths: list[str] = []
+
+        async def load(path: str) -> None:
+            async with semaphore:
+                try:
+                    file_metadata = await self.file_service.get_file_metadata(path)
+                    metadata_by_path[path] = IndexFileMetadata(
+                        path=path,
+                        size=file_metadata.size,
+                        checksum=checksums_by_path.get(path),
+                        content_type=self.file_service.content_type(path),
+                        last_modified=file_metadata.modified_at,
+                        created_at=file_metadata.created_at,
+                    )
+                except FileNotFoundError:
+                    await self.handle_delete(path)
+                    missing_paths.append(path)
+                except Exception as exc:
+                    errors[path] = str(exc)
+
+        await asyncio.gather(*(load(path) for path in paths))
+        return (
+            metadata_by_path,
+            [(path, errors[path]) for path in sorted(errors)],
+            sorted(missing_paths),
+        )
+
+    async def _load_index_batch_files(
+        self,
+        paths: list[str],
+        metadata_by_path: dict[str, IndexFileMetadata],
+    ) -> tuple[dict[str, IndexInputFile], list[tuple[str, str]]]:
+        """Read one batch of file contents into typed input objects."""
+        if not paths:
+            return {}, []
+
+        semaphore = asyncio.Semaphore(self.app_config.sync_max_concurrent_files)
+        files: dict[str, IndexInputFile] = {}
+        errors: dict[str, str] = {}
+
+        async def load(path: str) -> None:
+            async with semaphore:
+                metadata = metadata_by_path[path]
+                try:
+                    content = await self.file_service.read_file_bytes(path)
+                    loaded_checksum = await compute_checksum(content)
+                    files[path] = IndexInputFile(
+                        path=metadata.path,
+                        size=metadata.size,
+                        checksum=loaded_checksum,
+                        content_type=metadata.content_type,
+                        last_modified=metadata.last_modified,
+                        created_at=metadata.created_at,
+                        content=content,
+                    )
+                except FileOperationError as exc:
+                    # Trigger: FileService wraps binary read failures in FileOperationError.
+                    # Why: the service contract should stay consistent for direct callers.
+                    # Outcome: sync still treats wrapped missing-file reads as deletions.
+                    if isinstance(exc.__cause__, FileNotFoundError):
+                        await self.handle_delete(path)
+                    else:
+                        errors[path] = str(exc)
+                except Exception as exc:
+                    errors[path] = str(exc)
+
+        await asyncio.gather(*(load(path) for path in paths))
+        return files, [(path, errors[path]) for path in sorted(errors)]
+
+    async def _record_index_failure(
+        self,
+        path: str,
+        error: str,
+        skipped_files: list[SkippedFile],
+        skipped_paths: set[str],
+    ) -> None:
+        """Record a per-file batch failure and promote it to skipped when threshold is reached."""
+        await self._record_failure(path, error)
+        if await self._should_skip_file(path):
+            self._append_skipped_file(path, skipped_files, skipped_paths)
+
+    def _append_skipped_file(
+        self,
+        path: str,
+        skipped_files: list[SkippedFile],
+        skipped_paths: set[str],
+    ) -> None:
+        """Append one skipped file record once per sync run."""
+        if path in skipped_paths or path not in self._file_failures:
+            return
+
+        failure_info = self._file_failures[path]
+        skipped_files.append(
+            SkippedFile(
+                path=path,
+                reason=failure_info.last_error,
+                failure_count=failure_info.count,
+                first_failed=failure_info.first_failure,
+            )
+        )
+        skipped_paths.add(path)
+
+    async def _emit_index_progress(
+        self,
+        progress_callback: Callable[[IndexProgress], Awaitable[None]] | None,
+        *,
+        files_total: int,
+        files_processed: int,
+        batches_total: int,
+        batches_completed: int,
+        current_batch_bytes: int,
+        started_at: float,
+    ) -> None:
+        """Emit a typed indexing progress update when the caller requested one."""
+        if progress_callback is None:
+            return
+
+        elapsed_seconds = max(time.monotonic() - started_at, 0.001)
+        files_per_minute = files_processed / elapsed_seconds * 60 if files_processed else 0.0
+        eta_seconds = None
+        if files_processed and files_total > files_processed:
+            files_per_second = files_processed / elapsed_seconds
+            eta_seconds = (files_total - files_processed) / files_per_second
+
+        await progress_callback(
+            IndexProgress(
+                files_total=files_total,
+                files_processed=files_processed,
+                batches_total=batches_total,
+                batches_completed=batches_completed,
+                current_batch_bytes=current_batch_bytes,
+                files_per_minute=files_per_minute,
+                eta_seconds=eta_seconds,
+            )
+        )
 
     async def scan(self, directory, force_full: bool = False):
         """Smart scan using watermark and file count for large project optimization.
@@ -410,171 +765,181 @@ class SyncService:
         if project is None:
             raise ValueError(f"Project not found: {self.entity_repository.project_id}")
 
-        # Step 1: Quick file count
-        logger.debug("Counting files in directory")
-        current_count = await self._quick_count_files(directory)
-        logger.debug(f"Found {current_count} files in directory")
+        with logfire.span("sync.project.select_scan_strategy", force_full=force_full):
+            # Step 1: Quick file count
+            logger.debug("Counting files in directory")
+            current_count = await self._quick_count_files(directory)
+            logger.debug(f"Found {current_count} files in directory")
 
-        # Step 2: Determine scan strategy based on watermark and file count
-        if force_full:
-            # User explicitly requested full scan → bypass watermark optimization
-            scan_type = "full_forced"
-            logger.info("Force full scan requested, bypassing watermark optimization")
-            file_paths_to_scan = await self._scan_directory_full(directory)
+            # Step 2: Determine scan strategy based on watermark and file count
+            if force_full:
+                # User explicitly requested full scan → bypass watermark optimization
+                scan_type = "full_forced"
+                logger.info("Force full scan requested, bypassing watermark optimization")
+                scan_coro = self._scan_directory_full(directory)
 
-        elif project.last_file_count is None:
-            # First sync ever → full scan
-            scan_type = "full_initial"
-            logger.info("First sync for this project, performing full scan")
-            file_paths_to_scan = await self._scan_directory_full(directory)
+            elif project.last_file_count is None:
+                # First sync ever → full scan
+                scan_type = "full_initial"
+                logger.info("First sync for this project, performing full scan")
+                scan_coro = self._scan_directory_full(directory)
 
-        elif current_count < project.last_file_count:
-            # Files deleted → need full scan to detect which ones
-            scan_type = "full_deletions"
-            logger.info(
-                f"File count decreased ({project.last_file_count} → {current_count}), "
-                f"running full scan to detect deletions"
-            )
-            file_paths_to_scan = await self._scan_directory_full(directory)
+            elif current_count < project.last_file_count:
+                # Files deleted → need full scan to detect which ones
+                scan_type = "full_deletions"
+                logger.info(
+                    f"File count decreased ({project.last_file_count} → {current_count}), "
+                    f"running full scan to detect deletions"
+                )
+                scan_coro = self._scan_directory_full(directory)
 
-        elif project.last_scan_timestamp is not None:
-            # Incremental scan: only files modified since last scan
-            scan_type = "incremental"
-            logger.info(
-                f"Running incremental scan for files modified since {project.last_scan_timestamp}"
-            )
-            file_paths_to_scan = await self._scan_directory_modified_since(
-                directory, project.last_scan_timestamp
-            )
-            logger.info(
-                f"Incremental scan found {len(file_paths_to_scan)} potentially changed files"
-            )
+            elif project.last_scan_timestamp is not None:
+                # Incremental scan: only files modified since last scan
+                scan_type = "incremental"
+                logger.debug(
+                    f"Running incremental scan for files modified since {project.last_scan_timestamp}"
+                )
+                scan_coro = self._scan_directory_modified_since(
+                    directory, project.last_scan_timestamp
+                )
 
-        else:
-            # Fallback to full scan (no watermark available)
-            scan_type = "full_fallback"
-            logger.warning("No scan watermark available, falling back to full scan")
-            file_paths_to_scan = await self._scan_directory_full(directory)
-
-        # Step 3: Process each file with mtime-based comparison
-        scanned_paths: Set[str] = set()
-        changed_checksums: Dict[str, str] = {}
-
-        logger.debug(f"Processing {len(file_paths_to_scan)} files with mtime-based comparison")
-
-        for rel_path in file_paths_to_scan:
-            scanned_paths.add(rel_path)
-
-            # Get file stats
-            abs_path = directory / rel_path
-            if not abs_path.exists():
-                # File was deleted between scan and now (race condition)
-                continue
-
-            stat_info = abs_path.stat()
-
-            # Indexed lookup - single file query (not full table scan)
-            db_entity = await self.entity_repository.get_by_file_path(rel_path)
-
-            if db_entity is None:
-                # New file - need checksum for move detection
-                checksum = await self.file_service.compute_checksum(rel_path)
-                report.new.add(rel_path)
-                changed_checksums[rel_path] = checksum
-                logger.trace(f"New file detected: {rel_path}")
-                continue
-
-            # File exists in DB - check if mtime/size changed
-            db_mtime = db_entity.mtime
-            db_size = db_entity.size
-            fs_mtime = stat_info.st_mtime
-            fs_size = stat_info.st_size
-
-            # Compare mtime and size (like rsync/rclone)
-            # Allow small epsilon for float comparison (0.01s = 10ms)
-            mtime_changed = db_mtime is None or abs(fs_mtime - db_mtime) > 0.01
-            size_changed = db_size is None or fs_size != db_size
-
-            if mtime_changed or size_changed:
-                # File modified - compute checksum
-                checksum = await self.file_service.compute_checksum(rel_path)
-                db_checksum = db_entity.checksum
-
-                # Only mark as modified if checksum actually differs
-                # (handles cases where mtime changed but content didn't, e.g., git operations)
-                if checksum != db_checksum:
-                    report.modified.add(rel_path)
-                    changed_checksums[rel_path] = checksum
-                    logger.trace(
-                        f"Modified file detected: {rel_path}, "
-                        f"mtime_changed={mtime_changed}, size_changed={size_changed}"
-                    )
             else:
-                # File unchanged - no checksum needed
-                logger.trace(f"File unchanged (mtime/size match): {rel_path}")
+                # Fallback to full scan (no watermark available)
+                scan_type = "full_fallback"
+                logger.warning("No scan watermark available, falling back to full scan")
+                scan_coro = self._scan_directory_full(directory)
 
-        # Step 4: Detect moves (for both full and incremental scans)
-        # Check if any "new" files are actually moves by matching checksums
-        for new_path in list(report.new):  # Use list() to allow modification during iteration
-            new_checksum = changed_checksums.get(new_path)
-            if not new_checksum:
-                continue
+        with logfire.span("sync.project.filesystem_scan", scan_type=scan_type):
+            file_paths_to_scan = await scan_coro
+            if scan_type == "incremental":
+                logger.debug(
+                    f"Incremental scan found {len(file_paths_to_scan)} potentially changed files"
+                )
 
-            # Look for existing entity with same checksum but different path
-            # This could be a move or a copy
-            existing_entities = await self.entity_repository.find_by_checksum(new_checksum)
+            # Step 3: Process each file with mtime-based comparison
+            scanned_paths: Set[str] = set()
+            changed_checksums: Dict[str, str] = {}
 
-            for candidate in existing_entities:
-                if candidate.file_path == new_path:
-                    # Same path, skip (shouldn't happen for "new" files but be safe)
+            logger.debug(f"Processing {len(file_paths_to_scan)} files with mtime-based comparison")
+
+            for rel_path in file_paths_to_scan:
+                scanned_paths.add(rel_path)
+
+                # Get file stats
+                abs_path = directory / rel_path
+                if not abs_path.exists():
+                    # File was deleted between scan and now (race condition)
                     continue
 
-                # Check if the old path still exists on disk
-                old_path_abs = directory / candidate.file_path
-                if old_path_abs.exists():
-                    # Original still exists → this is a copy, not a move
-                    logger.trace(
-                        f"File copy detected (not move): {candidate.file_path} copied to {new_path}"
-                    )
+                stat_info = abs_path.stat()
+
+                # Indexed lookup - single file query (not full table scan)
+                db_entity = await self.entity_repository.get_by_file_path(rel_path)
+
+                if db_entity is None:
+                    # New file - need checksum for move detection
+                    checksum = await self.file_service.compute_checksum(rel_path)
+                    report.new.add(rel_path)
+                    changed_checksums[rel_path] = checksum
+                    logger.trace(f"New file detected: {rel_path}")
                     continue
 
-                # Original doesn't exist → this is a move!
-                report.moves[candidate.file_path] = new_path
-                report.new.remove(new_path)
-                logger.trace(f"Move detected: {candidate.file_path} -> {new_path}")
-                break  # Only match first candidate
+                # File exists in DB - check if mtime/size changed
+                db_mtime = db_entity.mtime
+                db_size = db_entity.size
+                fs_mtime = stat_info.st_mtime
+                fs_size = stat_info.st_size
 
-        # Step 5: Detect deletions (only for full scans)
-        # Incremental scans can't reliably detect deletions since they only see modified files
-        if scan_type in ("full_initial", "full_deletions", "full_fallback", "full_forced"):
-            # Use optimized query for just file paths (not full entities)
-            db_file_paths = await self.entity_repository.get_all_file_paths()
-            logger.debug(f"Found {len(db_file_paths)} db paths for deletion detection")
+                # Compare mtime and size (like rsync/rclone)
+                # Allow small epsilon for float comparison (0.01s = 10ms)
+                mtime_changed = db_mtime is None or abs(fs_mtime - db_mtime) > 0.01
+                size_changed = db_size is None or fs_size != db_size
 
-            for db_path in db_file_paths:
-                if db_path not in scanned_paths:
-                    # File in DB but not on filesystem
-                    # Check if it was already detected as a move
-                    if db_path in report.moves:
-                        # Already handled as a move, skip
+                if mtime_changed or size_changed:
+                    # File modified - compute checksum
+                    checksum = await self.file_service.compute_checksum(rel_path)
+                    db_checksum = db_entity.checksum
+
+                    # Only mark as modified if checksum actually differs
+                    # (handles cases where mtime changed but content didn't, e.g., git operations)
+                    if checksum != db_checksum:
+                        report.modified.add(rel_path)
+                        changed_checksums[rel_path] = checksum
+                        logger.trace(
+                            f"Modified file detected: {rel_path}, "
+                            f"mtime_changed={mtime_changed}, size_changed={size_changed}"
+                        )
+                else:
+                    # File unchanged - no checksum needed
+                    logger.trace(f"File unchanged (mtime/size match): {rel_path}")
+
+            # Step 4: Detect moves (for both full and incremental scans)
+            # Check if any "new" files are actually moves by matching checksums
+            with logfire.span("sync.project.detect_moves", new_count=len(report.new)):
+                for new_path in list(
+                    report.new
+                ):  # Use list() to allow modification during iteration
+                    new_checksum = changed_checksums.get(new_path)
+                    if not new_checksum:
                         continue
 
-                    # File was deleted
-                    report.deleted.add(db_path)
-                    logger.trace(f"Deleted file detected: {db_path}")
+                    # Look for existing entity with same checksum but different path
+                    # This could be a move or a copy
+                    existing_entities = await self.entity_repository.find_by_checksum(new_checksum)
 
-        # Store checksums for files that need syncing
-        report.checksums = changed_checksums
+                    for candidate in existing_entities:
+                        if candidate.file_path == new_path:
+                            # Same path, skip (shouldn't happen for "new" files but be safe)
+                            continue
 
-        scan_duration_ms = int((time.time() - scan_start_time) * 1000)
+                        # Check if the old path still exists on disk
+                        old_path_abs = directory / candidate.file_path
+                        if old_path_abs.exists():
+                            # Original still exists → this is a copy, not a move
+                            logger.trace(
+                                f"File copy detected (not move): {candidate.file_path} copied to {new_path}"
+                            )
+                            continue
 
-        logger.info(
-            f"Completed {scan_type} scan for directory {directory} in {scan_duration_ms}ms, "
-            f"found {report.total} changes (new={len(report.new)}, "
-            f"modified={len(report.modified)}, deleted={len(report.deleted)}, "
-            f"moves={len(report.moves)})"
-        )
-        return report
+                        # Original doesn't exist → this is a move!
+                        report.moves[candidate.file_path] = new_path
+                        report.new.remove(new_path)
+                        logger.trace(f"Move detected: {candidate.file_path} -> {new_path}")
+                        break  # Only match first candidate
+
+            # Step 5: Detect deletions (only for full scans)
+            # Incremental scans can't reliably detect deletions since they only see modified files
+            if scan_type in ("full_initial", "full_deletions", "full_fallback", "full_forced"):
+                with logfire.span("sync.project.detect_deletions", scan_type=scan_type):
+                    # Use optimized query for just file paths (not full entities)
+                    db_file_paths = await self.entity_repository.get_all_file_paths()
+                    logger.debug(f"Found {len(db_file_paths)} db paths for deletion detection")
+
+                    for db_path in db_file_paths:
+                        if db_path not in scanned_paths:
+                            # File in DB but not on filesystem
+                            # Check if it was already detected as a move
+                            if db_path in report.moves:
+                                # Already handled as a move, skip
+                                continue
+
+                            # File was deleted
+                            report.deleted.add(db_path)
+                            logger.trace(f"Deleted file detected: {db_path}")
+
+            # Store checksums for files that need syncing
+            report.checksums = changed_checksums
+            report.scanned_paths = scanned_paths
+
+            scan_duration_ms = int((time.time() - scan_start_time) * 1000)
+
+            logger.info(
+                f"Completed {scan_type} scan for directory {directory} in {scan_duration_ms}ms, "
+                f"found {report.total} changes (new={len(report.new)}, "
+                f"modified={len(report.modified)}, deleted={len(report.deleted)}, "
+                f"moves={len(report.moves)})"
+            )
+            return report
 
     async def sync_file(
         self, path: str, new: bool = True
@@ -593,18 +958,31 @@ class SyncService:
             logger.warning(f"Skipping file due to repeated failures: {path}")
             return None, None
 
-        try:
-            logger.debug(
-                f"Syncing file path={path} is_new={new} is_markdown={self.file_service.is_markdown(path)}"
-            )
+        start_time = time.time()
+        is_markdown = self.file_service.is_markdown(path)
+        file_kind = "markdown" if is_markdown else "regular"
 
-            if self.file_service.is_markdown(path):
+        try:
+            logger.debug(f"Syncing file path={path} is_new={new} is_markdown={is_markdown}")
+
+            if is_markdown:
                 entity, checksum = await self.sync_markdown_file(path, new)
             else:
                 entity, checksum = await self.sync_regular_file(path, new)
 
             if entity is not None:
-                await self.search_service.index_entity(entity)
+                try:
+                    await self.search_service.index_entity(entity)
+                except SemanticDependenciesMissingError:
+                    # Trigger: sqlite-vec or embedding provider unavailable
+                    # Why: FTS indexing succeeded but vector embeddings cannot be generated.
+                    #      Don't fail the entire sync — the entity is usable for text search.
+                    # Outcome: entity returned successfully, warning logged for visibility.
+                    logger.warning(
+                        f"Semantic search dependencies missing — vector embeddings skipped "
+                        f"for path={path}. Run 'bm reindex --embeddings' after resolving "
+                        f"the dependency issue."
+                    )
 
                 # Clear failure tracking on successful sync
                 self._clear_failure(path)
@@ -612,31 +990,63 @@ class SyncService:
                 logger.debug(
                     f"File sync completed, path={path}, entity_id={entity.id}, checksum={checksum[:8]}"
                 )
+            duration_ms = int((time.time() - start_time) * 1000)
+            if duration_ms >= SLOW_FILE_SYNC_WARNING_MS:
+                logger.warning(
+                    f"Slow file sync detected: path={path}, file_kind={file_kind}, duration_ms={duration_ms}"
+                )
             return entity, checksum
 
         except FileNotFoundError:
             # File exists in database but not on filesystem
             # This indicates a database/filesystem inconsistency - treat as deletion
-            logger.warning(
-                f"File not found during sync, treating as deletion: path={path}. "
-                "This may indicate a race condition or manual file deletion."
-            )
-            await self.handle_delete(path)
+            with logfire.span(
+                "sync.file.failure",
+                failure_type="file_not_found",
+                path=path,
+                file_kind=file_kind,
+                is_new=new,
+                is_fatal=False,
+            ):
+                logger.warning(
+                    f"File not found during sync, treating as deletion: path={path}. "
+                    "This may indicate a race condition or manual file deletion."
+                )
+                await self.handle_delete(path)
             return None, None
 
         except Exception as e:
+            failure_type = type(e).__name__
             # Check if this is a fatal error (or caused by one)
             # Fatal errors like project deletion should terminate sync immediately
-            if isinstance(e, SyncFatalError) or isinstance(e.__cause__, SyncFatalError):  # pragma: no cover
-                logger.error(f"Fatal sync error encountered, terminating sync: path={path}")
+            if isinstance(e, SyncFatalError) or isinstance(
+                e.__cause__, SyncFatalError
+            ):  # pragma: no cover
+                with logfire.span(
+                    "sync.file.failure",
+                    failure_type=failure_type,
+                    path=path,
+                    file_kind=file_kind,
+                    is_new=new,
+                    is_fatal=True,
+                ):
+                    logger.error(f"Fatal sync error encountered, terminating sync: path={path}")
                 raise
 
             # Otherwise treat as recoverable file-level error
             error_msg = str(e)
-            logger.error(f"Failed to sync file: path={path}, error={error_msg}")
+            with logfire.span(
+                "sync.file.failure",
+                failure_type=failure_type,
+                path=path,
+                file_kind=file_kind,
+                is_new=new,
+                is_fatal=False,
+            ):
+                logger.error(f"Failed to sync file: path={path}, error={error_msg}")
 
-            # Record failure for circuit breaker
-            await self._record_failure(path, error_msg)
+                # Record failure for circuit breaker
+                await self._record_failure(path, error_msg)
 
             return None, None
 
@@ -650,86 +1060,121 @@ class SyncService:
         Returns:
             Tuple of (entity, checksum)
         """
-        # Parse markdown first to get any existing permalink
+        synced = await self.sync_one_markdown_file(path, new=new, index_search=False)
+        return synced.entity, synced.checksum
+
+    async def sync_one_markdown_file(
+        self,
+        path: str,
+        *,
+        new: bool = True,
+        index_search: bool = True,
+        resolve_relations: bool = True,
+    ) -> SyncedMarkdownFile:
+        """Sync one markdown file and return the final canonical file state.
+
+        This method is the fail-fast single-file primitive for callers such as
+        cloud workers. It does not swallow unexpected exceptions.
+        """
         logger.debug(f"Parsing markdown file, path: {path}, new: {new}")
 
-        file_content = await self.file_service.read_file_content(path)
-        file_contains_frontmatter = has_frontmatter(file_content)
-
-        # Get file timestamps for tracking modification times
+        try:
+            initial_markdown_bytes = await self.file_service.read_file_bytes(path)
+        except FileOperationError as exc:
+            # Trigger: FileService wraps binary read failures in FileOperationError.
+            # Why: sync_file() treats bare FileNotFoundError as a deletion race and cleans up the DB row.
+            # Outcome: preserve that contract while still hashing the exact bytes we loaded.
+            if isinstance(exc.__cause__, FileNotFoundError):
+                raise exc.__cause__ from exc
+            raise
+        initial_markdown_content = initial_markdown_bytes.decode("utf-8")
         file_metadata = await self.file_service.get_file_metadata(path)
-        created = file_metadata.created_at
-        modified = file_metadata.modified_at
-
-        # Parse markdown content with file metadata (avoids redundant file read/stat)
-        # This enables cloud implementations (S3FileService) to provide metadata from head_object
-        abs_path = self.file_service.base_path / path
-        entity_markdown = await self.entity_parser.parse_markdown_content(
-            file_path=abs_path,
-            content=file_content,
-            mtime=file_metadata.modified_at.timestamp(),
-            ctime=file_metadata.created_at.timestamp(),
-        )
-
-        # if the file contains frontmatter, resolve a permalink (unless disabled)
-        if file_contains_frontmatter and not self.app_config.disable_permalinks:
-            # Resolve permalink - skip conflict checks during bulk sync for performance
-            permalink = await self.entity_service.resolve_permalink(
-                path, markdown=entity_markdown, skip_conflict_check=True
+        initial_checksum = await compute_checksum(initial_markdown_bytes)
+        existing_entity = await self.entity_repository.get_by_file_path(path)
+        if existing_entity is not None and existing_entity.checksum == initial_checksum:
+            logger.debug(
+                f"Markdown sync skipped unchanged file: path={path}, "
+                f"entity_id={existing_entity.id}, checksum={initial_checksum[:8]}"
+            )
+            return SyncedMarkdownFile(
+                entity=existing_entity,
+                checksum=initial_checksum,
+                markdown_content=initial_markdown_content,
+                file_path=path,
+                content_type=self.file_service.content_type(path),
+                updated_at=file_metadata.modified_at,
+                size=file_metadata.size,
             )
 
-            # If permalink changed, update the file
-            if permalink != entity_markdown.frontmatter.permalink:
-                logger.info(
-                    f"Updating permalink for path: {path}, old_permalink: {entity_markdown.frontmatter.permalink}, new_permalink: {permalink}"
-                )
-
-                entity_markdown.frontmatter.metadata["permalink"] = permalink
-                await self.file_service.update_frontmatter(path, {"permalink": permalink})
-                # Relire le fichier pour avoir le contenu à jour pour Dataview
-                file_content = await self.file_service.read_file_content(path)
-
-        # if the file is new, create an entity
-        if new:
-            # Create entity with final permalink
-            logger.debug(f"Creating new entity from markdown, path={path}")
-            await self.entity_service.create_entity_from_markdown(Path(path), entity_markdown)
-
-        # otherwise we need to update the entity and observations
-        else:
-            logger.debug(f"Updating entity from markdown, path={path}")
-            await self.entity_service.update_entity_and_observations(Path(path), entity_markdown)
-
-        # Update relations and search index
-        entity = await self.entity_service.update_entity_relations(path, entity_markdown)
-
-        # After updating relations, we need to compute the checksum again
-        # This is necessary for files with wikilinks to ensure consistent checksums
-        # after relation processing is complete
-        final_checksum = await self.file_service.compute_checksum(path)
-
-        # Update checksum, timestamps, and file metadata from file system
-        # Store mtime/size for efficient change detection in future scans
-        # This ensures temporal ordering in search and recent activity uses actual file modification times
-        await self.entity_repository.update(
-            entity.id,
+        indexed = await self.batch_indexer.index_markdown_file(
+            IndexInputFile(
+                path=path,
+                size=file_metadata.size,
+                checksum=initial_checksum,
+                content_type=self.file_service.content_type(path),
+                last_modified=file_metadata.modified_at,
+                created_at=file_metadata.created_at,
+                content=initial_markdown_bytes,
+            ),
+            new=new,
+            index_search=False,
+            resolve_relations=resolve_relations,
+        )
+        final_markdown_content = (
+            indexed.markdown_content
+            if indexed.markdown_content is not None
+            else initial_markdown_content
+        )
+        file_metadata = await self.file_service.get_file_metadata(path)
+        refreshed_entities = await self.entity_repository.find_by_ids([indexed.entity_id])
+        if len(refreshed_entities) != 1:  # pragma: no cover
+            raise ValueError(f"Failed to reload synced markdown entity for {path}")
+        # Trigger: markdown sync may have rewritten frontmatter after the initial file metadata load.
+        # Why: the batch indexer persisted checksum/path data from the pre-rewrite IndexInputFile.
+        # Outcome: refresh size and mtime from the file as it actually exists on disk now.
+        updated_entity = await self.entity_repository.update(
+            refreshed_entities[0].id,
             {
-                "checksum": final_checksum,
-                "created_at": created,
-                "updated_at": modified,
+                "checksum": indexed.checksum,
+                "created_at": file_metadata.created_at,
+                "updated_at": file_metadata.modified_at,
                 "mtime": file_metadata.modified_at.timestamp(),
                 "size": file_metadata.size,
             },
         )
+        if updated_entity is None:  # pragma: no cover
+            raise ValueError(f"Failed to update markdown entity metadata for {path}")
+
+        if index_search:
+            # Trigger: markdown may start with '---' as a thematic break or malformed
+            #          frontmatter that the parser already treated as plain content.
+            # Why: one-file sync should not fail after the entity upsert just because
+            #      strict frontmatter stripping rejects that exact text shape.
+            # Outcome: fall back to indexing the raw markdown content for these cases.
+            try:
+                search_content = remove_frontmatter(final_markdown_content)
+            except ParseError:
+                search_content = final_markdown_content
+            await self.search_service.index_entity_data(
+                updated_entity,
+                content=search_content,
+            )
 
         logger.debug(
-            f"Markdown sync completed: path={path}, entity_id={entity.id}, "
-            f"observation_count={len(entity.observations)}, relation_count={len(entity.relations)}, "
-            f"checksum={final_checksum[:8]}"
+            f"Markdown sync completed: path={path}, entity_id={updated_entity.id}, "
+            f"observation_count={len(updated_entity.observations)}, "
+            f"relation_count={len(updated_entity.relations)}, checksum={indexed.checksum[:8]}"
         )
 
-        # Return the final checksum to ensure everything is consistent
-        return entity, final_checksum
+        return SyncedMarkdownFile(
+            entity=updated_entity,
+            checksum=indexed.checksum,
+            markdown_content=final_markdown_content,
+            file_path=path,
+            content_type=self.file_service.content_type(path),
+            updated_at=file_metadata.modified_at,
+            size=file_metadata.size,
+        )
 
     async def sync_regular_file(self, path: str, new: bool = True) -> Tuple[Optional[Entity], str]:
         """Sync a non-markdown file with basic tracking.
@@ -758,7 +1203,7 @@ class SyncService:
             try:
                 entity = await self.entity_repository.add(
                     Entity(
-                        entity_type="file",
+                        note_type="file",
                         file_path=path,
                         checksum=checksum,
                         title=file_path.name,
@@ -972,13 +1417,17 @@ class SyncService:
             # update search index
             await self.search_service.index_entity(updated)
 
-    async def resolve_relations(self, entity_id: int | None = None):
+    async def resolve_relations(self, entity_id: int | None = None) -> set[int]:
         """Try to resolve unresolved relations.
 
         Args:
             entity_id: If provided, only resolve relations for this specific entity.
                       Otherwise, resolve all unresolved relations in the database.
+
+        Returns:
+            Set of source entity IDs whose outgoing relations changed.
         """
+        affected_entity_ids: set[int] = set()
 
         if entity_id:
             # Only get unresolved relations for the specific entity
@@ -1022,27 +1471,46 @@ class SyncService:
                             "to_name": resolved_entity.title,
                         },
                     )
-                    # update search index only on successful resolution
-                    await self.search_service.index_entity(resolved_entity)
+                    affected_entity_ids.add(relation.from_id)
                 except IntegrityError:
-                    # IntegrityError means a relation with this (from_id, to_id, relation_type)
-                    # already exists. The UPDATE was rolled back, so our unresolved relation
-                    # (to_id=NULL) still exists in the database. We delete it because:
-                    # 1. It's redundant - a resolved relation already captures this relationship
-                    # 2. If we don't delete it, future syncs will try to resolve it again
-                    #    and get the same IntegrityError
-                    logger.debug(
-                        "Deleting duplicate unresolved relation "
-                        f"relation_id={relation.id} "
-                        f"from_id={relation.from_id} "
-                        f"to_name={relation.to_name} "
-                        f"resolved_to_id={resolved_entity.id}"
-                    )
-                    try:
-                        await self.relation_repository.delete(relation.id)
-                    except Exception as e:
-                        # Log but don't fail - the relation may have been deleted already
-                        logger.debug(f"Could not delete duplicate relation {relation.id}: {e}")
+                    with logfire.span(
+                        "sync.relation.resolve_conflict",
+                        relation_id=relation.id,
+                        relation_type=relation.relation_type,
+                    ):
+                        # IntegrityError means a relation with this (from_id, to_id, relation_type)
+                        # already exists. The UPDATE was rolled back, so our unresolved relation
+                        # (to_id=NULL) still exists in the database. We delete it because:
+                        # 1. It's redundant - a resolved version already captures this relationship
+                        # 2. If we don't delete it, future syncs will try to resolve it again
+                        #    and get the same IntegrityError
+                        logger.debug(
+                            "Deleting duplicate unresolved relation "
+                            f"relation_id={relation.id} "
+                            f"from_id={relation.from_id} "
+                            f"to_name={relation.to_name} "
+                            f"resolved_to_id={resolved_entity.id}"
+                        )
+                        try:
+                            await self.relation_repository.delete(relation.id)
+                        except Exception as e:
+                            with logfire.span(
+                                "sync.relation.cleanup_failure",
+                                relation_id=relation.id,
+                                relation_type=relation.relation_type,
+                            ):
+                                # Log but don't fail - the relation may have been deleted already
+                                logger.debug(
+                                    f"Could not delete duplicate relation {relation.id}: {e}"
+                                )
+                    affected_entity_ids.add(relation.from_id)
+
+        for affected_entity_id in sorted(affected_entity_ids):
+            source_entity = await self.entity_repository.find_by_id(affected_entity_id)
+            if source_entity is not None:
+                await self.search_service.index_entity(source_entity)
+
+        return affected_entity_ids
 
     async def _cleanup_legacy_dataview_links(self) -> None:
         """Remove any legacy dataview_link relations from the database.
@@ -1084,12 +1552,36 @@ class SyncService:
                 count += 1
             return count
 
-        process = await asyncio.create_subprocess_shell(
-            f'find "{directory}" -type f | wc -l',
+        # Trigger: large-project scan optimization needs the OS `find` command.
+        # Why: passing argv directly avoids shell interpretation of configured project paths.
+        # Outcome: quotes and shell metacharacters in paths are treated as data.
+        process = await asyncio.create_subprocess_exec(
+            "find",
+            str(directory),
+            "-type",
+            "f",
+            "-print0",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+
+        count = 0
+        stderr_task = None
+        if process.stderr is not None:
+            stderr_task = asyncio.create_task(process.stderr.read())
+
+        if process.stdout is None:
+            await process.wait()
+        else:
+            # Trigger: `find` can emit one path per file for very large projects.
+            # Why: collecting every path via communicate() scales memory with path bytes.
+            # Outcome: count null-delimited records in fixed-size chunks.
+            while chunk := await process.stdout.read(1024 * 1024):
+                count += chunk.count(b"\0")
+
+            await process.wait()
+
+        stderr = await stderr_task if stderr_task is not None else b""
 
         if process.returncode != 0:
             error_msg = stderr.decode().strip()
@@ -1104,7 +1596,7 @@ class SyncService:
                 count += 1
             return count
 
-        return int(stdout.strip())
+        return count
 
     async def _scan_directory_modified_since(
         self, directory: Path, since_timestamp: float
@@ -1137,8 +1629,16 @@ class SyncService:
         # Convert timestamp to find-compatible format
         since_date = datetime.fromtimestamp(since_timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
-        process = await asyncio.create_subprocess_shell(
-            f'find "{directory}" -type f -newermt "{since_date}"',
+        # Trigger: incremental scans ask `find` to filter by modification time.
+        # Why: passing argv directly avoids shell interpretation of paths and timestamps.
+        # Outcome: optimized scanning keeps its speed without a shell injection boundary.
+        process = await asyncio.create_subprocess_exec(
+            "find",
+            str(directory),
+            "-type",
+            "f",
+            "-newermt",
+            since_date,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

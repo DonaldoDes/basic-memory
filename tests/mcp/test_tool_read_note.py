@@ -5,30 +5,43 @@ from textwrap import dedent
 import pytest
 
 from basic_memory.mcp.tools import write_note, read_note
-from basic_memory.schemas.search import SearchResponse, SearchResult, SearchItemType
+from basic_memory.mcp.tools.read_note import _parse_opening_frontmatter
 from basic_memory.utils import normalize_newlines
+
+
+def test_parse_opening_frontmatter_handles_crlf():
+    """JSON read_note output should strip frontmatter from Windows-written markdown."""
+    body, frontmatter = _parse_opening_frontmatter(
+        "---\r\ntitle: Windows Note\r\ntype: note\r\n---\r\n\r\nBody text\r\n"
+    )
+
+    assert frontmatter == {"title": "Windows Note", "type": "note"}
+    assert body.strip() == "Body text"
 
 
 @pytest.mark.asyncio
 async def test_read_note_by_title(app, test_project):
     """Test reading a note by its title."""
     # First create a note
-    await write_note.fn(
-        project=test_project.name, title="Special Note", folder="test", content="Note content here"
+    await write_note(
+        project=test_project.name,
+        title="Special Note",
+        directory="test",
+        content="Note content here",
     )
 
     # Should be able to read it by title
-    content = await read_note.fn("Special Note", project=test_project.name)
+    content = await read_note("Special Note", project=test_project.name)
     assert "Note content here" in content
 
 
 @pytest.mark.asyncio
 async def test_read_note_title_search_fallback_fetches_by_permalink(monkeypatch, app, test_project):
     """Force direct resolve to fail so we exercise the title-search + fetch fallback path."""
-    await write_note.fn(
+    await write_note(
         project=test_project.name,
         title="Fallback Title Note",
-        folder="test",
+        directory="test",
         content="fallback content",
     )
 
@@ -40,15 +53,15 @@ async def test_read_note_title_search_fallback_fetches_by_permalink(monkeypatch,
     direct_identifier = memory_url_path("Fallback Title Note")
 
     class SelectiveKnowledgeClient(OriginalKnowledgeClient):
-        async def resolve_entity(self, identifier: str) -> int:
+        async def resolve_entity(self, identifier: str, *, strict: bool = False) -> str:
             # Fail on the direct identifier to force fallback to title search
             if identifier == direct_identifier:
                 raise RuntimeError("force direct lookup failure")
-            return await super().resolve_entity(identifier)
+            return await super().resolve_entity(identifier, strict=strict)
 
     monkeypatch.setattr(clients_mod, "KnowledgeClient", SelectiveKnowledgeClient)
 
-    content = await read_note.fn("Fallback Title Note", project=test_project.name)
+    content = await read_note("Fallback Title Note", project=test_project.name)
     assert "fallback content" in content
 
 
@@ -65,62 +78,111 @@ async def test_read_note_returns_related_results_when_text_search_finds_matches(
 
     async def fake_search_notes_fn(*, query, search_type, **kwargs):
         if search_type == "title":
-            return SearchResponse(results=[], current_page=1, page_size=10)
+            return {"results": [], "current_page": 1, "page_size": 10}
 
-        return SearchResponse(
-            results=[
-                SearchResult(
-                    title="Related One",
-                    permalink="docs/related-one",
-                    content="",
-                    type=SearchItemType.ENTITY,
-                    score=1.0,
-                    file_path="docs/related-one.md",
-                ),
-                SearchResult(
-                    title="Related Two",
-                    permalink="docs/related-two",
-                    content="",
-                    type=SearchItemType.ENTITY,
-                    score=0.9,
-                    file_path="docs/related-two.md",
-                ),
+        return {
+            "results": [
+                {
+                    "title": "Related One",
+                    "permalink": "docs/related-one",
+                    "content": "",
+                    "type": "entity",
+                    "score": 1.0,
+                    "file_path": "docs/related-one.md",
+                },
+                {
+                    "title": "Related Two",
+                    "permalink": "docs/related-two",
+                    "content": "",
+                    "type": "entity",
+                    "score": 0.9,
+                    "file_path": "docs/related-two.md",
+                },
             ],
-            current_page=1,
-            page_size=10,
-        )
+            "current_page": 1,
+            "page_size": 10,
+        }
 
     # Ensure direct resolution doesn't short-circuit the fallback logic.
     class FailingKnowledgeClient(OriginalKnowledgeClient):
-        async def resolve_entity(self, identifier: str) -> int:
+        async def resolve_entity(self, identifier: str, *, strict: bool = False) -> str:
             raise RuntimeError("force fallback")
 
     monkeypatch.setattr(clients_mod, "KnowledgeClient", FailingKnowledgeClient)
-    monkeypatch.setattr(read_note_module.search_notes, "fn", fake_search_notes_fn)
+    monkeypatch.setattr(read_note_module, "search_notes", fake_search_notes_fn)
 
-    result = await read_note.fn("missing-note", project=test_project.name)
+    result = await read_note("missing-note", project=test_project.name)
     assert "I couldn't find an exact match" in result
     assert "## 1. Related One" in result
     assert "## 2. Related Two" in result
 
 
 @pytest.mark.asyncio
+async def test_read_note_title_fallback_requires_exact_title_match(monkeypatch, app, test_project):
+    """Do not fetch note content when title-search returns only fuzzy matches."""
+    await write_note(
+        project=test_project.name,
+        title="Existing Note",
+        directory="test",
+        content="existing note content",
+    )
+
+    import importlib
+
+    read_note_module = importlib.import_module("basic_memory.mcp.tools.read_note")
+    clients_mod = importlib.import_module("basic_memory.mcp.clients")
+    OriginalKnowledgeClient = clients_mod.KnowledgeClient
+
+    class StrictFailingKnowledgeClient(OriginalKnowledgeClient):
+        async def resolve_entity(self, identifier: str, *, strict: bool = False) -> str:
+            if strict:
+                raise RuntimeError("force strict direct lookup failure")
+            return await super().resolve_entity(identifier, strict=strict)
+
+    async def fake_search_notes_fn(*, query, search_type, **kwargs):
+        if search_type == "title":
+            return {
+                "results": [
+                    {
+                        "title": "Existing Note",
+                        "permalink": "test/existing-note",
+                        "content": "",
+                        "type": "entity",
+                        "score": 1.0,
+                        "file_path": "test/Existing Note.md",
+                    }
+                ],
+                "current_page": 1,
+                "page_size": 10,
+            }
+        return {"results": [], "current_page": 1, "page_size": 10}
+
+    monkeypatch.setattr(clients_mod, "KnowledgeClient", StrictFailingKnowledgeClient)
+    monkeypatch.setattr(read_note_module, "search_notes", fake_search_notes_fn)
+
+    result = await read_note("Missing Exact Title", project=test_project.name)
+    assert "Note Not Found" in result
+    assert "Missing Exact Title" in result
+    assert "existing note content" not in result
+
+
+@pytest.mark.asyncio
 async def test_note_unicode_content(app, test_project):
     """Test handling of unicode content in"""
     content = "# Test 🚀\nThis note has emoji 🎉 and unicode ♠♣♥♦"
-    result = await write_note.fn(
-        project=test_project.name, title="Unicode Test", folder="test", content=content
+    result = await write_note(
+        project=test_project.name, title="Unicode Test", directory="test", content=content
     )
 
     # Check that note was created (checksum is now "unknown" in v2)
     assert "# Created note" in result
     assert f"project: {test_project.name}" in result
     assert "file_path: test/Unicode Test.md" in result
-    assert "permalink: test/unicode-test" in result
+    assert f"permalink: {test_project.name}/test/unicode-test" in result
     assert "checksum:" in result  # Checksum exists but may be "unknown"
 
     # Read back should preserve unicode
-    result = await read_note.fn("test/unicode-test", project=test_project.name)
+    result = await read_note("test/unicode-test", project=test_project.name)
     assert normalize_newlines(content) in result
 
 
@@ -135,13 +197,13 @@ async def test_multiple_notes(app, test_project):
     ]
 
     for _, title, folder, content, tags in notes_data:
-        await write_note.fn(
-            project=test_project.name, title=title, folder=folder, content=content, tags=tags
+        await write_note(
+            project=test_project.name, title=title, directory=folder, content=content, tags=tags
         )
 
     # Should be able to read each one individually
     for permalink, title, folder, content, _ in notes_data:
-        note = await read_note.fn(permalink, project=test_project.name)
+        note = await read_note(permalink, project=test_project.name)
         assert content in note
 
     # Note: v2 API does not support glob patterns in read_note
@@ -150,9 +212,8 @@ async def test_multiple_notes(app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_multiple_notes_pagination(app, test_project):
-    """Test reading individual notes (pagination applies to single note content)"""
-    # Create several notes
+async def test_read_multiple_notes_individually(app, test_project):
+    """Test reading several notes back individually after writing them."""
     notes_data = [
         ("test/note-1", "Note 1", "test", "Content 1", ["tag1"]),
         ("test/note-2", "Note 2", "test", "Content 2", ["tag1", "tag2"]),
@@ -160,14 +221,12 @@ async def test_multiple_notes_pagination(app, test_project):
     ]
 
     for _, title, folder, content, tags in notes_data:
-        await write_note.fn(
-            project=test_project.name, title=title, folder=folder, content=content, tags=tags
+        await write_note(
+            project=test_project.name, title=title, directory=folder, content=content, tags=tags
         )
 
-    # Should be able to read each one individually with pagination
-    # Note: pagination now applies to single note content, not multiple notes
     for permalink, title, folder, content, _ in notes_data:
-        note = await read_note.fn(permalink, page=1, page_size=10, project=test_project.name)
+        note = await read_note(permalink, project=test_project.name)
         assert content in note
 
     # Note: v2 API does not support glob patterns in read_note
@@ -184,18 +243,312 @@ async def test_read_note_memory_url(app, test_project):
     - Return the note content
     """
     # First create a note
-    result = await write_note.fn(
+    result = await write_note(
         project=test_project.name,
         title="Memory URL Test",
-        folder="test",
+        directory="test",
         content="Testing memory:// URL handling",
     )
     assert result
 
     # Should be able to read it with a memory:// URL
     memory_url = "memory://test/memory-url-test"
-    content = await read_note.fn(memory_url, project=test_project.name)
+    content = await read_note(memory_url, project=test_project.name)
     assert "Testing memory:// URL handling" in content
+
+
+@pytest.mark.asyncio
+async def test_read_note_memory_url_with_project_prefix(app, test_project):
+    """Test reading a note using a memory:// URL with explicit project prefix."""
+    await write_note(
+        project=test_project.name,
+        title="Project Prefixed Memory URL Test",
+        directory="test",
+        content="Testing memory:// URL handling with project prefix",
+    )
+
+    memory_url = f"memory://{test_project.name}/test/project-prefixed-memory-url-test"
+    content = await read_note(memory_url)
+    assert "Testing memory:// URL handling with project prefix" in content
+
+
+@pytest.mark.asyncio
+async def test_read_note_skips_url_detection_when_project_id_provided(
+    monkeypatch,
+    app,
+    test_project,
+):
+    """project_id is authoritative, so memory URL discovery must not run first."""
+    await write_note(
+        project=test_project.name,
+        title="Project ID Memory URL Read",
+        directory="test",
+        content="Read by project id without discovery",
+    )
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("project_id routing should bypass URL discovery")
+
+    import importlib
+
+    read_note_module = importlib.import_module("basic_memory.mcp.tools.read_note")
+    monkeypatch.setattr(read_note_module, "detect_project_from_identifier_prefix", fail_if_called)
+
+    result = await read_note(
+        f"memory://{test_project.name}/test/project-id-memory-url-read",
+        project_id=test_project.external_id,
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["content"].strip() == "Read by project id without discovery"
+
+
+@pytest.mark.asyncio
+async def test_team_workspace_write_stores_complete_canonical_permalink(
+    app,
+    test_project,
+    entity_repository,
+):
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    expected_permalink = f"team-paul/{test_project.name}/team/team-workspace-note"
+
+    with workspace_permalink_context(workspace_slug="team-paul", workspace_type="organization"):
+        write_result = await write_note(
+            project=test_project.name,
+            title="Team Workspace Note",
+            directory="team",
+            content="Team canonical content",
+        )
+
+    assert f"permalink: {expected_permalink}" in write_result
+
+    stored = await entity_repository.get_by_permalink(expected_permalink)
+    assert stored is not None
+    assert stored.permalink == expected_permalink
+
+    read_result = await read_note(
+        expected_permalink,
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(read_result, dict)
+    assert read_result["permalink"] == expected_permalink
+    assert read_result["content"].strip() == "Team canonical content"
+
+
+@pytest.mark.asyncio
+async def test_team_workspace_write_stores_complete_permalink_when_project_prefixes_disabled(
+    app,
+    test_project,
+    entity_repository,
+    config_manager,
+):
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    config = config_manager.load_config()
+    config.permalinks_include_project = False
+    config_manager.save_config(config)
+
+    expected_permalink = f"team-paul/{test_project.name}/team/team-no-project-prefix-note"
+
+    with workspace_permalink_context(workspace_slug="team-paul", workspace_type="organization"):
+        write_result = await write_note(
+            project=test_project.name,
+            title="Team No Project Prefix Note",
+            directory="team",
+            content="Team canonical content without project-prefix config",
+        )
+
+    assert f"permalink: {expected_permalink}" in write_result
+
+    stored = await entity_repository.get_by_permalink(expected_permalink)
+    assert stored is not None
+    assert stored.permalink == expected_permalink
+
+    read_result = await read_note(
+        f"memory://{expected_permalink}",
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(read_result, dict)
+    assert read_result["permalink"] == expected_permalink
+    assert read_result["content"].strip() == "Team canonical content without project-prefix config"
+
+
+@pytest.mark.asyncio
+async def test_personal_workspace_write_stores_complete_canonical_permalink(
+    app,
+    test_project,
+    entity_repository,
+):
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    expected_permalink = f"personal/{test_project.name}/personal/personal-workspace-note"
+
+    with workspace_permalink_context(workspace_slug="personal", workspace_type="personal"):
+        write_result = await write_note(
+            project=test_project.name,
+            title="Personal Workspace Note",
+            directory="personal",
+            content="Personal canonical content",
+        )
+
+    assert f"permalink: {expected_permalink}" in write_result
+
+    stored = await entity_repository.get_by_permalink(expected_permalink)
+    assert stored is not None
+    assert stored.permalink == expected_permalink
+
+
+@pytest.mark.asyncio
+async def test_read_note_personal_workspace_keeps_short_project_permalink_working(
+    app,
+    test_project,
+):
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    legacy_permalink = f"{test_project.name}/personal/short-personal-note"
+
+    await write_note(
+        project=test_project.name,
+        title="Short Personal Note",
+        directory="personal",
+        content="Short personal workspace content",
+    )
+
+    with workspace_permalink_context(workspace_slug="personal", workspace_type="personal"):
+        read_result = await read_note(
+            f"memory://{legacy_permalink}",
+            project=test_project.name,
+            output_format="json",
+        )
+
+    assert isinstance(read_result, dict)
+    assert read_result["permalink"] == legacy_permalink
+    assert read_result["content"].strip() == "Short personal workspace content"
+
+
+@pytest.mark.asyncio
+async def test_read_note_workspace_qualified_personal_url_finds_legacy_short_permalink(
+    app,
+    test_project,
+    entity_repository,
+):
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    legacy_permalink = f"{test_project.name}/personal/legacy-personal-note"
+    qualified_permalink = f"personal/{legacy_permalink}"
+
+    await write_note(
+        project=test_project.name,
+        title="Legacy Personal Note",
+        directory="personal",
+        content="Legacy personal workspace content",
+    )
+
+    stored = await entity_repository.get_by_permalink(legacy_permalink)
+    assert stored is not None
+    assert stored.permalink == legacy_permalink
+
+    with workspace_permalink_context(workspace_slug="personal", workspace_type="personal"):
+        read_result = await read_note(
+            f"memory://{qualified_permalink}",
+            project=test_project.name,
+            output_format="json",
+        )
+
+    assert isinstance(read_result, dict)
+    assert read_result["permalink"] == legacy_permalink
+    assert read_result["content"].strip() == "Legacy personal workspace content"
+
+
+@pytest.mark.asyncio
+async def test_read_note_workspace_qualified_memory_url_uses_complete_permalink(
+    app,
+    test_project,
+):
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    expected_permalink = f"team-paul/{test_project.name}/team/tool-read-note"
+
+    with workspace_permalink_context(workspace_slug="team-paul", workspace_type="organization"):
+        await write_note(
+            project=test_project.name,
+            title="Tool Read Note",
+            directory="team",
+            content="Workspace URL read content",
+        )
+
+    result = await read_note(
+        f"memory://{expected_permalink}",
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["permalink"] == expected_permalink
+    assert result["content"].strip() == "Workspace URL read content"
+
+
+@pytest.mark.asyncio
+async def test_read_note_memory_url_fallback_uses_search_tool_normalization(
+    monkeypatch, app, test_project
+):
+    """Fallback search should go back through search_notes for memory:// normalization."""
+    await write_note(
+        project=test_project.name,
+        title="Memory URL Fallback Note",
+        directory="test",
+        content="Fallback note content",
+    )
+
+    import importlib
+
+    read_note_module = importlib.import_module("basic_memory.mcp.tools.read_note")
+    clients_mod = importlib.import_module("basic_memory.mcp.clients")
+    OriginalKnowledgeClient = clients_mod.KnowledgeClient
+
+    fallback_memory_url = f"memory://{test_project.name}/test/memory-url-fallback-note"
+    search_calls: list[tuple[str, str, str | None]] = []
+
+    class SelectiveKnowledgeClient(OriginalKnowledgeClient):
+        async def resolve_entity(self, identifier: str, *, strict: bool = False) -> str:
+            if strict and identifier.endswith("test/memory-url-fallback-note"):
+                raise RuntimeError("force direct lookup failure")
+            return await super().resolve_entity(identifier, strict=strict)
+
+    async def fake_search_notes_fn(*, query, search_type, project, **kwargs):
+        search_calls.append((search_type, query, project))
+        return {
+            "results": [
+                {
+                    "title": "Memory URL Fallback Note",
+                    "permalink": "test/memory-url-fallback-note",
+                    "content": "",
+                    "type": "entity",
+                    "score": 1.0,
+                    "file_path": "test/Memory URL Fallback Note.md",
+                }
+            ],
+            "current_page": 1,
+            "page_size": 10,
+        }
+
+    monkeypatch.setattr(clients_mod, "KnowledgeClient", SelectiveKnowledgeClient)
+    monkeypatch.setattr(read_note_module, "search_notes", fake_search_notes_fn)
+
+    result = await read_note(fallback_memory_url)
+
+    assert search_calls == [
+        ("title", fallback_memory_url, test_project.name),
+        ("text", fallback_memory_url, test_project.name),
+    ]
+    assert "I couldn't find an exact match" in result
+    assert "Memory URL Fallback Note" in result
 
 
 class TestReadNoteSecurityValidation:
@@ -216,7 +569,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for attack_identifier in attack_identifiers:
-            result = await read_note.fn(attack_identifier, project=test_project.name)
+            result = await read_note(attack_identifier, project=test_project.name)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -238,7 +591,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for attack_identifier in attack_identifiers:
-            result = await read_note.fn(attack_identifier, project=test_project.name)
+            result = await read_note(attack_identifier, project=test_project.name)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -262,7 +615,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for attack_identifier in attack_identifiers:
-            result = await read_note.fn(project=test_project.name, identifier=attack_identifier)
+            result = await read_note(project=test_project.name, identifier=attack_identifier)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -285,7 +638,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for attack_identifier in attack_identifiers:
-            result = await read_note.fn(project=test_project.name, identifier=attack_identifier)
+            result = await read_note(project=test_project.name, identifier=attack_identifier)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -306,7 +659,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for attack_identifier in attack_identifiers:
-            result = await read_note.fn(project=test_project.name, identifier=attack_identifier)
+            result = await read_note(project=test_project.name, identifier=attack_identifier)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -326,7 +679,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for attack_identifier in attack_identifiers:
-            result = await read_note.fn(project=test_project.name, identifier=attack_identifier)
+            result = await read_note(project=test_project.name, identifier=attack_identifier)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -348,7 +701,7 @@ class TestReadNoteSecurityValidation:
         ]
 
         for safe_identifier in safe_identifiers:
-            result = await read_note.fn(project=test_project.name, identifier=safe_identifier)
+            result = await read_note(project=test_project.name, identifier=safe_identifier)
 
             assert isinstance(result, str)
             # Should not contain security error message
@@ -362,15 +715,15 @@ class TestReadNoteSecurityValidation:
     async def test_read_note_allows_legitimate_titles(self, app, test_project):
         """Test that legitimate note titles work normally."""
         # Create a test note first
-        await write_note.fn(
+        await write_note(
             project=test_project.name,
             title="Security Test Note",
-            folder="security-tests",
+            directory="security-tests",
             content="# Security Test Note\nThis is a legitimate note for security testing.",
         )
 
         # Test reading by title (should work)
-        result = await read_note.fn("Security Test Note", project=test_project.name)
+        result = await read_note("Security Test Note", project=test_project.name)
 
         assert isinstance(result, str)
         # Should not be a security error
@@ -381,7 +734,7 @@ class TestReadNoteSecurityValidation:
     async def test_read_note_empty_identifier_security(self, app, test_project):
         """Test that empty identifier is handled securely."""
         # Empty identifier should be allowed (may return search results or error, but not security error)
-        result = await read_note.fn(identifier="", project=test_project.name)
+        result = await read_note(identifier="", project=test_project.name)
 
         assert isinstance(result, str)
         # Empty identifier should not trigger security error
@@ -391,11 +744,9 @@ class TestReadNoteSecurityValidation:
     async def test_read_note_security_with_all_parameters(self, app, test_project):
         """Test security validation works with all read_note parameters."""
         # Test that security validation is applied even when all other parameters are provided
-        result = await read_note.fn(
+        result = await read_note(
             project=test_project.name,
             identifier="../../../etc/malicious",
-            page=1,
-            page_size=5,
         )
 
         assert isinstance(result, str)
@@ -407,7 +758,7 @@ class TestReadNoteSecurityValidation:
     async def test_read_note_security_logging(self, app, caplog, test_project):
         """Test that security violations are properly logged."""
         # Attempt path traversal attack
-        result = await read_note.fn(identifier="../../../etc/passwd", project=test_project.name)
+        result = await read_note(identifier="../../../etc/passwd", project=test_project.name)
 
         assert "# Error" in result
         assert "paths must stay within project boundaries" in result
@@ -420,10 +771,10 @@ class TestReadNoteSecurityValidation:
     async def test_read_note_preserves_functionality_with_security(self, app, test_project):
         """Test that security validation doesn't break normal note reading functionality."""
         # Create a note with complex content to ensure security validation doesn't interfere
-        await write_note.fn(
+        await write_note(
             project=test_project.name,
             title="Full Feature Security Test Note",
-            folder="security-tests",
+            directory="security-tests",
             content=dedent("""
                 # Full Feature Security Test Note
                 
@@ -444,7 +795,7 @@ class TestReadNoteSecurityValidation:
         )
 
         # Test reading by permalink
-        result = await read_note.fn(
+        result = await read_note(
             "security-tests/full-feature-security-test-note", project=test_project.name
         )
 
@@ -468,7 +819,7 @@ class TestReadNoteSecurityEdgeCases:
         ]
 
         for attack_identifier in unicode_attack_identifiers:
-            result = await read_note.fn(attack_identifier, project=test_project.name)
+            result = await read_note(attack_identifier, project=test_project.name)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -480,7 +831,7 @@ class TestReadNoteSecurityEdgeCases:
         # Create a very long path traversal attack
         long_attack_identifier = "../" * 1000 + "etc/malicious"
 
-        result = await read_note.fn(long_attack_identifier, project=test_project.name)
+        result = await read_note(long_attack_identifier, project=test_project.name)
 
         assert isinstance(result, str)
         assert "# Error" in result
@@ -498,7 +849,7 @@ class TestReadNoteSecurityEdgeCases:
         ]
 
         for attack_identifier in case_attack_identifiers:
-            result = await read_note.fn(attack_identifier, project=test_project.name)
+            result = await read_note(attack_identifier, project=test_project.name)
 
             assert isinstance(result, str)
             assert "# Error" in result
@@ -516,7 +867,7 @@ class TestReadNoteSecurityEdgeCases:
         ]
 
         for attack_identifier in whitespace_attack_identifiers:
-            result = await read_note.fn(attack_identifier, project=test_project.name)
+            result = await read_note(attack_identifier, project=test_project.name)
 
             assert isinstance(result, str)
             # The attack should still be blocked even with whitespace

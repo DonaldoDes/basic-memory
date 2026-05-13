@@ -5,10 +5,10 @@ from typing import List, Optional, Sequence, Union, Any
 
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 from sqlalchemy.orm.interfaces import LoaderOption
 from sqlalchemy.engine import Row
 
@@ -33,7 +33,7 @@ class EntityRepository(Repository[Entity]):
         """
         super().__init__(session_maker, Entity, project_id=project_id)
 
-    async def get_by_id(self, entity_id: int) -> Optional[Entity]:  # pragma: no cover
+    async def get_by_id(self, entity_id: int, *, load_relations: bool = True) -> Optional[Entity]:
         """Get entity by numeric ID.
 
         Args:
@@ -43,9 +43,23 @@ class EntityRepository(Repository[Entity]):
             Entity if found, None otherwise
         """
         async with db.scoped_session(self.session_maker) as session:
+            if not load_relations:
+                result = await session.execute(self.select().where(Entity.id == entity_id))
+                return result.scalars().one_or_none()
+
             return await self.select_by_id(session, entity_id)
 
-    async def get_by_external_id(self, external_id: str) -> Optional[Entity]:
+    async def _find_one_by_query(self, query, *, load_relations: bool) -> Optional[Entity]:
+        """Return one entity row with optional eager loading."""
+        if load_relations:
+            return await self.find_one(query)
+
+        result = await self.execute_query(query, use_query_options=False)
+        return result.scalars().one_or_none()
+
+    async def get_by_external_id(
+        self, external_id: str, *, load_relations: bool = True
+    ) -> Optional[Entity]:
         """Get entity by external UUID.
 
         Args:
@@ -54,44 +68,48 @@ class EntityRepository(Repository[Entity]):
         Returns:
             Entity if found, None otherwise
         """
-        query = (
-            self.select()
-            .where(Entity.external_id == external_id)
-            .options(*self.get_load_options())
-        )
-        return await self.find_one(query)
+        query = self.select().where(Entity.external_id == external_id)
+        return await self._find_one_by_query(query, load_relations=load_relations)
 
-    async def get_by_permalink(self, permalink: str) -> Optional[Entity]:
+    async def get_by_permalink(
+        self, permalink: str, *, load_relations: bool = True
+    ) -> Optional[Entity]:
         """Get entity by permalink.
 
         Args:
             permalink: Unique identifier for the entity
         """
-        query = self.select().where(Entity.permalink == permalink).options(*self.get_load_options())
-        return await self.find_one(query)
+        query = self.select().where(Entity.permalink == permalink)
+        return await self._find_one_by_query(query, load_relations=load_relations)
 
-    async def get_by_title(self, title: str) -> Sequence[Entity]:
-        """Get entity by title.
+    async def get_by_title(self, title: str, *, load_relations: bool = True) -> Sequence[Entity]:
+        """Get entities by title, ordered by shortest path first.
+
+        When multiple entities share the same title (in different folders),
+        returns them ordered by file_path length then alphabetically.
+        This provides "shortest path" resolution for duplicate titles.
 
         Args:
             title: Title of the entity to find
         """
-        query = self.select().where(Entity.title == title).options(*self.get_load_options())
-        result = await self.execute_query(query)
+        query = (
+            self.select()
+            .where(Entity.title == title)
+            .order_by(func.length(Entity.file_path), Entity.file_path)
+        )
+        result = await self.execute_query(query, use_query_options=load_relations)
         return list(result.scalars().all())
 
-    async def get_by_file_path(self, file_path: Union[Path, str]) -> Optional[Entity]:
+    async def get_by_file_path(
+        self, file_path: Union[Path, str], *, load_relations: bool = True
+    ) -> Optional[Entity]:
         """Get entity by file_path.
 
         Args:
             file_path: Path to the entity file (will be converted to string internally)
         """
-        query = (
-            self.select()
-            .where(Entity.file_path == Path(file_path).as_posix())
-            .options(*self.get_load_options())
-        )
-        return await self.find_one(query)
+        query = self.select().where(Entity.file_path == Path(file_path).as_posix())
+        return await self._find_one_by_query(query, load_relations=load_relations)
 
     # -------------------------------------------------------------------------
     # Lightweight methods for permalink resolution (no eager loading)
@@ -157,6 +175,24 @@ class EntityRepository(Repository[Entity]):
         """
         query = select(Entity.permalink)
         query = self._add_project_filter(query)
+        result = await self.execute_query(query, use_query_options=False)
+        return list(result.scalars().all())
+
+    async def find_by_ids_for_hydration(self, ids: List[int]) -> Sequence[Entity]:
+        """Fetch minimal entity fields needed for context hydration.
+
+        Context hydration only needs an entity's primary key, title, and external
+        UUID. Keeping this separate from find_by_ids avoids the relationship eager
+        loads that are useful for full entity reads but expensive for response shaping.
+        """
+        if not ids:
+            return []
+
+        query = (
+            self.select()
+            .where(Entity.id.in_(ids))
+            .options(load_only(Entity.id, Entity.title, Entity.external_id))
+        )
         result = await self.execute_query(query, use_query_options=False)
         return list(result.scalars().all())
 
@@ -374,6 +410,9 @@ class EntityRepository(Repository[Entity]):
                     # Use merge to avoid session state conflicts
                     # Set the ID to update existing entity
                     entity.id = existing_entity.id
+                    # Preserve the stable external_id so that external references
+                    # (e.g. public share links) survive re-indexing
+                    entity.external_id = existing_entity.external_id
 
                     # Ensure observations reference the correct entity_id
                     for obs in entity.observations:
@@ -412,6 +451,22 @@ class EntityRepository(Repository[Entity]):
         query = select(Entity.file_path)
         query = self._add_project_filter(query)
 
+        result = await self.execute_query(query, use_query_options=False)
+        return list(result.scalars().all())
+
+    async def find_without_relations(self) -> Sequence[Entity]:
+        """Find entities that have no incoming or outgoing relations."""
+        # Trigger: entity appears as a source in any relation.
+        # Why: even unresolved outgoing links mean the entity references another node.
+        # Outcome: entities with outgoing relations are excluded from the orphan list.
+        has_outgoing = exists().where(Relation.from_id == Entity.id)
+
+        # Trigger: entity appears as the resolved target in any relation.
+        # Why: only resolved relation targets are graph nodes with an incoming edge.
+        # Outcome: entities referenced by resolved links are excluded from orphans.
+        has_incoming = exists().where(Relation.to_id == Entity.id)
+
+        query = self.select().where(~has_outgoing).where(~has_incoming).order_by(Entity.file_path)
         result = await self.execute_query(query, use_query_options=False)
         return list(result.scalars().all())
 

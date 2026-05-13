@@ -38,8 +38,16 @@ class SearchIndexRow:
     to_id: Optional[int] = None  # relations
     relation_type: Optional[str] = None  # relations
 
+    # Matched chunk text from vector search (the actual content that matched the query)
+    matched_chunk_text: Optional[str] = None
+
+    CONTENT_DISPLAY_LIMIT = 4000
+
     @property
     def content(self):
+        """Return truncated content for display. Full content in content_snippet."""
+        if self.content_snippet and len(self.content_snippet) > self.CONTENT_DISPLAY_LIMIT:
+            return self.content_snippet[: self.CONTENT_DISPLAY_LIMIT]
         return self.content_snippet
 
     @property

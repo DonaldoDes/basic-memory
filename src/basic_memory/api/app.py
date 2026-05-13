@@ -2,23 +2,14 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRouter
 from loguru import logger
 
 from basic_memory import __version__ as version
 from basic_memory.api.container import ApiContainer, set_container
-from basic_memory.api.routers import (
-    directory_router,
-    importer_router,
-    knowledge,
-    management,
-    memory,
-    project,
-    resource,
-    search,
-    prompt_router,
-)
 from basic_memory.api.v2.routers import (
     knowledge_router as v2_knowledge,
     project_router as v2_project,
@@ -28,9 +19,23 @@ from basic_memory.api.v2.routers import (
     directory_router as v2_directory,
     prompt_router as v2_prompt,
     importer_router as v2_importer,
+    schema_router as v2_schema,
 )
+from basic_memory.api.v2.routers.project_router import (
+    add_project,
+    list_projects,
+    synchronize_projects,
+)
+import logfire
 from basic_memory.config import init_api_logging
+from basic_memory.services.exceptions import EntityAlreadyExistsError
 from basic_memory.services.initialization import initialize_app
+from basic_memory.workspace_context import (
+    WORKSPACE_SLUG_HEADER,
+    WORKSPACE_TYPE_HEADER,
+    workspace_permalink_context_validation_error,
+    workspace_permalink_context,
+)
 
 
 @asynccontextmanager
@@ -46,30 +51,39 @@ async def lifespan(app: FastAPI):  # pragma: no cover
     set_container(container)
     app.state.container = container
 
-    logger.info(f"Starting Basic Memory API (mode={container.mode.name})")
+    with logfire.span(
+        "api.lifecycle.startup",
+        entrypoint="api",
+        mode=container.mode.name.lower(),
+    ):
+        logger.info(f"Starting Basic Memory API (mode={container.mode.name})")
 
-    await initialize_app(container.config)
+        await initialize_app(container.config)
 
-    # Cache database connections in app state for performance
-    logger.info("Initializing database and caching connections...")
-    engine, session_maker = await container.init_database()
-    app.state.engine = engine
-    app.state.session_maker = session_maker
-    logger.info("Database connections cached in app state")
+        # Cache database connections in app state for performance
+        logger.info("Initializing database and caching connections...")
+        engine, session_maker = await container.init_database()
+        app.state.engine = engine
+        app.state.session_maker = session_maker
+        logger.info("Database connections cached in app state")
 
-    # Create and start sync coordinator (lifecycle centralized in coordinator)
-    sync_coordinator = container.create_sync_coordinator()
-    await sync_coordinator.start()
-    app.state.sync_coordinator = sync_coordinator
+        # Create and start sync coordinator (lifecycle centralized in coordinator)
+        sync_coordinator = container.create_sync_coordinator()
+        await sync_coordinator.start()
+        app.state.sync_coordinator = sync_coordinator
 
     # Proceed with startup
     yield
 
     # Shutdown - coordinator handles clean task cancellation
-    logger.info("Shutting down Basic Memory API")
-    await sync_coordinator.stop()
-
-    await container.shutdown_database()
+    with logfire.span(
+        "api.lifecycle.shutdown",
+        entrypoint="api",
+        mode=container.mode.name.lower(),
+    ):
+        logger.info("Shutting down Basic Memory API")
+        await sync_coordinator.stop()
+        await container.shutdown_database()
 
 
 # Initialize FastAPI app
@@ -80,6 +94,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.middleware("http")
+async def workspace_permalink_context_middleware(request: Request, call_next):
+    """Populate workspace permalink context from request headers."""
+    workspace_slug = request.headers.get(WORKSPACE_SLUG_HEADER)
+    workspace_type = request.headers.get(WORKSPACE_TYPE_HEADER)
+
+    validation_error = workspace_permalink_context_validation_error(workspace_slug, workspace_type)
+    if validation_error is not None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": validation_error},
+        )
+
+    if not workspace_slug:
+        return await call_next(request)
+
+    # ContextVar state remains active across the awaited downstream handler while
+    # this context manager is open, so entity creation can see request metadata.
+    with workspace_permalink_context(
+        workspace_slug=workspace_slug,
+        workspace_type=workspace_type,
+    ):
+        return await call_next(request)
+
+
 # Include v2 routers FIRST (more specific paths must match before /{project} catch-all)
 app.include_router(v2_knowledge, prefix="/v2/projects/{project_id}")
 app.include_router(v2_memory, prefix="/v2/projects/{project_id}")
@@ -88,21 +128,44 @@ app.include_router(v2_resource, prefix="/v2/projects/{project_id}")
 app.include_router(v2_directory, prefix="/v2/projects/{project_id}")
 app.include_router(v2_prompt, prefix="/v2/projects/{project_id}")
 app.include_router(v2_importer, prefix="/v2/projects/{project_id}")
+app.include_router(v2_schema, prefix="/v2/projects/{project_id}")
 app.include_router(v2_project, prefix="/v2")
 
-# Include v1 routers (/{project} is a catch-all, must come after specific prefixes)
-app.include_router(knowledge.router, prefix="/{project}")
-app.include_router(memory.router, prefix="/{project}")
-app.include_router(resource.router, prefix="/{project}")
-app.include_router(search.router, prefix="/{project}")
-app.include_router(project.project_router, prefix="/{project}")
-app.include_router(directory_router.router, prefix="/{project}")
-app.include_router(prompt_router.router, prefix="/{project}")
-app.include_router(importer_router.router, prefix="/{project}")
+# Legacy web app proxy paths (compat with /proxy/projects/projects)
+app.include_router(v2_project, prefix="/proxy/projects")
 
-# Project resource router works across projects
-app.include_router(project.project_resource_router)
-app.include_router(management.router)
+# Legacy v1 compat: older CLI versions (v0.18.0 and earlier) call /projects/...
+# Using router mount causes 307 redirect which proxy doesn't follow, so add explicit routes
+legacy_router = APIRouter(tags=["legacy"])
+legacy_router.add_api_route("/projects/projects", list_projects, methods=["GET"])
+legacy_router.add_api_route("/projects/projects", add_project, methods=["POST"])
+legacy_router.add_api_route("/projects/config/sync", synchronize_projects, methods=["POST"])
+app.include_router(legacy_router)
+
+# V2 routers are the only public API surface
+
+
+@app.exception_handler(EntityAlreadyExistsError)
+async def entity_already_exists_error_handler(request: Request, exc: EntityAlreadyExistsError):
+    """Handle entity creation conflicts (e.g., file already exists).
+
+    This is expected behavior when users try to create notes that exist,
+    so log at INFO level instead of ERROR.
+    """
+    logger.info(
+        "Entity already exists",
+        url=str(request.url),
+        method=request.method,
+        path=request.url.path,
+        error=str(exc),
+    )
+    return await http_exception_handler(
+        request,
+        HTTPException(
+            status_code=409,
+            detail="Note already exists. Use edit_note to modify it, or delete it first.",
+        ),
+    )
 
 
 @app.exception_handler(Exception)
@@ -116,4 +179,7 @@ async def exception_handler(request, exc):  # pragma: no cover
         error_type=type(exc).__name__,
         error=str(exc),
     )
-    return await http_exception_handler(request, HTTPException(status_code=500, detail=str(exc)))
+    return await http_exception_handler(
+        request,
+        HTTPException(status_code=500, detail="Internal server error"),
+    )

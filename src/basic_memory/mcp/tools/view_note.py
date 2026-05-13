@@ -8,17 +8,16 @@ from fastmcp import Context
 
 from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tools.read_note import read_note
-from basic_memory.telemetry import track_mcp_tool
 
 
 @mcp.tool(
     description="View a note as a formatted artifact for better readability.",
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def view_note(
     identifier: str,
     project: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 10,
+    project_id: Optional[str] = None,
     context: Context | None = None,
 ) -> str:
     """View a markdown note as a formatted artifact.
@@ -31,8 +30,9 @@ async def view_note(
         identifier: The title or permalink of the note to view
         project: Project name to read from. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
-        page: Page number for paginated results (default: 1)
-        page_size: Number of items per page (default: 10)
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -45,9 +45,6 @@ async def view_note(
         # View a note by permalink
         view_note("meetings/weekly-standup")
 
-        # View with pagination
-        view_note("large-document", page=2, page_size=5)
-
         # Explicit project specification
         view_note("Meeting Notes", project="my-project")
 
@@ -55,11 +52,17 @@ async def view_note(
         HTTPError: If project doesn't exist or is inaccessible
         SecurityError: If identifier attempts path traversal
     """
-    track_mcp_tool("view_note")
     logger.info(f"Viewing note: {identifier} in project: {project}")
 
-    # Call the existing read_note logic
-    content = await read_note.fn(identifier, project, page, page_size, context)
+    # Call the existing read_note logic (default output_format="text" returns str)
+    content = str(
+        await read_note(
+            identifier=identifier,
+            project=project,
+            project_id=project_id,
+            context=context,
+        )
+    )
 
     # Check if this is an error message (note not found)
     if "# Note Not Found" in content:

@@ -1,5 +1,6 @@
 """Status command for basic-memory CLI."""
 
+import json
 from typing import Set, Dict
 from typing import Annotated, Optional
 
@@ -11,8 +12,10 @@ from rich.panel import Panel
 from rich.tree import Tree
 
 from basic_memory.cli.app import app
+from basic_memory.cli.commands.routing import force_routing, validate_routing_flags
+from basic_memory.config import ConfigManager
 from basic_memory.mcp.async_client import get_client
-from basic_memory.mcp.tools.utils import call_post
+from basic_memory.mcp.clients import ProjectClient
 from basic_memory.schemas import SyncReportResponse
 from basic_memory.mcp.project_context import get_active_project
 
@@ -139,20 +142,20 @@ def display_changes(
     console.print(Panel(tree, expand=False))
 
 
-async def run_status(project: Optional[str] = None, verbose: bool = False):  # pragma: no cover
-    """Check sync status of files vs database."""
+async def run_status(
+    project: Optional[str] = None,
+) -> tuple[str, SyncReportResponse]:
+    """Fetch sync status of files vs database.
 
-    try:
-        async with get_client() as client:
-            project_item = await get_active_project(client, project, None)
-            response = await call_post(client, f"{project_item.project_url}/project/status")
-            sync_report = SyncReportResponse.model_validate(response.json())
+    Returns (project_name, sync_report) for the caller to render.
+    """
+    # Resolve default project so get_client() can route per-project
+    project = project or ConfigManager().default_project
 
-            display_changes(project_item.name, "Status", sync_report, verbose)
-
-    except (ValueError, ToolError) as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
+    async with get_client(project_name=project) as client:
+        project_item = await get_active_project(client, project, None)
+        sync_report = await ProjectClient(client).get_status(project_item.external_id)
+        return project_item.name, sync_report
 
 
 @app.command()
@@ -162,13 +165,48 @@ def status(
         typer.Option(help="The project name."),
     ] = None,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed file information"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+    local: bool = typer.Option(
+        False, "--local", help="Force local API routing (ignore cloud mode)"
+    ),
+    cloud: bool = typer.Option(False, "--cloud", help="Force cloud API routing"),
 ):
-    """Show sync status between files and database."""
+    """Show sync status between files and database.
+
+    Use --json for machine-readable output.
+    Use --local to force local routing when cloud mode is enabled.
+    Use --cloud to force cloud routing when cloud mode is disabled.
+    """
     from basic_memory.cli.commands.command_utils import run_with_cleanup
 
     try:
-        run_with_cleanup(run_status(project, verbose))  # pragma: no cover
+        validate_routing_flags(local, cloud)
+        # Trigger: no explicit routing flag provided
+        # Why: status scans the local filesystem — cloud routing would use the
+        #      Docker-internal path stored in the cloud database, which doesn't
+        #      exist locally.
+        # Outcome: default to local routing unless --cloud was explicitly requested.
+        if not local and not cloud:
+            local = True
+        with force_routing(local=local, cloud=cloud):
+            project_name, sync_report = run_with_cleanup(run_status(project))
+
+        if json_output:
+            print(json.dumps(sync_report.model_dump(mode="json"), indent=2, default=str))
+        else:
+            display_changes(project_name, "Status", sync_report, verbose)
+    except (ValueError, ToolError) as e:
+        if json_output:
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
     except Exception as e:
         logger.error(f"Error checking status: {e}")
-        typer.echo(f"Error checking status: {e}", err=True)
+        if json_output:
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            typer.echo(f"Error checking status: {e}", err=True)
         raise typer.Exit(code=1)  # pragma: no cover

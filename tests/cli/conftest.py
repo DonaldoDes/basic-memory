@@ -25,6 +25,8 @@ def isolated_home(tmp_path, monkeypatch) -> Path:
     from basic_memory import config as config_module
 
     config_module._CONFIG_CACHE = None
+    config_module._CONFIG_MTIME = None
+    config_module._CONFIG_SIZE = None
 
     monkeypatch.setenv("HOME", str(tmp_path))
     if os.name == "nt":
@@ -36,13 +38,23 @@ def isolated_home(tmp_path, monkeypatch) -> Path:
 
 
 @pytest_asyncio.fixture
-async def app(app_config, project_config, engine_factory, test_config, aiolib) -> FastAPI:
+async def app(
+    app_config, project_config, engine_factory, test_config, aiolib
+) -> AsyncGenerator[FastAPI, None]:
     """Create test FastAPI application."""
     app = fastapi_app
+    previous_overrides = dict(app.dependency_overrides)
     app.dependency_overrides[get_app_config] = lambda: app_config
     app.dependency_overrides[get_project_config] = lambda: project_config
     app.dependency_overrides[get_engine_factory] = lambda: engine_factory
-    return app
+    try:
+        yield app
+    finally:
+        # Trigger: CLI tests share the module-level FastAPI app with API/MCP tests.
+        # Why: leaving per-test dependency overrides installed lets later commands
+        # talk to stale engines that no cleanup fixture owns.
+        # Outcome: keep CLI app wiring isolated to the requesting test.
+        app.dependency_overrides = previous_overrides
 
 
 @pytest_asyncio.fixture

@@ -20,12 +20,24 @@ from loguru import logger
 from rich.console import Console
 
 from basic_memory.cli.commands.cloud.rclone_installer import is_rclone_installed
+from basic_memory.config import resolve_data_dir
 from basic_memory.utils import normalize_project_path
 
 console = Console()
 
 # Minimum rclone version for --create-empty-src-dirs support
 MIN_RCLONE_VERSION_EMPTY_DIRS = (1, 64, 0)
+
+# Tigris edge caching returns stale data for users outside the origin region (iad).
+# --header is rclone's global flag that applies to ALL HTTP transactions (list, download,
+# upload). This is critical because bisync starts with S3 ListObjectsV2, which is neither
+# a download nor upload — so --header-download/--header-upload would miss list requests.
+# See: https://www.tigrisdata.com/docs/objects/consistency/
+TIGRIS_CONSISTENCY_HEADERS = [
+    "--header",
+    "X-Tigris-Consistent: true",
+]
+
 
 class RunResult(Protocol):
     returncode: int
@@ -127,13 +139,16 @@ def get_bmignore_filter_path() -> Path:
 def get_project_bisync_state(project_name: str) -> Path:
     """Get path to project's bisync state directory.
 
+    Honors ``BASIC_MEMORY_CONFIG_DIR`` so isolated instances each keep their
+    own bisync state alongside their config.
+
     Args:
         project_name: Name of the project
 
     Returns:
         Path to bisync state directory for this project
     """
-    return Path.home() / ".basic-memory" / "bisync-state" / project_name
+    return resolve_data_dir() / "bisync-state" / project_name
 
 
 def bisync_initialized(project_name: str) -> bool:
@@ -209,8 +224,12 @@ def project_sync(
         "sync",
         str(local_path),
         remote_path,
+        *TIGRIS_CONSISTENCY_HEADERS,
         "--filter-from",
         str(filter_path),
+        # Prevent NUL byte padding on virtual filesystems (e.g. Google Drive File Stream)
+        # See: rclone/rclone#6801
+        "--local-no-preallocate",
     ]
 
     if verbose:
@@ -278,6 +297,7 @@ def project_bisync(
         "bisync",
         str(local_path),
         remote_path,
+        *TIGRIS_CONSISTENCY_HEADERS,
         "--resilient",
         "--conflict-resolve=newer",
         "--max-delete=25",
@@ -286,6 +306,9 @@ def project_bisync(
         str(filter_path),
         "--workdir",
         str(state_path),
+        # Prevent NUL byte padding on virtual filesystems (e.g. Google Drive File Stream)
+        # See: rclone/rclone#6801
+        "--local-no-preallocate",
     ]
 
     # Add --create-empty-src-dirs if rclone version supports it (v1.64+)
@@ -353,6 +376,7 @@ def project_check(
         "check",
         str(local_path),
         remote_path,
+        *TIGRIS_CONSISTENCY_HEADERS,
         "--filter-from",
         str(filter_path),
     ]
@@ -392,6 +416,6 @@ def project_ls(
     if path:
         remote_path = f"{remote_path}/{path}"
 
-    cmd = ["rclone", "ls", remote_path]
+    cmd = ["rclone", "ls", *TIGRIS_CONSISTENCY_HEADERS, remote_path]
     result = run(cmd, capture_output=True, text=True, check=True)
     return result.stdout.splitlines()

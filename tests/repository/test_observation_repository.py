@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
-import sqlalchemy
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 from basic_memory import db
 from basic_memory.models import Entity, Observation, Project
@@ -59,7 +59,7 @@ async def test_create_observation_entity_does_not_exist(
         "content": "Test content",
         "context": "test-context",
     }
-    with pytest.raises(sqlalchemy.exc.IntegrityError):
+    with pytest.raises(IntegrityError):
         await observation_repository.create(observation_data)
 
 
@@ -95,7 +95,7 @@ async def test_delete_observations(session_maker: async_sessionmaker, repo, test
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -137,7 +137,7 @@ async def test_delete_observation_by_id(
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -174,7 +174,7 @@ async def test_delete_observation_by_content(
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -215,7 +215,7 @@ async def test_find_by_category(session_maker: async_sessionmaker, repo, test_pr
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -276,7 +276,7 @@ async def test_observation_categories(
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -344,7 +344,7 @@ async def test_find_by_category_case_sensitivity(
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -389,7 +389,7 @@ async def test_observation_permalink_truncates_long_content(
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",
@@ -440,7 +440,7 @@ async def test_observation_permalink_short_content_unchanged(
         entity = Entity(
             project_id=test_project.id,
             title="test_entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/test-entity",
             file_path="test/test_entity.md",
             content_type="text/markdown",

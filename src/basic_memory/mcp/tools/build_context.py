@@ -1,23 +1,115 @@
 """Build context tool for Basic Memory MCP server."""
 
-from typing import Optional, cast
+from typing import Annotated, Optional, Literal, cast
 
+import logfire
 from loguru import logger
 from fastmcp import Context
+from pydantic import AliasChoices, Field
 
-from basic_memory.mcp.async_client import get_client
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory.config import ConfigManager
+from basic_memory.mcp.project_context import (
+    detect_project_from_memory_url_prefix,
+    get_project_client,
+    resolve_project_and_path,
+)
 from basic_memory.mcp.server import mcp
-from basic_memory.telemetry import track_mcp_tool
 from basic_memory.schemas.base import TimeFrame
 from basic_memory.schemas.memory import (
+    ContextResult,
     EntitySummary,
     GraphContext,
     MemoryUrl,
     ObservationSummary,
-    memory_url_path,
+    RelationSummary,
 )
 from basic_memory.dataview.integration import create_dataview_integration
+
+
+def _format_entity_block(result: ContextResult) -> str:
+    """Format a single context result as a markdown block."""
+    primary = result.primary_result
+    lines = []
+
+    # --- Header ---
+    lines.append(f"## {primary.title}")
+    if primary.permalink:
+        lines.append(f"permalink: {primary.permalink}")
+    # RelationSummary has no content field; Entity/Observation do
+    if not isinstance(primary, RelationSummary) and primary.content:
+        lines.append("")
+        lines.append(primary.content)
+
+    # --- Observations ---
+    if result.observations:
+        lines.append("")
+        lines.append("### Observations")
+        for obs in result.observations:
+            lines.append(f"- [{obs.category}] {obs.content}")
+
+    # --- Relations (from primary's related_results that are RelationSummary) ---
+    relation_items: list[RelationSummary] = [
+        r for r in result.related_results if isinstance(r, RelationSummary)
+    ]
+    if relation_items:
+        lines.append("")
+        lines.append("### Relations")
+        for rel in relation_items:
+            lines.append(f"- {rel.relation_type} [[{rel.to_entity}]]")
+
+    # --- Related entities (non-relation related results) ---
+    related_entities: list[EntitySummary | ObservationSummary] = [
+        r for r in result.related_results if not isinstance(r, RelationSummary)
+    ]
+    if related_entities:
+        lines.append("")
+        lines.append("### Related")
+        for item in related_entities:
+            permalink = item.permalink if item.permalink else ""
+            lines.append(f"- [[{item.title}]] ({permalink})")
+
+    return "\n".join(lines)
+
+
+def _format_context_markdown(graph: GraphContext, project: str) -> str:
+    """Format GraphContext as compact markdown text.
+
+    Produces a human-readable markdown representation that is much smaller
+    than the equivalent JSON, suitable for LLM consumption when structured
+    data isn't needed.
+    """
+    if not graph.results:
+        uri = graph.metadata.uri or ""
+        return f"No results found for '{uri}' in project '{project}'."
+
+    parts = []
+
+    # --- Title from first primary result ---
+    first_title = graph.results[0].primary_result.title
+    if len(graph.results) == 1:
+        parts.append(f"# Context: {first_title}")
+    else:
+        uri = graph.metadata.uri or ""
+        parts.append(f"# Context: {uri}")
+
+    parts.append("")
+
+    # --- Entity blocks separated by --- ---
+    entity_blocks = [_format_entity_block(result) for result in graph.results]
+    parts.append("\n\n---\n\n".join(entity_blocks))
+
+    # --- Footer ---
+    meta = graph.metadata
+    primary_count = meta.primary_count or 0
+    related_count = meta.related_count or 0
+    parts.append("")
+    parts.append("---")
+    parts.append(
+        f"*{primary_count} primary, {related_count} related"
+        f" | depth={meta.depth} | project: {project}*"
+    )
+
+    return "\n".join(parts)
 
 
 @mcp.tool(
@@ -35,19 +127,46 @@ from basic_memory.dataview.integration import create_dataview_integration
     Timeframes support natural language like:
     - "2 days ago", "last week", "today", "3 months ago"
     - Or standard formats like "7d", "24h"
+
+    Format options:
+    - "json" (default): Structured JSON with internal fields excluded
+    - "text": Compact markdown text for LLM consumption
     """,
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def build_context(
-    url: MemoryUrl,
+    url: Annotated[
+        MemoryUrl,
+        Field(validation_alias=AliasChoices("url", "uri", "memory_url")),
+    ],
     project: Optional[str] = None,
+    project_id: Optional[str] = None,
     depth: str | int | None = 1,
-    timeframe: Optional[TimeFrame] = "7d",
-    page: int = 1,
-    page_size: int = 10,
-    max_related: int = 10,
+    timeframe: Annotated[
+        Optional[TimeFrame],
+        Field(
+            default="7d",
+            validation_alias=AliasChoices("timeframe", "since", "time_range", "lookback"),
+        ),
+    ] = "7d",
+    # `offset` is intentionally NOT aliased: it has different semantics
+    # (item-indexed vs. 1-indexed page-number).
+    page: Annotated[
+        int,
+        Field(default=1, validation_alias=AliasChoices("page", "page_number")),
+    ] = 1,
+    page_size: Annotated[
+        int,
+        Field(default=10, validation_alias=AliasChoices("page_size", "limit", "per_page")),
+    ] = 10,
+    max_related: Annotated[
+        int,
+        Field(default=10, validation_alias=AliasChoices("max_related", "max_results")),
+    ] = 10,
+    output_format: Literal["json", "text"] = "json",
     enable_dataview: bool = True,
     context: Context | None = None,
-) -> GraphContext:
+) -> dict | str:
     """Get context needed to continue a discussion within a specific project.
 
     This tool enables natural continuation of discussions by loading relevant context
@@ -55,26 +174,30 @@ async def build_context(
     a rich context graph of related information.
 
     Project Resolution:
-    Server resolves projects in this order: Single Project Mode → project parameter → default project.
-    If project unknown, use list_memory_projects() or recent_activity() first.
+    Server resolves projects using a unified priority chain (same in local and cloud modes):
+    Single Project Mode → project parameter → default project.
+    Uses default project automatically. Specify `project` parameter to target a different project.
 
     Args:
         project: Project name to build context from. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
         url: memory:// URI pointing to discussion content (e.g. memory://specs/search)
         depth: How many relation hops to traverse (1-3 recommended for performance)
         timeframe: How far back to look. Supports natural language like "2 days ago", "last week"
         page: Page number of results to return (default: 1)
         page_size: Number of results to return per page (default: 10)
         max_related: Maximum number of related results to return (default: 10)
+        output_format: Response format - "json" for structured JSON dict,
+            "text" for compact markdown text
         enable_dataview: Execute Dataview queries in context notes (default: True)
         context: Optional FastMCP context for performance caching.
 
     Returns:
-        GraphContext containing:
-            - primary_results: Content matching the memory:// URI
-            - related_results: Connected content via relations
-            - metadata: Context building details
+        dict (output_format="json"): Structured JSON with internal fields excluded
+        str (output_format="text"): Compact markdown representation
 
     Examples:
         # Continue a specific discussion
@@ -83,17 +206,22 @@ async def build_context(
         # Get deeper context about a component
         build_context("work-docs", "memory://components/memory-service", depth=2)
 
-        # Look at recent changes to a specification
-        build_context("research", "memory://specs/document-format", timeframe="today")
-
-        # Research the history of a feature
-        build_context("dev-notes", "memory://features/knowledge-graph", timeframe="3 months ago")
+        # Get text output for compact context
+        build_context("research", "memory://specs/search", output_format="text")
 
     Raises:
         ToolError: If project doesn't exist or depth parameter is invalid
     """
-    track_mcp_tool("build_context")
-    logger.info(f"Building context from {url} in project {project}")
+    # Detect project from memory URL prefix before routing.
+    # project_id routes by external UUID, so it bypasses URL discovery entirely.
+    if project is None and project_id is None:
+        detected = await detect_project_from_memory_url_prefix(
+            url,
+            ConfigManager().config,
+            context=context,
+        )
+        if detected:
+            project = detected
 
     # Convert string depth to integer if needed
     if isinstance(depth, str):
@@ -106,71 +234,129 @@ async def build_context(
 
     # URL is already validated and normalized by MemoryUrl type annotation
 
-    async with get_client() as client:
-        # Get the active project using the new stateless approach
-        active_project = await get_active_project(client, project, context)
-
-        # Import here to avoid circular import
-        from basic_memory.mcp.clients import MemoryClient
-        from basic_memory.mcp.clients.knowledge import KnowledgeClient
-
-        # Use typed MemoryClient for API calls
-        memory_client = MemoryClient(client, active_project.external_id)
-        graph_context = await memory_client.build_context(
-            memory_url_path(url),
-            depth=depth or 1,
-            timeframe=timeframe,
-            page=page,
-            page_size=page_size,
-            max_related=max_related,
-        )
-        
-        # Enrich with Dataview if enabled
-        if enable_dataview:
-            # Check if any primary results have dataview_queries in metadata
-            has_queries = any(
-                context_result.primary_result.type == "entity" 
-                and context_result.primary_result.metadata 
-                and "dataview_queries" in context_result.primary_result.metadata
-                for context_result in graph_context.results
+    with logfire.span(
+        "mcp.tool.build_context",
+        entrypoint="mcp",
+        tool_name="build_context",
+        requested_project=project,
+        requested_project_id=project_id,
+        depth=depth or 1,
+        timeframe=timeframe,
+        page=page,
+        page_size=page_size,
+        max_related=max_related,
+        output_format=output_format,
+        is_memory_url=str(url).startswith("memory://"),
+    ):
+        async with get_project_client(project, context=context, project_id=project_id) as (
+            client,
+            active_project,
+        ):
+            logger.info(
+                f"MCP tool call tool=build_context project={active_project.name} "
+                f"url={url} depth={depth} timeframe={timeframe} output_format={output_format}"
             )
-            
-            if has_queries:
-                logger.info("Enriching graph context with Dataview queries from metadata")
-                
-                # Fetch all notes for Dataview query execution (only once)
-                knowledge_client = KnowledgeClient(client, active_project.external_id)
-                notes = await knowledge_client.list_entities_for_dataview()
-                
-                # Create integration with notes_provider
-                integration = create_dataview_integration(notes_provider=lambda: notes)
-                
-                for context_result in graph_context.results:
-                    # Process primary result if it has dataview_queries in metadata
-                    primary = context_result.primary_result
-                    if (primary.type == "entity" 
-                        and primary.metadata 
-                        and "dataview_queries" in primary.metadata
-                        and primary.content):
-                        
-                        queries = primary.metadata["dataview_queries"]
-                        if queries:
-                            try:
-                                # Execute each query stored in metadata
-                                dataview_section = "\n\n---\n## Dataview Query Results\n\n"
-                                for idx, query_text in enumerate(queries, 1):
-                                    result = integration.execute_raw_query(
-                                        query_text=query_text,
-                                        query_id=f"dv-{idx}"
+
+            # Resolve memory:// identifier with project-prefix awareness
+            _, resolved_path, _ = await resolve_project_and_path(
+                client,
+                url,
+                active_project.name,
+                context,
+            )
+
+            # Import here to avoid circular import
+            from basic_memory.mcp.clients import MemoryClient
+            from basic_memory.mcp.clients.knowledge import KnowledgeClient
+
+            # Use typed MemoryClient for API calls
+            memory_client = MemoryClient(client, active_project.external_id)
+            graph = await memory_client.build_context(
+                resolved_path,
+                depth=depth or 1,
+                timeframe=timeframe,
+                page=page,
+                page_size=page_size,
+                max_related=max_related,
+            )
+
+            # Enrich with Dataview if enabled. Looks at dataview_queries
+            # stored in primary result metadata, fetches notes once, and
+            # appends rendered query results to primary.content.
+            if enable_dataview:
+                has_queries = any(
+                    context_result.primary_result.type == "entity"
+                    and context_result.primary_result.metadata
+                    and "dataview_queries" in context_result.primary_result.metadata
+                    for context_result in graph.results
+                )
+
+                if has_queries:
+                    logger.info(
+                        "Enriching graph context with Dataview queries from metadata"
+                    )
+                    knowledge_client = KnowledgeClient(
+                        client, active_project.external_id
+                    )
+                    notes = await knowledge_client.list_entities_for_dataview()
+                    integration = create_dataview_integration(
+                        notes_provider=lambda: notes
+                    )
+
+                    for context_result in graph.results:
+                        primary = context_result.primary_result
+                        if (
+                            primary.type == "entity"
+                            and primary.metadata
+                            and "dataview_queries" in primary.metadata
+                            and primary.content
+                        ):
+                            queries = primary.metadata["dataview_queries"]
+                            if queries:
+                                try:
+                                    dataview_section = (
+                                        "\n\n---\n## Dataview Query Results\n\n"
                                     )
-                                    if result['status'] == 'success' and result.get('result_markdown'):
-                                        dataview_section += result['result_markdown'] + "\n\n"
-                                
-                                if len(dataview_section) > len("\n\n---\n## Dataview Query Results\n\n"):
-                                    primary.content += dataview_section
-                            except Exception as e:
-                                logger.warning(f"Failed to execute Dataview queries from metadata: {e}")
-            else:
-                logger.debug("No dataview_queries found in metadata, skipping Dataview enrichment")
-        
-        return graph_context
+                                    for idx, query_text in enumerate(queries, 1):
+                                        result = integration.execute_raw_query(
+                                            query_text=query_text,
+                                            query_id=f"dv-{idx}",
+                                        )
+                                        if (
+                                            result["status"] == "success"
+                                            and result.get("result_markdown")
+                                        ):
+                                            dataview_section += (
+                                                result["result_markdown"] + "\n\n"
+                                            )
+
+                                    if len(dataview_section) > len(
+                                        "\n\n---\n## Dataview Query Results\n\n"
+                                    ):
+                                        primary.content = (
+                                            cast(str, primary.content)
+                                            + dataview_section
+                                        )
+                                except Exception as e:  # pragma: no cover
+                                    logger.warning(
+                                        "Failed to execute Dataview queries "
+                                        f"from metadata: {e}"
+                                    )
+                else:
+                    logger.debug(
+                        "No dataview_queries found in metadata, skipping "
+                        "Dataview enrichment"
+                    )
+
+            logger.info(
+                f"MCP tool response: tool=build_context project={active_project.name} "
+                f"uri={graph.metadata.uri or resolved_path} "
+                f"primary_count={graph.metadata.primary_count or 0} "
+                f"related_count={graph.metadata.related_count or 0} "
+                f"output_format={output_format}"
+            )
+
+            if output_format == "text":
+                return _format_context_markdown(graph, active_project.name)
+
+            return graph.model_dump()

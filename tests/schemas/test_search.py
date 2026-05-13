@@ -5,6 +5,7 @@ from datetime import datetime
 from basic_memory.schemas.search import (
     SearchItemType,
     SearchQuery,
+    SearchRetrievalMode,
     SearchResult,
     SearchResponse,
 )
@@ -33,12 +34,24 @@ def test_search_filters():
     query = SearchQuery(
         text="search",
         entity_types=[SearchItemType.ENTITY],
-        types=["component"],
+        note_types=["component"],
         after_date=datetime(2024, 1, 1),
     )
     assert query.entity_types == [SearchItemType.ENTITY]
-    assert query.types == ["component"]
+    assert query.note_types == ["component"]
     assert query.after_date == "2024-01-01T00:00:00"
+
+
+def test_search_retrieval_mode_defaults_to_fts():
+    """Search retrieval mode defaults to FTS and accepts vector modes."""
+    query = SearchQuery(text="search implementation")
+    assert query.retrieval_mode == SearchRetrievalMode.FTS
+
+    vector_query = SearchQuery(
+        text="search implementation",
+        retrieval_mode=SearchRetrievalMode.VECTOR,
+    )
+    assert vector_query.retrieval_mode == SearchRetrievalMode.VECTOR
 
 
 def test_search_result():
@@ -48,13 +61,13 @@ def test_search_result():
         type=SearchItemType.ENTITY,
         entity="some_entity",
         score=0.8,
-        metadata={"entity_type": "component"},
+        metadata={"note_type": "component"},
         permalink="specs/search",
         file_path="specs/search.md",
     )
     assert result.type == SearchItemType.ENTITY
     assert result.score == 0.8
-    assert result.metadata == {"entity_type": "component"}
+    assert result.metadata == {"note_type": "component"}
 
 
 def test_observation_result():
@@ -114,6 +127,7 @@ def test_search_response():
             metadata={},
         ),
     ]
-    response = SearchResponse(results=results, current_page=1, page_size=1)
+    response = SearchResponse(results=results, current_page=1, page_size=1, total=2)
     assert len(response.results) == 2
     assert response.results[0].score > response.results[1].score
+    assert response.total == 2

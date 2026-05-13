@@ -7,6 +7,7 @@ from typing import Any
 
 from httpx import AsyncClient
 
+import logfire
 from basic_memory.mcp.tools.utils import call_post
 from basic_memory.schemas.search import SearchResponse
 
@@ -56,10 +57,20 @@ class SearchClient:
         Raises:
             ToolError: If the request fails
         """
-        response = await call_post(
-            self.http_client,
-            f"{self._base_path}/",
-            json=query,
-            params={"page": page, "page_size": page_size},
-        )
+        with logfire.span(
+            "mcp.client.search.search",
+            client_name="search",
+            operation="search",
+            page=page,
+            page_size=page_size,
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/",
+                json=query,
+                params={"page": page, "page_size": page_size},
+                client_name="search",
+                operation="search",
+                path_template="/v2/projects/{project_id}/search/",
+            )
         return SearchResponse.model_validate(response.json())

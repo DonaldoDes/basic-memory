@@ -1,5 +1,6 @@
 """Tests for V2 knowledge graph API routes (ID-based endpoints)."""
 
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -8,6 +9,7 @@ from httpx import AsyncClient
 from basic_memory.models import Project
 from basic_memory.models.knowledge import Entity
 from basic_memory.schemas import DeleteEntitiesResponse
+from basic_memory.schemas.response import DirectoryMoveResult, DirectoryDeleteResult
 from basic_memory.schemas.v2 import EntityResponseV2, EntityResolveResponse
 
 
@@ -22,7 +24,7 @@ async def test_resolve_identifier_by_permalink(
     # Create an entity first
     entity_data = {
         "title": "TestResolve",
-        "folder": "test",
+        "directory": "test",
         "content": "Test content for resolve",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
@@ -55,12 +57,68 @@ async def test_resolve_identifier_not_found(client: AsyncClient, v2_project_url)
 
 
 @pytest.mark.asyncio
+async def test_resolve_identifier_no_fuzzy_match(client: AsyncClient, v2_project_url):
+    """Test that resolve uses strict mode - no fuzzy search fallback.
+
+    This ensures wiki links only resolve to exact matches (permalink, title, or path),
+    not to similar-sounding entities via fuzzy search.
+    """
+    # Create an entity with a specific name
+    entity_data = {
+        "title": "link-test",
+        "folder": "testing",
+        "content": "A test note",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
+    assert response.status_code == 200
+
+    # Try to resolve "nonexistent" - should NOT fuzzy match to "link-test"
+    resolve_data = {"identifier": "nonexistent"}
+    response = await client.post(f"{v2_project_url}/knowledge/resolve", json=resolve_data)
+
+    # Must return 404, not a fuzzy match to "link-test"
+    assert response.status_code == 404
+    assert "Entity not found" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_identifier_with_source_path_no_fuzzy_match(
+    client: AsyncClient, v2_project_url
+):
+    """Test that context-aware resolution also uses strict mode.
+
+    Even with source_path for context-aware resolution, nonexistent
+    links should return 404, not fuzzy match to nearby entities.
+    """
+    # Create entities in a folder structure
+    entity_data = {
+        "title": "link-test",
+        "folder": "testing/nested",
+        "content": "A nested test note",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
+    assert response.status_code == 200
+
+    # Try to resolve "nonexistent" with source_path context
+    # Should NOT fuzzy match to "link-test" in the same or nearby folder
+    resolve_data = {
+        "identifier": "nonexistent",
+        "source_path": "testing/nested/other-note.md",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/resolve", json=resolve_data)
+
+    # Must return 404, not a fuzzy match
+    assert response.status_code == 404
+    assert "Entity not found" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_get_entity_by_id(client: AsyncClient, test_graph, v2_project_url, entity_repository):
     """Test getting an entity by its external_id (UUID)."""
     # Create an entity first
     entity_data = {
         "title": "TestGetById",
-        "folder": "test",
+        "directory": "test",
         "content": "Test content for get by ID",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
@@ -82,6 +140,58 @@ async def test_get_entity_by_id(client: AsyncClient, test_graph, v2_project_url,
 
 
 @pytest.mark.asyncio
+async def test_get_entity_by_id_allows_long_relation_type(
+    client: AsyncClient,
+    v2_project_url,
+    relation_repository,
+):
+    """GET entity should not fail when stored relation_type exceeds 200 characters."""
+    source_response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "Long Relation Source",
+            "directory": "test",
+            "content": "Source entity content",
+        },
+    )
+    assert source_response.status_code == 200
+    source_entity = EntityResponseV2.model_validate(source_response.json())
+
+    target_response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "Long Relation Target",
+            "directory": "test",
+            "content": "Target entity content",
+        },
+    )
+    assert target_response.status_code == 200
+    target_entity = EntityResponseV2.model_validate(target_response.json())
+
+    long_relation_type = (
+        "**Architecture/efficiency concern:** "
+        "the orchestration prompt expanded a short edge label into a full descriptive note "
+        "that is much longer than 200 characters but should still serialize cleanly."
+    )
+
+    await relation_repository.create(
+        {
+            "from_id": source_entity.id,
+            "to_id": target_entity.id,
+            "to_name": target_entity.title,
+            "relation_type": long_relation_type,
+        }
+    )
+
+    response = await client.get(f"{v2_project_url}/knowledge/entities/{source_entity.external_id}")
+
+    assert response.status_code == 200
+    entity = EntityResponseV2.model_validate(response.json())
+    assert len(entity.relations) == 1
+    assert entity.relations[0].relation_type == long_relation_type
+
+
+@pytest.mark.asyncio
 async def test_get_entity_by_id_not_found(client: AsyncClient, v2_project_url):
     """Test getting a non-existent entity by external_id returns 404."""
     # Use a UUID format that doesn't exist
@@ -97,13 +207,15 @@ async def test_create_entity(client: AsyncClient, file_service, v2_project_url):
     """Test creating an entity via v2 endpoint."""
     data = {
         "title": "TestV2Entity",
-        "folder": "test",
-        "entity_type": "test",
+        "directory": "test",
+        "note_type": "test",
         "content_type": "text/markdown",
         "content": "TestContent for V2",
     }
 
-    response = await client.post(f"{v2_project_url}/knowledge/entities", json=data)
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities", json=data, params={"fast": False}
+    )
 
     assert response.status_code == 200
     entity = EntityResponseV2.model_validate(response.json())
@@ -113,14 +225,70 @@ async def test_create_entity(client: AsyncClient, file_service, v2_project_url):
     assert isinstance(entity.id, int)
     assert entity.api_version == "v2"
 
-    assert entity.permalink == "test/test-v2-entity"
+    assert entity.permalink == "test-project/test/test-v2-entity"
     assert entity.file_path == "test/TestV2Entity.md"
-    assert entity.entity_type == data["entity_type"]
+    assert entity.note_type == data["note_type"]
 
     # Verify file was created
     file_path = file_service.get_entity_path(entity)
     file_content, _ = await file_service.read_file(file_path)
     assert data["content"] in file_content
+
+
+@pytest.mark.asyncio
+async def test_create_entity_conflict_returns_409(client: AsyncClient, v2_project_url):
+    """Test creating a duplicate entity returns 409 Conflict."""
+    data = {
+        "title": "TestV2EntityConflict",
+        "directory": "conflict",
+        "note_type": "note",
+        "content_type": "text/markdown",
+        "content": "Original content for conflict",
+    }
+
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json=data,
+        params={"fast": False},
+    )
+    assert response.status_code == 200
+
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json=data,
+        params={"fast": False},
+    )
+    assert response.status_code == 409
+    expected_detail = "Note already exists. Use edit_note to modify it, or delete it first."
+    assert response.json()["detail"] == expected_detail
+
+
+@pytest.mark.asyncio
+async def test_create_entity_returns_content(client: AsyncClient, file_service, v2_project_url):
+    """Test creating an entity always returns file content with frontmatter."""
+    data = {
+        "title": "TestContentReturn",
+        "directory": "test",
+        "note_type": "note",
+        "content_type": "text/markdown",
+        "content": "Body content for return test",
+    }
+
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json=data,
+        params={"fast": False},
+    )
+    assert response.status_code == 200
+    entity = EntityResponseV2.model_validate(response.json())
+
+    # Content should always be populated with frontmatter
+    assert entity.content is not None
+    assert "---" in entity.content  # frontmatter markers
+    assert "title: TestContentReturn" in entity.content
+    assert "type: note" in entity.content
+    assert "permalink:" in entity.content
+    assert data["content"] in entity.content
 
 
 @pytest.mark.asyncio
@@ -130,7 +298,7 @@ async def test_create_entity_with_observations_and_relations(
     """Test creating an entity with observations and relations via v2."""
     data = {
         "title": "TestV2Complex",
-        "folder": "test",
+        "directory": "test",
         "content": """
 # TestV2Complex
 
@@ -140,7 +308,9 @@ async def test_create_entity_with_observations_and_relations(
 """,
     }
 
-    response = await client.post(f"{v2_project_url}/knowledge/entities", json=data)
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities", json=data, params={"fast": False}
+    )
 
     assert response.status_code == 200
     entity = EntityResponseV2.model_validate(response.json())
@@ -167,7 +337,7 @@ async def test_update_entity_by_id(
     # Create an entity first
     create_data = {
         "title": "TestUpdate",
-        "folder": "test",
+        "directory": "test",
         "content": "Original content",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=create_data)
@@ -181,12 +351,13 @@ async def test_update_entity_by_id(
     # Update it by external_id
     update_data = {
         "title": "TestUpdate",
-        "folder": "test",
+        "directory": "test",
         "content": "Updated content via V2",
     }
     response = await client.put(
         f"{v2_project_url}/knowledge/entities/{original_external_id}",
         json=update_data,
+        params={"fast": False},
     )
 
     assert response.status_code == 200
@@ -195,12 +366,145 @@ async def test_update_entity_by_id(
     # V2 update must return external_id field
     assert updated_entity.external_id is not None
     assert updated_entity.api_version == "v2"
+    assert updated_entity.content is not None
+    assert "Updated content via V2" in updated_entity.content
 
     # Verify file was updated
     file_path = file_service.get_entity_path(updated_entity)
     file_content, _ = await file_service.read_file(file_path)
     assert "Updated content via V2" in file_content
     assert "Original content" not in file_content
+
+
+@pytest.mark.asyncio
+async def test_update_entity_by_id_does_not_duplicate(
+    client: AsyncClient, v2_project_url, entity_repository
+):
+    """PUT updates the existing external_id without creating duplicates."""
+    create_data = {
+        "title": "07 - Get Started",
+        "directory": "docs",
+        "content": "Original content",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/entities", json=create_data)
+    assert response.status_code == 200
+    created_entity = EntityResponseV2.model_validate(response.json())
+
+    update_data = {
+        "title": "07 Get Started",
+        "directory": "docs",
+        "content": "Updated content",
+    }
+    response = await client.put(
+        f"{v2_project_url}/knowledge/entities/{created_entity.external_id}",
+        json=update_data,
+    )
+    assert response.status_code == 200
+
+    entities = await entity_repository.find_all()
+    assert len(entities) == 1
+    assert entities[0].external_id == created_entity.external_id
+
+
+@pytest.mark.asyncio
+async def test_put_entity_with_fast_param_returns_fully_indexed_row(
+    client: AsyncClient, v2_project_url, entity_repository
+):
+    """PUT ignores the legacy fast param and still returns a fully indexed row."""
+    external_id = str(uuid.uuid4())
+    update_data = {
+        "title": "FastPutEntity",
+        "directory": "test",
+        "content": """
+# FastPutEntity
+
+## Observations
+- [note] This should be deferred
+
+- related_to [[AnotherEntity]]
+""",
+    }
+    response = await client.put(
+        f"{v2_project_url}/knowledge/entities/{external_id}",
+        json=update_data,
+        params={"fast": True},
+    )
+
+    assert response.status_code == 201
+    created_entity = EntityResponseV2.model_validate(response.json())
+    assert created_entity.external_id == external_id
+    assert len(created_entity.observations) == 1
+    assert len(created_entity.relations) == 1
+
+    db_entity = await entity_repository.get_by_external_id(external_id)
+    assert db_entity is not None
+
+
+@pytest.mark.asyncio
+async def test_create_with_fast_param_does_not_schedule_reindex_task(
+    client: AsyncClient, v2_project_url, task_scheduler_spy, app_config
+):
+    """Legacy fast=true should not resurrect the removed reindex note-write path."""
+    app_config.semantic_search_enabled = False
+    start_count = len(task_scheduler_spy)
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "TaskScheduledEntity",
+            "directory": "test",
+            "content": "Content for task scheduling",
+        },
+        params={"fast": True},
+    )
+    assert response.status_code == 200
+    assert len(task_scheduler_spy) == start_count
+
+
+@pytest.mark.asyncio
+async def test_create_schedules_vector_sync_when_semantic_enabled(
+    client: AsyncClient, v2_project_url, task_scheduler_spy, app_config
+):
+    """Create should schedule vector sync when semantic mode is enabled."""
+    app_config.semantic_search_enabled = True
+    start_count = len(task_scheduler_spy)
+
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "NonFastSemanticEntity",
+            "directory": "test",
+            "content": "Content for non-fast semantic scheduling",
+        },
+        params={"fast": False},
+    )
+    assert response.status_code == 200
+    created_entity = EntityResponseV2.model_validate(response.json())
+
+    assert len(task_scheduler_spy) == start_count + 1
+    scheduled = task_scheduler_spy[-1]
+    assert scheduled["task_name"] == "sync_entity_vectors"
+    assert scheduled["payload"]["entity_id"] == created_entity.id
+
+
+@pytest.mark.asyncio
+async def test_create_skips_vector_sync_when_semantic_disabled(
+    client: AsyncClient, v2_project_url, task_scheduler_spy, app_config
+):
+    """Create should not schedule vector sync when semantic mode is disabled."""
+    app_config.semantic_search_enabled = False
+    start_count = len(task_scheduler_spy)
+
+    response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "NonFastNoSemanticEntity",
+            "directory": "test",
+            "content": "Content for non-fast without semantic scheduling",
+        },
+        params={"fast": False},
+    )
+    assert response.status_code == 200
+    assert len(task_scheduler_spy) == start_count
 
 
 @pytest.mark.asyncio
@@ -211,7 +515,7 @@ async def test_edit_entity_by_id_append(
     # Create an entity first
     create_data = {
         "title": "TestEdit",
-        "folder": "test",
+        "directory": "test",
         "content": "# TestEdit\n\nOriginal content",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=create_data)
@@ -230,6 +534,7 @@ async def test_edit_entity_by_id_append(
     response = await client.patch(
         f"{v2_project_url}/knowledge/entities/{original_external_id}",
         json=edit_data,
+        params={"fast": False},
     )
 
     assert response.status_code == 200
@@ -238,6 +543,8 @@ async def test_edit_entity_by_id_append(
     # V2 patch must return external_id field
     assert edited_entity.external_id is not None
     assert edited_entity.api_version == "v2"
+    assert edited_entity.content is not None
+    assert "Appended content" in edited_entity.content
 
     # Verify file has both original and appended content
     file_path = file_service.get_entity_path(edited_entity)
@@ -254,7 +561,7 @@ async def test_edit_entity_by_id_find_replace(
     # Create an entity first
     create_data = {
         "title": "TestFindReplace",
-        "folder": "test",
+        "directory": "test",
         "content": "# TestFindReplace\n\nOld text that will be replaced",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=create_data)
@@ -298,7 +605,7 @@ async def test_delete_entity_by_id(
     # Create an entity first
     create_data = {
         "title": "TestDelete",
-        "folder": "test",
+        "directory": "test",
         "content": "Content to be deleted",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=create_data)
@@ -340,7 +647,7 @@ async def test_move_entity(client: AsyncClient, file_service, v2_project_url, en
     # Create an entity first
     create_data = {
         "title": "TestMove",
-        "folder": "test",
+        "directory": "test",
         "content": "Content to be moved",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=create_data)
@@ -377,7 +684,9 @@ async def test_v2_endpoints_use_project_id_not_name(client: AsyncClient, test_pr
     """Verify v2 endpoints require project external_id UUID, not name."""
     # Try using project name instead of external_id - should fail
     fake_entity_uuid = "00000000-0000-0000-0000-000000000000"
-    response = await client.get(f"/v2/projects/{test_project.name}/knowledge/entities/{fake_entity_uuid}")
+    response = await client.get(
+        f"/v2/projects/{test_project.name}/knowledge/entities/{fake_entity_uuid}"
+    )
 
     # Should get 404 because name is not a valid project external_id
     assert response.status_code == 404
@@ -464,7 +773,7 @@ async def test_entity_response_v2_has_api_version(
     # Create an entity
     entity_data = {
         "title": "TestApiVersion",
-        "folder": "test",
+        "directory": "test",
         "content": "Test content",
     }
     response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
@@ -483,3 +792,193 @@ async def test_entity_response_v2_has_api_version(
     entity_v2 = EntityResponseV2.model_validate(response.json())
     assert entity_v2.api_version == "v2"
     assert entity_v2.external_id == entity_external_id
+
+
+# --- Move directory tests (V2) ---
+
+
+@pytest.mark.asyncio
+async def test_move_directory_v2_success(client: AsyncClient, v2_project_url):
+    """Test POST /v2/.../move-directory endpoint successfully moves all files."""
+    # Create multiple notes in a source directory
+    for i in range(3):
+        response = await client.post(
+            f"{v2_project_url}/knowledge/entities",
+            json={
+                "title": f"V2DirMoveDoc{i + 1}",
+                "directory": "v2-move-source",
+                "content": f"Content for document {i + 1}",
+            },
+        )
+        assert response.status_code == 200
+
+    # Move the entire directory
+    move_data = {
+        "source_directory": "v2-move-source",
+        "destination_directory": "v2-move-dest",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/move-directory", json=move_data)
+    assert response.status_code == 200
+
+    result = DirectoryMoveResult.model_validate(response.json())
+    assert result.total_files == 3
+    assert result.successful_moves == 3
+    assert result.failed_moves == 0
+    assert len(result.moved_files) == 3
+
+
+@pytest.mark.asyncio
+async def test_move_directory_v2_empty_directory(client: AsyncClient, v2_project_url):
+    """Test move_directory V2 with no files in source returns zero counts."""
+    move_data = {
+        "source_directory": "v2-nonexistent-source",
+        "destination_directory": "v2-some-dest",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/move-directory", json=move_data)
+    assert response.status_code == 200
+
+    result = DirectoryMoveResult.model_validate(response.json())
+    assert result.total_files == 0
+    assert result.successful_moves == 0
+    assert result.failed_moves == 0
+
+
+@pytest.mark.asyncio
+async def test_move_directory_v2_validation_error(client: AsyncClient, v2_project_url):
+    """Test move_directory V2 with missing required fields returns validation error."""
+    # Missing destination_directory
+    response = await client.post(
+        f"{v2_project_url}/knowledge/move-directory",
+        json={"source_directory": "some-source"},
+    )
+    assert response.status_code == 422
+
+    # Missing source_directory
+    response = await client.post(
+        f"{v2_project_url}/knowledge/move-directory",
+        json={"destination_directory": "some-dest"},
+    )
+    assert response.status_code == 422
+
+
+# --- Delete directory tests (V2) ---
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_v2_success(client: AsyncClient, v2_project_url):
+    """Test POST /v2/.../delete-directory endpoint successfully deletes all files."""
+    # Create multiple notes in a directory to delete
+    for i in range(3):
+        response = await client.post(
+            f"{v2_project_url}/knowledge/entities",
+            json={
+                "title": f"V2DeleteDoc{i + 1}",
+                "directory": "v2-delete-dir",
+                "content": f"Content for document {i + 1}",
+            },
+        )
+        assert response.status_code == 200
+
+    # Verify notes exist
+    created_entity = EntityResponseV2.model_validate(response.json())
+    get_response = await client.get(
+        f"{v2_project_url}/knowledge/entities/{created_entity.external_id}"
+    )
+    assert get_response.status_code == 200
+
+    # Delete the entire directory
+    delete_data = {
+        "directory": "v2-delete-dir",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/delete-directory", json=delete_data)
+    assert response.status_code == 200
+
+    result = DirectoryDeleteResult.model_validate(response.json())
+    assert result.total_files == 3
+    assert result.successful_deletes == 3
+    assert result.failed_deletes == 0
+    assert len(result.deleted_files) == 3
+
+    # Verify entity is no longer accessible
+    get_response = await client.get(
+        f"{v2_project_url}/knowledge/entities/{created_entity.external_id}"
+    )
+    assert get_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_v2_empty_directory(client: AsyncClient, v2_project_url):
+    """Test delete_directory V2 with no files returns zero counts."""
+    delete_data = {
+        "directory": "v2-nonexistent-delete-dir",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/delete-directory", json=delete_data)
+    assert response.status_code == 200
+
+    result = DirectoryDeleteResult.model_validate(response.json())
+    assert result.total_files == 0
+    assert result.successful_deletes == 0
+    assert result.failed_deletes == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_v2_validation_error(client: AsyncClient, v2_project_url):
+    """Test delete_directory V2 with missing required fields returns validation error."""
+    # Missing directory field
+    response = await client.post(
+        f"{v2_project_url}/knowledge/delete-directory",
+        json={},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_v2_nested_structure(client: AsyncClient, v2_project_url):
+    """Test delete_directory V2 handles nested directory structure."""
+    # Create notes in nested structure
+    directories = [
+        "v2-nested-delete/2024",
+        "v2-nested-delete/2024/q1",
+    ]
+
+    for dir_path in directories:
+        response = await client.post(
+            f"{v2_project_url}/knowledge/entities",
+            json={
+                "title": f"Note in {dir_path.split('/')[-1]}",
+                "directory": dir_path,
+                "content": f"Content in {dir_path}",
+            },
+        )
+        assert response.status_code == 200
+
+    # Delete the parent directory
+    delete_data = {
+        "directory": "v2-nested-delete/2024",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/delete-directory", json=delete_data)
+    assert response.status_code == 200
+
+    result = DirectoryDeleteResult.model_validate(response.json())
+    assert result.total_files == 2
+    assert result.successful_deletes == 2
+    assert result.failed_deletes == 0
+
+
+@pytest.mark.asyncio
+async def test_entity_response_includes_user_tracking_fields(client: AsyncClient, v2_project_url):
+    """EntityResponseV2 includes created_by and last_updated_by fields (null for local)."""
+    entity_data = {
+        "title": "UserTrackingTest",
+        "directory": "test",
+        "content": "Test content",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
+    assert response.status_code == 200
+
+    body = response.json()
+    # Fields should be present in the response (null for local/CLI usage)
+    assert "created_by" in body
+    assert "last_updated_by" in body
+    assert body["created_by"] is None
+    assert body["last_updated_by"] is None

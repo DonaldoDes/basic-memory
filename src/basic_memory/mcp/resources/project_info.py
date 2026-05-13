@@ -38,8 +38,8 @@ async def project_info(
 
     Args:
         project: Optional project name. If not provided, uses default_project
-                (if default_project_mode=true) or CLI constraint. If unknown,
-                use list_memory_projects() to discover available projects.
+                from config or CLI constraint. If unknown, use
+                list_memory_projects() to discover available projects.
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -62,10 +62,9 @@ async def project_info(
 
     async with get_client() as client:
         project_config = await get_active_project(client, project, context)
-        project_url = project_config.permalink
 
         # Call the API endpoint
-        response = await call_get(client, f"{project_url}/project/info")
+        response = await call_get(client, f"/v2/projects/{project_config.external_id}/info")
 
         # Convert response to ProjectInfoResponse
         return ProjectInfoResponse.model_validate(response.json())

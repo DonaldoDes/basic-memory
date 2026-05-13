@@ -4,11 +4,23 @@ This router uses external_id UUIDs for stable, API-friendly routing.
 V1 uses string-based project names which are less efficient and less stable.
 """
 
-from fastapi import APIRouter, BackgroundTasks, Path
+import asyncio
 
-from basic_memory.api.routers.utils import to_search_results
-from basic_memory.schemas.search import SearchQuery, SearchResponse
-from basic_memory.deps import SearchServiceV2ExternalDep, EntityServiceV2ExternalDep
+from fastapi import APIRouter, HTTPException, Path
+
+import logfire
+from basic_memory.api.v2.utils import to_search_results
+from basic_memory.repository.semantic_errors import (
+    SemanticDependenciesMissingError,
+    SemanticSearchDisabledError,
+)
+from basic_memory.schemas.search import SearchQuery, SearchResponse, SearchRetrievalMode
+from basic_memory.deps import (
+    SearchServiceV2ExternalDep,
+    EntityServiceV2ExternalDep,
+    TaskSchedulerDep,
+    ProjectExternalIdPathDep,
+)
 
 # Note: No prefix here - it's added during registration as /v2/{project_id}/search
 router = APIRouter(tags=["search"])
@@ -38,22 +50,93 @@ async def search(
     Returns:
         SearchResponse with paginated search results
     """
-    limit = page_size
-    offset = (page - 1) * page_size
-    results = await search_service.search(query, limit=limit, offset=offset)
-    search_results = await to_search_results(entity_service, results)
-    return SearchResponse(
-        results=search_results,
-        current_page=page,
+    with logfire.span(
+        "api.request.search",
+        entrypoint="api",
+        domain="search",
+        action="search",
+        page=page,
         page_size=page_size,
-    )
+        retrieval_mode=query.retrieval_mode.value,
+        has_query=bool(
+            (query.text and query.text.strip())
+            or query.title
+            or query.permalink
+            or query.permalink_match
+        ),
+        has_filters=bool(query.note_types or query.entity_types or query.metadata_filters),
+    ):
+        offset = (page - 1) * page_size
+        exact_count_available = query.retrieval_mode == SearchRetrievalMode.FTS
+        try:
+            with logfire.span(
+                "api.search.search.execute_query",
+                domain="search",
+                action="search",
+                phase="execute_query",
+                page=page,
+                page_size=page_size,
+            ):
+                if exact_count_available:
+                    results, total = await asyncio.gather(
+                        search_service.search(query, limit=page_size, offset=offset),
+                        search_service.count(query),
+                    )
+                else:
+                    results = await search_service.search(query, limit=page_size + 1, offset=offset)
+                    total = 0
+        except SemanticSearchDisabledError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SemanticDependenciesMissingError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        with logfire.span(
+            "api.search.search.paginate_results",
+            domain="search",
+            action="search",
+            phase="paginate_results",
+            result_count=len(results),
+        ):
+            if exact_count_available:
+                has_more = offset + len(results) < total
+            else:
+                # Trigger: semantic modes would need another vector/hybrid retrieval to count.
+                # Why: search requests should not pay for a second semantic pass.
+                # Outcome: preserve probe pagination for semantic search and leave total at 0.
+                has_more = len(results) > page_size
+                if has_more:
+                    results = results[:page_size]
+
+        with logfire.span(
+            "api.search.search.hydrate_results",
+            domain="search",
+            action="search",
+            phase="hydrate_results",
+            result_count=len(results),
+        ):
+            search_results = await to_search_results(entity_service, results)
+        with logfire.span(
+            "api.search.search.build_response",
+            domain="search",
+            action="search",
+            phase="build_response",
+            result_count=len(search_results),
+        ):
+            return SearchResponse(
+                results=search_results,
+                current_page=page,
+                page_size=page_size,
+                total=total,
+                has_more=has_more,
+            )
 
 
 @router.post("/search/reindex")
 async def reindex(
-    background_tasks: BackgroundTasks,
-    search_service: SearchServiceV2ExternalDep,
-    project_id: str = Path(..., description="Project external UUID"),
+    task_scheduler: TaskSchedulerDep,
+    project_id: ProjectExternalIdPathDep,
 ):
     """Recreate and populate the search index for a project.
 
@@ -63,11 +146,10 @@ async def reindex(
 
     Args:
         project_id: Project external UUID from URL path
-        background_tasks: FastAPI background tasks handler
-        search_service: Search service scoped to project
+        task_scheduler: Task scheduler for background work
 
     Returns:
         Status message indicating reindex has been initiated
     """
-    await search_service.reindex_all(background_tasks=background_tasks)
+    task_scheduler.schedule("reindex_project", project_id=project_id)
     return {"status": "ok", "message": "Reindex initiated"}

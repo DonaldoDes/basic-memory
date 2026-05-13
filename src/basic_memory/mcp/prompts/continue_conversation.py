@@ -4,16 +4,15 @@ These prompts help users continue conversations and work across sessions,
 providing context from previous interactions to maintain continuity.
 """
 
+from textwrap import dedent
 from typing import Annotated, Optional
 
 from loguru import logger
 from pydantic import Field
 
-from basic_memory.config import get_project_config
-from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.tools.utils import call_post
-from basic_memory.schemas.prompt import ContinueConversationRequest
+from basic_memory.mcp.tools.recent_activity import recent_activity
+from basic_memory.mcp.tools.search import search_notes
 
 
 @mcp.prompt(
@@ -41,21 +40,92 @@ async def continue_conversation(
     """
     logger.info(f"Continuing session, topic: {topic}, timeframe: {timeframe}")
 
-    async with get_client() as client:
-        # Create request model
-        request = ContinueConversationRequest(  # pyright: ignore [reportCallIssue]
-            topic=topic, timeframe=timeframe
-        )
+    if topic:
+        # Use json format to get structured data for result counting and branching
+        result = await search_notes(query=topic, after_date=timeframe, output_format="json")
 
-        project_url = get_project_config().project_url
+        if isinstance(result, dict):
+            results = result.get("results", [])
+            context_text = _format_continuation_results(results, topic)
+            result_count = len(results)
+        else:
+            # Error string
+            context_text = str(result)
+            result_count = 0
+    else:
+        # No topic — show recent activity
+        effective_timeframe = timeframe or "7d"
+        activity_text = await recent_activity(timeframe=effective_timeframe)
+        context_text = str(activity_text)
+        result_count = -1  # Signals we used recent_activity
 
-        # Call the prompt API endpoint
-        response = await call_post(
-            client,
-            f"{project_url}/prompt/continue-conversation",
-            json=request.model_dump(exclude_none=True),
-        )
+    target = f"'{topic}'" if topic else "recent activity"
 
-        # Extract the rendered prompt from the response
-        result = response.json()
-        return result["prompt"]
+    prompt = dedent(f"""
+        # Continuing conversation on: {target}
+
+        This is a memory retrieval session.
+
+        Please use the available basic-memory tools to gather relevant context before responding.
+        Start by executing one of the suggested commands below to retrieve content.
+
+        {context_text}
+
+        ---
+
+        ## Next Steps
+    """)
+
+    if topic and result_count > 0:
+        prompt += dedent(f"""
+            Found {result_count} results related to '{topic}'.
+
+            1. **Read full content** - Use `read_note("permalink")` to dive into specific notes
+            2. **Build context** - Use `build_context("memory://path")` to see relationships
+            3. **Search deeper** - Use `search_notes("{topic}")` with different filters
+
+            > **Knowledge Capture:** As you continue this conversation, actively look for
+            > opportunities to record new information, decisions, or insights using `write_note()`.
+        """)
+    elif topic:
+        prompt += dedent(f"""
+            No previous context found for '{topic}'.
+
+            This is an opportunity to start documenting this topic:
+
+            1. **Create a new note** - Use `write_note(title="{topic}", content="...")` to start
+            2. **Search with variations** - Try `search_notes("{topic}")` with different terms
+            3. **Check recent activity** - Use `recent_activity(timeframe="7d")` to see what's new
+        """)
+    else:
+        prompt += dedent("""
+            1. **Explore specific items** - Use `read_note("permalink")` to dive deeper
+            2. **Search for topics** - Use `search_notes("topic")` to find specific content
+            3. **Build context** - Use `build_context("memory://path")` to see relationships
+        """)
+
+    return prompt
+
+
+def _format_continuation_results(results: list[dict], topic: str) -> str:
+    """Format search result dicts for conversation continuation context."""
+    if not results:
+        return f"No previous context found for '{topic}'."
+
+    lines = [f"## Previous Context for '{topic}'\n"]
+
+    for item in results:
+        title = item.get("title", "Untitled")
+        permalink = item.get("permalink", "")
+
+        lines.append(f"### {title}")
+        if permalink:
+            lines.append(f"permalink: {permalink}")
+            lines.append(f'Read with: `read_note("{permalink}")`')
+        content = item.get("content")
+        if content:
+            content = content[:300] + "..." if len(content) > 300 else content
+            lines.append(f"\n{content}")
+        lines.append("")
+
+    return "\n".join(lines)

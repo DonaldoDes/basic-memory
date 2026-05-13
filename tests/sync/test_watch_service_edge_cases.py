@@ -1,7 +1,11 @@
 """Test edge cases in the WatchService."""
 
+import builtins
+
 import pytest
 from watchfiles import Change
+
+from basic_memory.config import ProjectEntry
 
 
 def test_filter_changes_valid_path(watch_service, project_config):
@@ -19,6 +23,66 @@ def test_filter_changes_valid_path(watch_service, project_config):
         )
         is True
     )
+
+
+def test_filter_changes_allows_project_under_hidden_parent(watch_service, tmp_path):
+    """Hidden parent directories outside the project root must not mute the watcher."""
+    project_home = tmp_path / ".claude" / "projects" / "memory"
+    project_home.mkdir(parents=True)
+    watch_service.app_config.projects["hidden-parent"] = ProjectEntry(path=str(project_home))
+    watch_service._sorted_watch_filter_roots = (project_home.resolve(),)
+
+    visible_note = project_home / "notes" / "visible.md"
+    hidden_note = project_home / "notes" / ".drafts" / "hidden.md"
+
+    assert watch_service.filter_changes(Change.added, str(visible_note)) is True
+    assert watch_service.filter_changes(Change.added, str(hidden_note)) is False
+
+
+def test_filter_changes_rejects_nested_project_inside_hidden_directory(watch_service, tmp_path):
+    """A nested project must not make its enclosing project's hidden path visible."""
+    outer_project = tmp_path / "outer"
+    nested_project = outer_project / ".private" / "subproject"
+    nested_project.mkdir(parents=True)
+    watch_service.app_config.projects["outer"] = ProjectEntry(path=str(outer_project))
+    watch_service.app_config.projects["nested"] = ProjectEntry(path=str(nested_project))
+    watch_service._sorted_watch_filter_roots = (
+        outer_project.resolve(),
+        nested_project.resolve(),
+    )
+
+    nested_note = nested_project / "notes" / "visible.md"
+
+    assert watch_service.filter_changes(Change.added, str(nested_note)) is False
+
+
+def test_filter_changes_uses_cached_sorted_roots_without_resorting(
+    monkeypatch,
+    watch_service,
+    tmp_path,
+):
+    """The watch callback hot path should not sort roots after the cycle cached them."""
+    project_home = tmp_path / "project"
+    project_home.mkdir()
+    watch_service._sorted_watch_filter_roots = (project_home.resolve(),)
+
+    def fail_if_sorted(*args, **kwargs):
+        raise AssertionError("cached watch roots should already be sorted")
+
+    monkeypatch.setattr(builtins, "sorted", fail_if_sorted)
+
+    assert watch_service.filter_changes(Change.added, str(project_home / "note.md")) is True
+
+
+def test_filter_changes_path_outside_all_projects(watch_service, tmp_path):
+    """Unmatched paths should still use full-path hidden filtering as a fallback."""
+    watch_service._sorted_watch_filter_roots = ()
+
+    unrelated = tmp_path / "unrelated" / "file.md"
+    hidden_unrelated = tmp_path / ".hidden" / "file.md"
+
+    assert watch_service.filter_changes(Change.added, str(unrelated)) is True
+    assert watch_service.filter_changes(Change.added, str(hidden_unrelated)) is False
 
 
 def test_filter_changes_hidden_path(watch_service, project_config):

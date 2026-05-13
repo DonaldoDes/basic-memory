@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import mimetypes
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
@@ -11,6 +12,7 @@ import aiofiles
 
 import yaml
 
+import logfire
 from basic_memory import file_utils
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -22,6 +24,14 @@ from basic_memory.schemas import Entity as EntitySchema
 from basic_memory.services.exceptions import BinaryFileError, FileOperationError
 from basic_memory.utils import FilePath
 from loguru import logger
+
+
+@dataclass(slots=True)
+class FrontmatterUpdateResult:
+    """Final content emitted by a frontmatter rewrite without a follow-up reread."""
+
+    checksum: str
+    content: str
 
 
 class FileService:
@@ -43,7 +53,7 @@ class FileService:
     def __init__(
         self,
         base_path: Path,
-        markdown_processor: MarkdownProcessor,
+        markdown_processor: Optional[MarkdownProcessor] = None,
         max_concurrent_files: int = 10,
         app_config: Optional["BasicMemoryConfig"] = None,
     ):
@@ -94,9 +104,18 @@ class FileService:
             )
             return ""
 
-        file_path = self.get_entity_path(entity)
-        markdown = await self.markdown_processor.read_file(file_path)
-        return markdown.content or ""
+        with logfire.span(
+            "file_service.read_content",
+            domain="file_service",
+            action="read_content",
+            phase="read_content",
+        ):
+            if self.markdown_processor is None:
+                raise ValueError("markdown_processor is required for read_entity_content")
+
+            file_path = self.get_entity_path(entity)
+            markdown = await self.markdown_processor.read_file(file_path)
+            return markdown.content or ""
 
     async def delete_entity_file(self, entity: EntityModel) -> None:
         """Delete entity file from filesystem.
@@ -187,32 +206,39 @@ class FileService:
         full_path = path_obj if path_obj.is_absolute() else self.base_path / path_obj
 
         try:
-            # Ensure parent directory exists
-            await self.ensure_directory(full_path.parent)
+            with logfire.span(
+                "file_service.write",
+                domain="file_service",
+                action="write",
+                phase="write",
+            ):
+                await self.ensure_directory(full_path.parent)
 
-            # Write content atomically
-            logger.info(
-                "Writing file: "
-                f"path={path_obj}, "
-                f"content_length={len(content)}, "
-                f"is_markdown={full_path.suffix.lower() == '.md'}"
-            )
-
-            await file_utils.write_file_atomic(full_path, content)
-
-            # Format file if configured
-            final_content = content
-            if self.app_config:
-                formatted_content = await file_utils.format_file(
-                    full_path, self.app_config, is_markdown=self.is_markdown(path)
+                logger.info(
+                    "Writing file: "
+                    f"path={path_obj}, "
+                    f"content_length={len(content)}, "
+                    f"is_markdown={full_path.suffix.lower() == '.md'}"
                 )
-                if formatted_content is not None:
-                    final_content = formatted_content  # pragma: no cover
 
-            # Compute and return checksum of final content
-            checksum = await file_utils.compute_checksum(final_content)
-            logger.debug(f"File write completed path={full_path}, {checksum=}")
-            return checksum
+                await file_utils.write_file_atomic(full_path, content)
+
+                if self.app_config:
+                    formatted_content = await file_utils.format_file(
+                        full_path, self.app_config, is_markdown=self.is_markdown(path)
+                    )
+                    if formatted_content is not None:
+                        pass  # pragma: no cover
+
+                # Trigger: formatters and platform-specific text writers can change the
+                # persisted bytes even when the logical content string is the same.
+                # Why: sync and move detection compare against on-disk checksums, not
+                #      the pre-write Python string.
+                # Outcome: return the checksum of the actual stored file so callers do
+                #          not record a hash that immediately disagrees with the file.
+                checksum = await self.compute_checksum(full_path)
+                logger.debug(f"File write completed path={full_path}, {checksum=}")
+                return checksum
 
         except Exception as e:
             logger.exception("File write error", path=str(full_path), error=str(e))
@@ -245,22 +271,33 @@ class FileService:
             raise BinaryFileError(str(full_path))
 
         try:
-            logger.debug("Reading file content", operation="read_file_content", path=str(full_path))
-            async with aiofiles.open(full_path, mode="r", encoding="utf-8") as f:
-                content = await f.read()
+            with logfire.span(
+                "file_service.read_content",
+                domain="file_service",
+                action="read_content",
+                phase="read_content",
+            ):
+                logger.debug(
+                    "Reading file content", operation="read_file_content", path=str(full_path)
+                )
+                async with aiofiles.open(full_path, mode="r", encoding="utf-8") as f:
+                    content = await f.read()
 
-            logger.debug(
-                "File read completed",
-                path=str(full_path),
-                content_length=len(content),
-            )
-            return content
+                logger.debug(
+                    "File read completed",
+                    path=str(full_path),
+                    content_length=len(content),
+                )
+                return content
 
         except FileNotFoundError:
             # Preserve FileNotFoundError so callers (e.g. sync) can treat it as deletion.
             logger.warning("File not found", operation="read_file_content", path=str(full_path))
             raise
         except Exception as e:
+            if isinstance(e, FileNotFoundError):
+                logger.warning("File not found", operation="read_file", path=str(full_path))
+                raise
             logger.exception("File read error", path=str(full_path), error=str(e))
             raise FileOperationError(f"Failed to read file: {e}")
 
@@ -284,20 +321,26 @@ class FileService:
         full_path = path_obj if path_obj.is_absolute() else self.base_path / path_obj
 
         try:
-            logger.debug("Reading file bytes", operation="read_file_bytes", path=str(full_path))
-            async with aiofiles.open(full_path, mode="rb") as f:
-                content = await f.read()
+            with logfire.span(
+                "file_service.read_content",
+                domain="file_service",
+                action="read_content",
+                phase="read_content",
+            ):
+                logger.debug("Reading file bytes", operation="read_file_bytes", path=str(full_path))
+                async with aiofiles.open(full_path, mode="rb") as f:
+                    content = await f.read()
 
-            logger.debug(
-                "File read completed",
-                path=str(full_path),
-                content_length=len(content),
-            )
-            return content
+                logger.debug(
+                    "File read completed",
+                    path=str(full_path),
+                    content_length=len(content),
+                )
+                return content
 
         except Exception as e:
             logger.exception("File read error", path=str(full_path), error=str(e))
-            raise FileOperationError(f"Failed to read file: {e}")
+            raise FileOperationError(f"Failed to read file: {e}") from e
 
     async def read_file(self, path: FilePath) -> Tuple[str, str]:
         """Read file and compute checksum using true async I/O.
@@ -327,22 +370,36 @@ class FileService:
             raise BinaryFileError(str(full_path))
 
         try:
-            logger.debug("Reading file", operation="read_file", path=str(full_path))
+            with logfire.span(
+                "file_service.read",
+                domain="file_service",
+                action="read",
+                phase="read",
+            ):
+                logger.debug("Reading file", operation="read_file", path=str(full_path))
 
-            # Use aiofiles for non-blocking read
-            async with aiofiles.open(full_path, mode="r", encoding="utf-8") as f:
-                content = await f.read()
+                async with aiofiles.open(full_path, mode="r", encoding="utf-8") as f:
+                    content = await f.read()
 
-            checksum = await file_utils.compute_checksum(content)
+                # Trigger: text-mode reads normalize line endings on Windows, so the
+                #          decoded string can differ from the bytes we just wrote.
+                # Why: write_file/update_frontmatter now return the checksum of the
+                #      persisted file, and read_file should report the same authority.
+                # Outcome: callers get human-readable content plus the checksum for the
+                #          exact bytes stored on disk.
+                checksum = await self.compute_checksum(full_path)
 
-            logger.debug(
-                "File read completed",
-                path=str(full_path),
-                checksum=checksum,
-                content_length=len(content),
-            )
-            return content, checksum
+                logger.debug(
+                    "File read completed",
+                    path=str(full_path),
+                    checksum=checksum,
+                    content_length=len(content),
+                )
+                return content, checksum
 
+        except FileNotFoundError as e:
+            logger.warning("File not found", operation="read_file", path=str(full_path))
+            raise FileOperationError(f"Failed to read file: {e}") from e
         except Exception as e:
             logger.exception("File read error", path=str(full_path), error=str(e))
             raise FileOperationError(f"Failed to read file: {e}")
@@ -398,12 +455,14 @@ class FileService:
             )
             raise FileOperationError(f"Failed to move file {source} -> {destination}: {e}")
 
-    async def update_frontmatter(self, path: FilePath, updates: Dict[str, Any]) -> str:
-        """Update frontmatter fields in a file while preserving all content.
+    async def update_frontmatter_with_result(
+        self, path: FilePath, updates: Dict[str, Any]
+    ) -> FrontmatterUpdateResult:
+        """Update frontmatter and return the exact final written markdown content.
 
         Only modifies the frontmatter section, leaving all content untouched.
         Creates frontmatter section if none exists.
-        Returns checksum of updated file.
+        Returns both checksum and final content so callers do not need a reread.
 
         Uses aiofiles for true async I/O (non-blocking).
 
@@ -412,7 +471,7 @@ class FileService:
             updates: Dict of frontmatter fields to update
 
         Returns:
-            Checksum of updated file
+            Typed result containing checksum and final content
 
         Raises:
             FileOperationError: If file operations fail
@@ -464,7 +523,14 @@ class FileService:
                 if formatted_content is not None:
                     content_for_checksum = formatted_content  # pragma: no cover
 
-            return await file_utils.compute_checksum(content_for_checksum)
+            # Trigger: frontmatter normalization may persist bytes that differ from the
+            # in-memory string because of formatter output or platform newline handling.
+            # Why: follow-up scans and checksum-based move detection read raw bytes from disk.
+            # Outcome: the returned checksum always matches the file that was just written.
+            return FrontmatterUpdateResult(
+                checksum=await self.compute_checksum(full_path),
+                content=content_for_checksum,
+            )
 
         except Exception as e:  # pragma: no cover
             # Only log real errors (not YAML parsing, which is handled above)
@@ -475,6 +541,11 @@ class FileService:
                     error=str(e),
                 )
             raise FileOperationError(f"Failed to update frontmatter: {e}")
+
+    async def update_frontmatter(self, path: FilePath, updates: Dict[str, Any]) -> str:
+        """Update frontmatter fields in a file while preserving all content."""
+        result = await self.update_frontmatter_with_result(path, updates)
+        return result.checksum
 
     async def compute_checksum(self, path: FilePath) -> str:
         """Compute checksum for a file using true async I/O.

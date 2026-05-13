@@ -28,6 +28,7 @@ async def test_disable_permalinks_create_entity(tmp_path, engine_factory, app_co
 
     # Override app config to enable disable_permalinks
     app_config.disable_permalinks = True
+    app_config.ensure_frontmatter_on_sync = False
 
     # Setup repositories
     entity_repository = EntityRepository(session_maker, project_id=test_project.id)
@@ -61,8 +62,8 @@ async def test_disable_permalinks_create_entity(tmp_path, engine_factory, app_co
     # Create entity via API
     entity_data = EntitySchema(
         title="Test Note",
-        folder="test",
-        entity_type="note",
+        directory="test",
+        note_type="note",
         content="Test content",
     )
 
@@ -88,6 +89,7 @@ async def test_disable_permalinks_sync_workflow(tmp_path, engine_factory, app_co
 
     # Override app config to enable disable_permalinks
     app_config.disable_permalinks = True
+    app_config.ensure_frontmatter_on_sync = False
 
     # Create a test markdown file without frontmatter
     test_file = tmp_path / "test_note.md"

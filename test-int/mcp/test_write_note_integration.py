@@ -25,7 +25,7 @@ async def test_write_note_basic_creation(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Simple Note",
-                "folder": "basic",
+                "directory": "basic",
                 "content": "# Simple Note\n\nThis is a simple note for testing.",
                 "tags": "simple,test",
             },
@@ -38,7 +38,7 @@ async def test_write_note_basic_creation(mcp_server, app, test_project):
         assert "# Created note" in response_text
         assert f"project: {test_project.name}" in response_text
         assert "file_path: basic/Simple Note.md" in response_text
-        assert "permalink: basic/simple-note" in response_text
+        assert f"permalink: {test_project.name}/basic/simple-note" in response_text
         assert "## Tags" in response_text
         assert "- simple, test" in response_text
         assert f"[Session: Using project '{test_project.name}']" in response_text
@@ -54,7 +54,7 @@ async def test_write_note_no_tags(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "No Tags Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "Just some plain text without tags.",
             },
         )
@@ -65,7 +65,7 @@ async def test_write_note_no_tags(mcp_server, app, test_project):
 
         assert "# Created note" in response_text
         assert "file_path: test/No Tags Note.md" in response_text
-        assert "permalink: test/no-tags-note" in response_text
+        assert f"permalink: {test_project.name}/test/no-tags-note" in response_text
         # Should not have tags section when no tags provided
 
 
@@ -80,7 +80,7 @@ async def test_write_note_update_existing(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Update Test",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Update Test\n\nOriginal content.",
                 "tags": "original",
             },
@@ -88,15 +88,16 @@ async def test_write_note_update_existing(mcp_server, app, test_project):
 
         assert "# Created note" in result1.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
 
-        # Update the same note
+        # Update the same note (explicit overwrite)
         result2 = await client.call_tool(
             "write_note",
             {
                 "project": test_project.name,
                 "title": "Update Test",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Update Test\n\nUpdated content with changes.",
                 "tags": "updated,modified",
+                "overwrite": True,
             },
         )
 
@@ -107,7 +108,7 @@ async def test_write_note_update_existing(mcp_server, app, test_project):
         assert "# Updated note" in response_text
         assert f"project: {test_project.name}" in response_text
         assert "file_path: test/Update Test.md" in response_text
-        assert "permalink: test/update-test" in response_text
+        assert f"permalink: {test_project.name}/test/update-test" in response_text
         assert "- updated, modified" in response_text
         assert f"[Session: Using project '{test_project.name}']" in response_text
 
@@ -123,7 +124,7 @@ async def test_write_note_tag_array(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Array Tags Test",
-                "folder": "test",
+                "directory": "test",
                 "content": "Testing tag array handling",
                 "tags": ["python", "testing", "integration", "mcp"],
             },
@@ -136,7 +137,7 @@ async def test_write_note_tag_array(mcp_server, app, test_project):
         assert "# Created note" in response_text
         assert f"project: {test_project.name}" in response_text
         assert "file_path: test/Array Tags Test.md" in response_text
-        assert "permalink: test/array-tags-test" in response_text
+        assert f"permalink: {test_project.name}/test/array-tags-test" in response_text
         assert "## Tags" in response_text
         assert "python" in response_text
         assert f"[Session: Using project '{test_project.name}']" in response_text
@@ -164,7 +165,7 @@ async def test_write_note_custom_permalink(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Custom Permalink Note",
-                "folder": "notes",
+                "directory": "notes",
                 "content": content_with_custom_permalink,
             },
         )
@@ -192,7 +193,7 @@ async def test_write_note_unicode_content(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Unicode Test 🌟",
-                "folder": "test",
+                "directory": "test",
                 "content": unicode_content,
                 "tags": "unicode,emoji,测试",
             },
@@ -206,7 +207,7 @@ async def test_write_note_unicode_content(mcp_server, app, test_project):
         assert f"project: {test_project.name}" in response_text
         assert "file_path: test/Unicode Test 🌟.md" in response_text
         # Permalink should be sanitized
-        assert "permalink: test/unicode-test" in response_text
+        assert f"permalink: {test_project.name}/test/unicode-test" in response_text
         assert "## Tags" in response_text
         assert f"[Session: Using project '{test_project.name}']" in response_text
 
@@ -243,7 +244,7 @@ async def test_write_note_complex_content_with_observations_relations(
             {
                 "project": test_project.name,
                 "title": "Complex Knowledge Note",
-                "folder": "knowledge",
+                "directory": "knowledge",
                 "content": complex_content,
                 "tags": "complex,knowledge,relations",
             },
@@ -256,7 +257,7 @@ async def test_write_note_complex_content_with_observations_relations(
         assert "# Created note" in response_text
         assert f"project: {test_project.name}" in response_text
         assert "file_path: knowledge/Complex Knowledge Note.md" in response_text
-        assert "permalink: knowledge/complex-knowledge-note" in response_text
+        assert f"permalink: {test_project.name}/knowledge/complex-knowledge-note" in response_text
 
         # Should show observation and relation counts
         assert "## Observations" in response_text
@@ -296,7 +297,7 @@ async def test_write_note_preserve_frontmatter(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Frontmatter Note",
-                "folder": "test",
+                "directory": "test",
                 "content": content_with_frontmatter,
                 "tags": "frontmatter,preservation",
             },
@@ -309,7 +310,7 @@ async def test_write_note_preserve_frontmatter(mcp_server, app, test_project):
         assert "# Created note" in response_text
         assert f"project: {test_project.name}" in response_text
         assert "file_path: test/Frontmatter Note.md" in response_text
-        assert "permalink: test/frontmatter-note" in response_text
+        assert f"permalink: {test_project.name}/test/frontmatter-note" in response_text
         assert f"[Session: Using project '{test_project.name}']" in response_text
 
 
@@ -326,7 +327,7 @@ async def test_write_note_kebab_filenames_basic(mcp_server, app, test_project, a
             {
                 "project": test_project.name,
                 "title": "My Note: With/Invalid|Chars?",
-                "folder": "my-folder",
+                "directory": "my-folder",
                 "content": "Testing kebab-case and invalid characters.",
                 "tags": "kebab,invalid,filename",
             },
@@ -338,7 +339,9 @@ async def test_write_note_kebab_filenames_basic(mcp_server, app, test_project, a
         # File path and permalink should be kebab-case and sanitized
         assert f"project: {test_project.name}" in response_text
         assert "file_path: my-folder/my-note-with-invalid-chars.md" in response_text
-        assert "permalink: my-folder/my-note-with-invalid-chars" in response_text
+        assert (
+            f"permalink: {test_project.name}/my-folder/my-note-with-invalid-chars" in response_text
+        )
         assert f"[Session: Using project '{test_project.name}']" in response_text
 
 
@@ -355,7 +358,7 @@ async def test_write_note_kebab_filenames_repeat_invalid(mcp_server, app, test_p
             {
                 "project": test_project.name,
                 "title": 'Crazy<>:"|?*Note/Name',
-                "folder": "my-folder",
+                "directory": "my-folder",
                 "content": "Should be fully kebab-case and safe.",
                 "tags": "crazy,filename,test",
             },
@@ -366,7 +369,7 @@ async def test_write_note_kebab_filenames_repeat_invalid(mcp_server, app, test_p
 
         assert f"project: {test_project.name}" in response_text
         assert "file_path: my-folder/crazy-note-name.md" in response_text
-        assert "permalink: my-folder/crazy-note-name" in response_text
+        assert f"permalink: {test_project.name}/my-folder/crazy-note-name" in response_text
         assert f"[Session: Using project '{test_project.name}']" in response_text
 
 
@@ -404,7 +407,7 @@ async def test_write_note_file_path_os_path_join(mcp_server, app, test_project, 
                 {
                     "project": test_project.name,
                     "title": title,
-                    "folder": folder,
+                    "directory": folder,
                     "content": "Testing os.path.join logic.",
                     "tags": "integration,ospath",
                 },
@@ -416,7 +419,7 @@ async def test_write_note_file_path_os_path_join(mcp_server, app, test_project, 
 
             assert f"project: {test_project.name}" in response_text
             assert f"file_path: {expected_path}" in response_text
-            assert f"permalink: {expected_permalink}" in response_text
+            assert f"permalink: {test_project.name}/{expected_permalink}" in response_text
             assert f"[Session: Using project '{test_project.name}']" in response_text
 
 
@@ -462,7 +465,7 @@ async def test_write_note_project_path_validation(mcp_server, app, test_project)
             {
                 "project": test_project.name,
                 "title": "Validation Test",
-                "folder": "documents",
+                "directory": "documents",
                 "content": "Testing path validation",
                 "tags": "test",
             },
@@ -473,3 +476,49 @@ async def test_write_note_project_path_validation(mcp_server, app, test_project)
         # Should successfully create without path validation errors
         assert "# Created note" in response_text
         assert "not allowed" not in response_text
+
+
+@pytest.mark.asyncio
+async def test_write_note_overwrite_guard_via_mcp_client(mcp_server, app, test_project):
+    """End-to-end test: overwrite guard works through the MCP Client protocol."""
+
+    async with Client(mcp_server) as client:
+        # Create initial note
+        result1 = await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "MCP Guard Test",
+                "directory": "guard",
+                "content": "# MCP Guard Test\n\nOriginal content via MCP.",
+            },
+        )
+        assert "# Created note" in result1.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+
+        # Second write without overwrite should be blocked
+        result2 = await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "MCP Guard Test",
+                "directory": "guard",
+                "content": "# MCP Guard Test\n\nReplacement content via MCP.",
+            },
+        )
+        response_text = result2.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "# Error: Note already exists" in response_text
+        assert "edit_note" in response_text
+
+        # Overwrite with explicit flag should succeed
+        result3 = await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "MCP Guard Test",
+                "directory": "guard",
+                "content": "# MCP Guard Test\n\nReplacement content via MCP.",
+                "overwrite": True,
+            },
+        )
+        response_text3 = result3.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "# Updated note" in response_text3

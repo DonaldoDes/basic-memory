@@ -1,12 +1,12 @@
 """Import command for basic-memory CLI to import chat data from conversations2.json format."""
 
-import asyncio
 import json
 from pathlib import Path
 from typing import Annotated, Tuple
 
 import typer
 from basic_memory.cli.app import claude_app
+from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.config import ConfigManager, get_project_config
 from basic_memory.importers.claude_conversations_importer import ClaudeConversationsImporter
 from basic_memory.markdown import EntityParser, MarkdownProcessor
@@ -44,7 +44,7 @@ def import_claude(
     2. Create markdown files for each conversation
     3. Format content in clean, readable markdown
 
-    After importing, run 'basic-memory sync' to index the new files.
+    After importing, run 'bm reindex --search' to index the new files.
     """
 
     config = get_project_config()
@@ -54,10 +54,12 @@ def import_claude(
             raise typer.Exit(1)
 
         # Get importer dependencies
-        markdown_processor, file_service = asyncio.run(get_importer_dependencies())
+        markdown_processor, file_service = run_with_cleanup(get_importer_dependencies())
 
         # Create the importer
-        importer = ClaudeConversationsImporter(config.home, markdown_processor, file_service)
+        importer = ClaudeConversationsImporter(
+            config.home, markdown_processor, file_service, project_name=config.name
+        )
 
         # Process the file
         base_path = config.home / folder
@@ -66,7 +68,7 @@ def import_claude(
         # Run the import
         with conversations_json.open("r", encoding="utf-8") as file:
             json_data = json.load(file)
-            result = asyncio.run(importer.import_data(json_data, folder))
+            result = run_with_cleanup(importer.import_data(json_data, folder))
 
         if not result.success:  # pragma: no cover
             typer.echo(f"Error during import: {result.error_message}", err=True)
@@ -82,7 +84,7 @@ def import_claude(
             )
         )
 
-        console.print("\nRun 'basic-memory sync' to index the new files.")
+        console.print("\nRun 'bm reindex --search' to index the new files.")
 
     except Exception as e:
         logger.error("Import failed")

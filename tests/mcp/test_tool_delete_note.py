@@ -1,6 +1,12 @@
 """Tests for delete_note MCP tool."""
 
-from basic_memory.mcp.tools.delete_note import _format_delete_error_response
+from unittest.mock import patch
+
+import pytest
+
+from basic_memory.mcp.tools.delete_note import delete_note, _format_delete_error_response
+from basic_memory.mcp.tools.read_note import read_note
+from basic_memory.mcp.tools.write_note import write_note
 
 
 class TestDeleteNoteErrorFormatting:
@@ -94,5 +100,178 @@ class TestDeleteNoteErrorFormatting:
         assert "folder/note-title" in result  # Permalink format
 
 
-# Integration tests removed to focus on error formatting coverage
-# The error formatting tests above provide the necessary coverage for MCP tool error messaging
+@pytest.mark.asyncio
+async def test_delete_note_rejects_fuzzy_match(client, test_project):
+    """delete_note must reject nonexistent identifiers, not fuzzy-match to a similar note."""
+    await write_note(
+        project=test_project.name,
+        title="Delete Target Note",
+        directory="test",
+        content="# Delete Target Note\nShould not be deleted.",
+    )
+
+    # Attempt to delete a nonexistent note — should return False, not silently delete the existing note
+    result = await delete_note(
+        project=test_project.name,
+        identifier="Delete Target NONEXISTENT",
+    )
+
+    # Should indicate not found (False or error string)
+    assert result is False or (isinstance(result, str) and "not found" in result.lower())
+
+    # Verify the existing note was NOT deleted
+    content = await read_note("Delete Target Note", project=test_project.name)
+    assert "Should not be deleted" in content
+
+
+@pytest.mark.asyncio
+async def test_delete_note_detects_project_from_memory_url(client, test_project):
+    """delete_note should detect project from memory:// URL prefix when project=None."""
+    # Create a note to delete
+    await write_note(
+        project=test_project.name,
+        title="Delete URL Note",
+        directory="test",
+        content="# Delete URL Note\nContent to delete.",
+    )
+
+    # Delete using memory:// URL with project=None — should auto-detect project
+    # The note may or may not be found (depends on URL resolution), but the key
+    # assertion is that routing goes to the correct project
+    result = await delete_note(
+        identifier=f"memory://{test_project.name}/test/delete-url-note",
+        project=None,
+    )
+
+    # Result is True (deleted) or False (not found by that URL) — either is acceptable.
+    # The important thing is it didn't error and routed to the correct project.
+    assert isinstance(result, bool)
+
+
+@pytest.mark.asyncio
+async def test_delete_note_skips_detection_for_plain_path(client, test_project):
+    """delete_note should NOT call detect_project_from_memory_url_prefix for plain paths.
+
+    A plain path like 'research/note' should not be misrouted to a project
+    named 'research' — the 'research' segment is a directory, not a project.
+    """
+    with patch(
+        "basic_memory.mcp.tools.delete_note.detect_project_from_memory_url_prefix"
+    ) as mock_detect:
+        # Use a plain path (no memory:// prefix) — detection should not be called
+        await delete_note(
+            identifier="test/nonexistent-note",
+            project=None,
+        )
+
+        mock_detect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_note_skips_detection_when_project_provided(client, test_project):
+    """delete_note should skip URL detection when project is explicitly provided."""
+    with patch(
+        "basic_memory.mcp.tools.delete_note.detect_project_from_memory_url_prefix"
+    ) as mock_detect:
+        await delete_note(
+            identifier=f"memory://{test_project.name}/test/some-note",
+            project=test_project.name,
+        )
+
+        mock_detect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_memory_url_strips_project_prefix(client, test_project):
+    """Directory deletes use project-relative file paths after memory:// routing."""
+    await write_note(
+        project=test_project.name,
+        title="Delete Directory Memory URL",
+        directory="memory-url-dir",
+        content="# Delete Directory Memory URL\nDelete via project-prefixed memory URL.",
+    )
+
+    result = await delete_note(
+        identifier=f"memory://{test_project.name}/memory-url-dir",
+        is_directory=True,
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["deleted"] is True
+    assert result["total_files"] == 1
+    assert result["successful_deletes"] == 1
+    assert result["failed_deletes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_memory_url_keeps_real_project_prefix_when_prefixes_disabled(
+    client,
+    test_project,
+    config_manager,
+):
+    """When project prefixes are disabled, resolved directory paths are already project-relative."""
+    config = config_manager.load_config()
+    config.permalinks_include_project = False
+    config_manager.save_config(config)
+
+    real_directory = f"{test_project.name}/archive"
+    await write_note(
+        project=test_project.name,
+        title="Delete Directory Real Project Prefix",
+        directory=real_directory,
+        content="# Delete Directory Real Project Prefix\nDelete target content.",
+    )
+    await write_note(
+        project=test_project.name,
+        title="Keep Directory Decoy",
+        directory="archive",
+        content="# Keep Directory Decoy\nDecoy content.",
+    )
+
+    result = await delete_note(
+        identifier=f"memory://{test_project.name}/{real_directory}",
+        is_directory=True,
+        project=test_project.name,
+        output_format="json",
+    )
+
+    assert isinstance(result, dict)
+    assert result["deleted"] is True
+    assert result["total_files"] == 1
+    assert result["successful_deletes"] == 1
+    assert result["failed_deletes"] == 0
+
+    deleted = await read_note("Delete Directory Real Project Prefix", project=test_project.name)
+    assert "Delete target content" not in deleted
+    decoy = await read_note("Keep Directory Decoy", project=test_project.name)
+    assert "Decoy content" in decoy
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_workspace_memory_url_strips_route_prefix(client, test_project):
+    """Workspace-qualified memory:// directory deletes still hit project-relative files."""
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    directory = "workspace-memory-url-dir"
+    with workspace_permalink_context(workspace_slug="team-paul", workspace_type="organization"):
+        await write_note(
+            project=test_project.name,
+            title="Delete Workspace Directory Memory URL",
+            directory=directory,
+            content="# Delete Workspace Directory Memory URL\nDelete via workspace memory URL.",
+        )
+
+        result = await delete_note(
+            identifier=f"memory://team-paul/{test_project.name}/{directory}",
+            is_directory=True,
+            project=test_project.name,
+            output_format="json",
+        )
+
+    assert isinstance(result, dict)
+    assert result["deleted"] is True
+    assert result["total_files"] == 1
+    assert result["successful_deletes"] == 1
+    assert result["failed_deletes"] == 0

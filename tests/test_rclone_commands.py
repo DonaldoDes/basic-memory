@@ -40,6 +40,17 @@ class _Runner:
         return _RunResult(returncode=self._returncode, stdout=self._stdout)
 
 
+def _assert_has_consistency_headers(cmd: list[str]) -> None:
+    """Assert the rclone command includes Tigris consistency headers.
+
+    Uses --header (global flag) so the header applies to ALL HTTP transactions,
+    including S3 list requests that bisync issues before any download/upload.
+    """
+    assert "--header" in cmd
+    header_idx = cmd.index("--header")
+    assert cmd[header_idx + 1] == "X-Tigris-Consistent: true"
+
+
 def _write_filter_file(tmp_path: Path) -> Path:
     p = tmp_path / "filters.txt"
     p.write_text("- .git/**\n", encoding="utf-8")
@@ -47,7 +58,9 @@ def _write_filter_file(tmp_path: Path) -> Path:
 
 
 def test_sync_project_dataclass():
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/Users/test/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/Users/test/research"
+    )
     assert project.name == "research"
     assert project.path == "app/data/research"
     assert project.local_sync_path == "/Users/test/research"
@@ -70,10 +83,19 @@ def test_get_project_remote_strips_app_data_prefix():
     assert get_project_remote(project, "my-bucket") == "basic-memory-cloud:my-bucket/research"
 
 
-def test_get_project_bisync_state():
+def test_get_project_bisync_state(monkeypatch):
+    monkeypatch.delenv("BASIC_MEMORY_CONFIG_DIR", raising=False)
     state_path = get_project_bisync_state("research")
     expected = Path.home() / ".basic-memory" / "bisync-state" / "research"
     assert state_path == expected
+
+
+def test_get_project_bisync_state_honors_basic_memory_config_dir(tmp_path, monkeypatch):
+    """Regression guard for #742: bisync state dir follows BASIC_MEMORY_CONFIG_DIR."""
+    custom_dir = tmp_path / "instance-w" / "state"
+    monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", str(custom_dir))
+
+    assert get_project_bisync_state("research") == custom_dir / "bisync-state" / "research"
 
 
 def test_bisync_initialized_false_when_not_exists(tmp_path, monkeypatch):
@@ -125,6 +147,7 @@ def test_project_sync_success(tmp_path):
     assert cmd[:2] == ["rclone", "sync"]
     assert Path(cmd[2]) == Path("/tmp/research")
     assert cmd[3] == "basic-memory-cloud:my-bucket/research"
+    _assert_has_consistency_headers(cmd)
     assert "--filter-from" in cmd
     assert str(filter_path) in cmd
     assert "--dry-run" in cmd
@@ -134,9 +157,18 @@ def test_project_sync_success(tmp_path):
 def test_project_sync_with_verbose(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
-    project_sync(project, "my-bucket", verbose=True, run=runner, is_installed=lambda: True, filter_path=filter_path)
+    project_sync(
+        project,
+        "my-bucket",
+        verbose=True,
+        run=runner,
+        is_installed=lambda: True,
+        filter_path=filter_path,
+    )
 
     cmd, _ = runner.calls[0]
     assert "--verbose" in cmd
@@ -146,9 +178,13 @@ def test_project_sync_with_verbose(tmp_path):
 def test_project_sync_with_progress(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
-    project_sync(project, "my-bucket", run=runner, is_installed=lambda: True, filter_path=filter_path)
+    project_sync(
+        project, "my-bucket", run=runner, is_installed=lambda: True, filter_path=filter_path
+    )
 
     cmd, _ = runner.calls[0]
     assert "--progress" in cmd
@@ -163,7 +199,9 @@ def test_project_sync_no_local_path():
 
 
 def test_project_sync_checks_rclone_installed():
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
     with pytest.raises(RcloneError) as exc_info:
         project_sync(project, "my-bucket", is_installed=lambda: False)
     assert "rclone is not installed" in str(exc_info.value)
@@ -173,7 +211,9 @@ def test_project_bisync_success(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
     state_path = tmp_path / "state"
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     result = project_bisync(
         project,
@@ -189,6 +229,7 @@ def test_project_bisync_success(tmp_path):
     assert result is True
     cmd, _ = runner.calls[0]
     assert cmd[:2] == ["rclone", "bisync"]
+    _assert_has_consistency_headers(cmd)
     assert "--resilient" in cmd
     assert "--conflict-resolve=newer" in cmd
     assert "--max-delete=25" in cmd
@@ -200,7 +241,9 @@ def test_project_bisync_success(tmp_path):
 def test_project_bisync_requires_resync_first_time(tmp_path):
     filter_path = _write_filter_file(tmp_path)
     state_path = tmp_path / "state"
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     with pytest.raises(RcloneError) as exc_info:
         project_bisync(
@@ -220,7 +263,9 @@ def test_project_bisync_with_resync_flag(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
     state_path = tmp_path / "state"
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     result = project_bisync(
         project,
@@ -243,7 +288,9 @@ def test_project_bisync_dry_run_skips_init_check(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
     state_path = tmp_path / "state"
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     result = project_bisync(
         project,
@@ -270,7 +317,9 @@ def test_project_bisync_no_local_path():
 
 
 def test_project_bisync_checks_rclone_installed(tmp_path):
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
     with pytest.raises(RcloneError) as exc_info:
         project_bisync(
             project,
@@ -287,7 +336,9 @@ def test_project_bisync_includes_empty_dirs_flag_when_supported(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
     state_path = tmp_path / "state"
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     project_bisync(
         project,
@@ -308,7 +359,9 @@ def test_project_bisync_excludes_empty_dirs_flag_when_not_supported(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
     state_path = tmp_path / "state"
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     project_bisync(
         project,
@@ -328,12 +381,17 @@ def test_project_bisync_excludes_empty_dirs_flag_when_not_supported(tmp_path):
 def test_project_check_success(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
-    result = project_check(project, "my-bucket", run=runner, is_installed=lambda: True, filter_path=filter_path)
+    result = project_check(
+        project, "my-bucket", run=runner, is_installed=lambda: True, filter_path=filter_path
+    )
     assert result is True
     cmd, kwargs = runner.calls[0]
     assert cmd[:2] == ["rclone", "check"]
+    _assert_has_consistency_headers(cmd)
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
 
@@ -341,7 +399,9 @@ def test_project_check_success(tmp_path):
 def test_project_check_with_one_way(tmp_path):
     runner = _Runner(returncode=0)
     filter_path = _write_filter_file(tmp_path)
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
 
     project_check(
         project,
@@ -357,7 +417,9 @@ def test_project_check_with_one_way(tmp_path):
 
 
 def test_project_check_checks_rclone_installed():
-    project = SyncProject(name="research", path="app/data/research", local_sync_path="/tmp/research")
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
     with pytest.raises(RcloneError) as exc_info:
         project_check(project, "my-bucket", is_installed=lambda: False)
     assert "rclone is not installed" in str(exc_info.value)
@@ -368,6 +430,8 @@ def test_project_ls_success():
     project = SyncProject(name="research", path="app/data/research")
     files = project_ls(project, "my-bucket", run=runner, is_installed=lambda: True)
     assert files == ["file1.md", "file2.md", "subdir/file3.md"]
+    cmd, _ = runner.calls[0]
+    _assert_has_consistency_headers(cmd)
 
 
 def test_project_ls_with_subpath():
@@ -458,3 +522,43 @@ def test_min_rclone_version_constant():
     assert MIN_RCLONE_VERSION_EMPTY_DIRS == (1, 64, 0)
 
 
+def test_project_sync_includes_no_preallocate_flag(tmp_path):
+    """Sync command includes --local-no-preallocate to prevent NUL byte padding."""
+    runner = _Runner(returncode=0)
+    filter_path = _write_filter_file(tmp_path)
+    project = SyncProject(name="research", path="/research", local_sync_path="/tmp/research")
+
+    project_sync(
+        project,
+        "my-bucket",
+        run=runner,
+        is_installed=lambda: True,
+        filter_path=filter_path,
+    )
+
+    cmd, _ = runner.calls[0]
+    assert "--local-no-preallocate" in cmd
+
+
+def test_project_bisync_includes_no_preallocate_flag(tmp_path):
+    """Bisync command includes --local-no-preallocate to prevent NUL byte padding."""
+    runner = _Runner(returncode=0)
+    filter_path = _write_filter_file(tmp_path)
+    state_path = tmp_path / "state"
+    project = SyncProject(
+        name="research", path="app/data/research", local_sync_path="/tmp/research"
+    )
+
+    project_bisync(
+        project,
+        "my-bucket",
+        run=runner,
+        is_installed=lambda: True,
+        version=(1, 64, 2),
+        filter_path=filter_path,
+        state_path=state_path,
+        is_initialized=lambda _name: True,
+    )
+
+    cmd, _ = runner.calls[0]
+    assert "--local-no-preallocate" in cmd

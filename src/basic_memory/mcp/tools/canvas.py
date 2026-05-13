@@ -4,27 +4,32 @@ This tool creates Obsidian canvas files (.canvas) using the JSON Canvas 1.0 spec
 """
 
 import json
-from typing import Dict, List, Any, Optional
+from typing import Annotated, Dict, List, Any, Optional
 
 from loguru import logger
 from fastmcp import Context
+from pydantic import AliasChoices, BeforeValidator, Field
 
-from basic_memory.mcp.async_client import get_client
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory.mcp.project_context import get_project_client
+from basic_memory.utils import coerce_list
 from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tools.utils import call_put, call_post, resolve_entity_id
-from basic_memory.telemetry import track_mcp_tool
 
 
 @mcp.tool(
     description="Create an Obsidian canvas file to visualize concepts and connections.",
+    annotations={"destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def canvas(
-    nodes: List[Dict[str, Any]],
-    edges: List[Dict[str, Any]],
+    nodes: Annotated[List[Dict[str, Any]], BeforeValidator(coerce_list)],
+    edges: Annotated[List[Dict[str, Any]], BeforeValidator(coerce_list)],
     title: str,
-    folder: str,
+    directory: Annotated[
+        str,
+        Field(validation_alias=AliasChoices("directory", "folder", "dir", "path")),
+    ],
     project: Optional[str] = None,
+    project_id: Optional[str] = None,
     context: Context | None = None,
 ) -> str:
     """Create an Obsidian canvas file with the provided nodes and edges.
@@ -41,11 +46,14 @@ async def canvas(
     Args:
         project: Project name to create canvas in. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
         nodes: List of node objects following JSON Canvas 1.0 spec
         edges: List of edge objects following JSON Canvas 1.0 spec
         title: The title of the canvas (will be saved as title.canvas)
-        folder: Folder path relative to project root where the canvas should be saved.
-                Use forward slashes (/) as separators. Examples: "diagrams", "projects/2025", "visual/maps"
+        directory: Directory path relative to project root where the canvas should be saved.
+                   Use forward slashes (/) as separators. Examples: "diagrams", "projects/2025", "visual/maps"
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -53,7 +61,7 @@ async def canvas(
 
     Important Notes:
     - When referencing files, use the exact file path as shown in Obsidian
-      Example: "folder/Document Name.md" (not permalink format)
+      Example: "docs/Document Name.md" (not permalink format)
     - For file nodes, the "file" attribute must reference an existing file
     - Nodes require id, type, x, y, width, height properties
     - Edges require id, fromNode, toNode properties
@@ -67,7 +75,7 @@ async def canvas(
         {
           "id": "node1",
           "type": "file",  // Options: "file", "text", "link", "group"
-          "file": "folder/Document.md",
+          "file": "docs/Document.md",
           "x": 0,
           "y": 0,
           "width": 400,
@@ -86,22 +94,22 @@ async def canvas(
     ```
 
     Examples:
-        # Create canvas in project
-        canvas("my-project", nodes=[...], edges=[...], title="My Canvas", folder="diagrams")
+        # Create canvas in default/current project
+        canvas(nodes=[...], edges=[...], title="My Canvas", directory="diagrams")
 
-        # Create canvas in work project
-        canvas("work-project", nodes=[...], edges=[...], title="Process Flow", folder="visual/maps")
+        # Create canvas with explicit project
+        canvas(nodes=[...], edges=[...], title="Process Flow", directory="visual/maps", project="work-project")
 
     Raises:
-        ToolError: If project doesn't exist or folder path is invalid
+        ToolError: If project doesn't exist or directory path is invalid
     """
-    track_mcp_tool("canvas")
-    async with get_client() as client:
-        active_project = await get_active_project(client, project, context)
-
+    async with get_project_client(project, context=context, project_id=project_id) as (
+        client,
+        active_project,
+    ):
         # Ensure path has .canvas extension
         file_title = title if title.endswith(".canvas") else f"{title}.canvas"
-        file_path = f"{folder}/{file_title}"
+        file_path = f"{directory}/{file_title}"
 
         # Create canvas data structure
         canvas_data = {"nodes": nodes, "edges": edges}
@@ -127,7 +135,9 @@ async def canvas(
             ):
                 logger.info(f"Canvas file exists, updating instead: {file_path}")
                 try:
-                    entity_id = await resolve_entity_id(client, active_project.external_id, file_path)
+                    entity_id = await resolve_entity_id(
+                        client, active_project.external_id, file_path
+                    )
                     # For update, send content in JSON body
                     response = await call_put(
                         client,

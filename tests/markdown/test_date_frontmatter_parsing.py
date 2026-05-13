@@ -5,7 +5,10 @@ in YAML frontmatter are automatically parsed as datetime.date objects by PyYAML,
 but later code expects strings and calls .strip() on them, causing AttributeError.
 """
 
+from textwrap import dedent
+
 import pytest
+
 from basic_memory.markdown.entity_parser import EntityParser
 
 
@@ -13,20 +16,22 @@ from basic_memory.markdown.entity_parser import EntityParser
 def test_file_with_date(tmp_path):
     """Create a test file with date fields in frontmatter."""
     test_file = tmp_path / "test_note.md"
-    content = """---
-title: Test Note
-date: 2025-10-24
-created: 2025-10-24
-tags:
-  - python
-  - testing
----
+    test_file.write_text(
+        dedent("""\
+        ---
+        title: Test Note
+        date: 2025-10-24
+        created: 2025-10-24
+        tags:
+          - python
+          - testing
+        ---
 
-# Test Content
+        # Test Content
 
-This file has date fields in frontmatter that PyYAML will parse as datetime.date objects.
-"""
-    test_file.write_text(content)
+        This file has date fields in frontmatter that PyYAML will parse as datetime.date objects.
+    """)
+    )
     return test_file
 
 
@@ -34,16 +39,18 @@ This file has date fields in frontmatter that PyYAML will parse as datetime.date
 def test_file_with_date_in_tags(tmp_path):
     """Create a test file with a date value in tags (edge case)."""
     test_file = tmp_path / "test_note_date_tags.md"
-    content = """---
-title: Test Note with Date Tags
-tags: 2025-10-24
----
+    test_file.write_text(
+        dedent("""\
+        ---
+        title: Test Note with Date Tags
+        tags: 2025-10-24
+        ---
 
-# Test Content
+        # Test Content
 
-This file has a date value as tags, which will be parsed as datetime.date.
-"""
-    test_file.write_text(content)
+        This file has a date value as tags, which will be parsed as datetime.date.
+    """)
+    )
     return test_file
 
 
@@ -51,19 +58,21 @@ This file has a date value as tags, which will be parsed as datetime.date.
 def test_file_with_dates_in_tag_list(tmp_path):
     """Create a test file with dates in a tag list (edge case)."""
     test_file = tmp_path / "test_note_dates_in_list.md"
-    content = """---
-title: Test Note with Dates in Tags List
-tags:
-  - valid-tag
-  - 2025-10-24
-  - another-tag
----
+    test_file.write_text(
+        dedent("""\
+        ---
+        title: Test Note with Dates in Tags List
+        tags:
+          - valid-tag
+          - 2025-10-24
+          - another-tag
+        ---
 
-# Test Content
+        # Test Content
 
-This file has date values mixed into tags list.
-"""
-    test_file.write_text(content)
+        This file has date values mixed into tags list.
+    """)
+    )
     return test_file
 
 
@@ -130,6 +139,87 @@ async def test_parse_file_with_dates_in_tag_list(test_file_with_dates_in_tag_lis
 
 
 @pytest.mark.asyncio
+async def test_parse_file_with_list_frontmatter_fields(tmp_path):
+    """Test that list values in expected-string frontmatter fields are coerced to strings.
+
+    Reproduces basic-memory-cloud#376 where a markdown file has YAML list values
+    in frontmatter fields like 'title' or 'type' that downstream code expects
+    to be strings, causing 'list' object has no attribute 'strip'.
+    """
+    test_file = tmp_path / "test_list_fields.md"
+    test_file.write_text(
+        dedent("""\
+        ---
+        title:
+          - Week 2 Discussion Post
+          - Alternate Title
+        tags:
+          - coursework
+          - sie-571
+        type:
+          - note
+          - assignment
+        some_field:
+          - item1
+          - item2
+        ---
+
+        # Content
+
+        Some body text.
+    """)
+    )
+
+    parser = EntityParser(tmp_path)
+    entity_markdown = await parser.parse_file(test_file)
+
+    # title must always be a string, even when YAML parses it as a list
+    title = entity_markdown.frontmatter.title
+    assert isinstance(title, str), f"Expected str, got {type(title)}"
+    assert "Week 2 Discussion Post" in title
+
+    # type must always be a string
+    note_type = entity_markdown.frontmatter.type
+    assert isinstance(note_type, str), f"Expected str, got {type(note_type)}"
+
+    # tags should still be a list (they're explicitly handled)
+    tags = entity_markdown.frontmatter.tags
+    assert isinstance(tags, list)
+    assert "coursework" in tags
+
+    # arbitrary list fields in metadata are preserved as lists
+    some_field = entity_markdown.frontmatter.metadata.get("some_field")
+    assert isinstance(some_field, list)
+    assert some_field == ["item1", "item2"]
+
+    # Verify title is safe for .strip() and .casefold() (the actual crash sites)
+    assert title.strip().casefold()
+
+
+@pytest.mark.asyncio
+async def test_parse_file_with_list_title_single_item(tmp_path):
+    """Test that a single-item list title is coerced to a plain string."""
+    test_file = tmp_path / "test_single_list_title.md"
+    test_file.write_text(
+        dedent("""\
+        ---
+        title:
+          - My Single Title
+        ---
+
+        # Content
+    """)
+    )
+
+    parser = EntityParser(tmp_path)
+    entity_markdown = await parser.parse_file(test_file)
+
+    title = entity_markdown.frontmatter.title
+    assert isinstance(title, str)
+    assert title == "My Single Title"
+
+
+@pytest.mark.asyncio
 async def test_parse_file_with_various_yaml_types(tmp_path):
     """Test that various YAML types in frontmatter don't cause errors.
 
@@ -138,24 +228,26 @@ async def test_parse_file_with_various_yaml_types(tmp_path):
     when code expects strings and calls .strip().
     """
     test_file = tmp_path / "test_yaml_types.md"
-    content = """---
-title: Test YAML Types
-date: 2025-10-24
-priority: 1
-completed: true
-tags:
-  - python
-  - testing
-metadata:
-  author: Test User
-  version: 1.0
----
+    test_file.write_text(
+        dedent("""\
+        ---
+        title: Test YAML Types
+        date: 2025-10-24
+        priority: 1
+        completed: true
+        tags:
+          - python
+          - testing
+        metadata:
+          author: Test User
+          version: 1.0
+        ---
 
-# Test Content
+        # Test Content
 
-This file has various YAML types that need to be normalized.
-"""
-    test_file.write_text(content)
+        This file has various YAML types that need to be normalized.
+    """)
+    )
 
     parser = EntityParser(tmp_path)
     entity_markdown = await parser.parse_file(test_file)
@@ -202,20 +294,19 @@ async def test_parse_file_with_datetime_objects(tmp_path):
     with time components (as parsed by PyYAML), ensuring they're converted to ISO format strings.
     """
     test_file = tmp_path / "test_datetime.md"
+    test_file.write_text(
+        dedent("""\
+        ---
+        title: Test Datetime
+        created_at: 2025-10-24 14:30:00
+        updated_at: 2025-10-24T00:00:00
+        ---
 
-    # YAML datetime strings that PyYAML will parse as datetime objects
-    # Format: YYYY-MM-DD HH:MM:SS or YYYY-MM-DDTHH:MM:SS
-    content = """---
-title: Test Datetime
-created_at: 2025-10-24 14:30:00
-updated_at: 2025-10-24T00:00:00
----
+        # Test Content
 
-# Test Content
-
-This file has datetime values in frontmatter that PyYAML will parse as datetime objects.
-"""
-    test_file.write_text(content)
+        This file has datetime values in frontmatter that PyYAML will parse as datetime objects.
+    """)
+    )
 
     parser = EntityParser(tmp_path)
     entity_markdown = await parser.parse_file(test_file)
@@ -234,3 +325,38 @@ This file has datetime values in frontmatter that PyYAML will parse as datetime 
     assert "2025-10-24" in updated_at and "00:00:00" in updated_at, (
         f"Datetime at midnight should be normalized to ISO format, got: {updated_at}"
     )
+
+
+@pytest.mark.asyncio
+async def test_parse_file_with_reserved_frontmatter_field_content(tmp_path):
+    """Test that a 'content' field in frontmatter doesn't break parsing.
+
+    Reproduces basic-memory-cloud#375 where frontmatter containing a field named
+    'content' causes frontmatter.Post.__init__() to receive multiple values for
+    the 'content' positional argument.
+    """
+    test_file = tmp_path / "topic-note-template.md"
+    test_file.write_text(
+        dedent("""\
+        ---
+        title: Topic Note Template
+        content: Template for topic notes
+        handler: some-handler-value
+        ---
+
+        # Template Body
+
+        Actual body content here.
+    """)
+    )
+
+    parser = EntityParser(tmp_path)
+    entity_markdown = await parser.parse_file(test_file)
+
+    assert entity_markdown.frontmatter.title == "Topic Note Template"
+    # The 'content' and 'handler' fields should be preserved in metadata
+    assert entity_markdown.frontmatter.metadata.get("content") == "Template for topic notes"
+    assert entity_markdown.frontmatter.metadata.get("handler") == "some-handler-value"
+    # The actual body content should be parsed correctly
+    assert entity_markdown.content is not None
+    assert "Template Body" in entity_markdown.content

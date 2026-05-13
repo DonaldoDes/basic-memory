@@ -9,6 +9,7 @@ from frontmatter import Post
 
 from basic_memory.file_utils import has_frontmatter, remove_frontmatter, parse_frontmatter
 from basic_memory.markdown import EntityMarkdown
+from basic_memory.markdown.entity_parser import normalize_frontmatter_metadata
 from basic_memory.models import Entity
 from basic_memory.models import Observation as ObservationModel
 
@@ -49,7 +50,7 @@ def entity_model_from_markdown(
 
     # Update basic fields
     model.title = markdown.frontmatter.title
-    model.entity_type = markdown.frontmatter.type
+    model.note_type = markdown.frontmatter.type
     # Only update permalink if it exists in frontmatter, otherwise preserve existing
     if markdown.frontmatter.permalink is not None:
         model.permalink = markdown.frontmatter.permalink
@@ -58,9 +59,9 @@ def entity_model_from_markdown(
     model.created_at = markdown.created
     model.updated_at = markdown.modified
 
-    # Handle metadata - ensure all values are strings and filter None
-    metadata = markdown.frontmatter.metadata or {}
-    model.entity_metadata = {k: str(v) for k, v in metadata.items() if v is not None}
+    # Handle metadata - normalize values and filter None (preserve structured data)
+    metadata = normalize_frontmatter_metadata(markdown.frontmatter.metadata or {})
+    model.entity_metadata = {k: v for k, v in metadata.items() if v is not None}
 
     # Get project_id from entity if not provided
     obs_project_id = project_id or (model.project_id if hasattr(model, "project_id") else None)
@@ -85,7 +86,7 @@ async def schema_to_markdown(schema: Any) -> Post:
     Convert schema to markdown Post object.
 
     Args:
-        schema: Schema to convert (must have title, entity_type, and permalink attributes)
+        schema: Schema to convert (must have title, note_type, and permalink attributes)
 
     Returns:
         Post object with frontmatter metadata
@@ -112,7 +113,7 @@ async def schema_to_markdown(schema: Any) -> Post:
     post = Post(
         content,
         title=schema.title,
-        type=schema.entity_type,
+        type=schema.note_type,
     )
     # set the permalink if passed in
     if schema.permalink:

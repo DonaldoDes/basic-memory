@@ -13,7 +13,7 @@ from basic_memory.schemas import (
     SystemStatus,
 )
 from basic_memory.services.project_service import ProjectService
-from basic_memory.config import ConfigManager
+from basic_memory.config import ConfigManager, DatabaseBackend
 
 
 def test_projects_property(project_service: ProjectService):
@@ -127,6 +127,27 @@ async def test_get_system_status(project_service: ProjectService):
 
 
 @pytest.mark.asyncio
+async def test_get_system_status_reads_watch_status_from_config_dir(
+    project_service: ProjectService, tmp_path, monkeypatch
+):
+    """Regression guard for #742: watch-status.json is read from the configured
+    data dir, not hardcoded to ~/.basic-memory."""
+    import json as _json
+    from basic_memory.config import WATCH_STATUS_JSON
+
+    custom_dir = tmp_path / "instance-v" / "state"
+    custom_dir.mkdir(parents=True)
+    (custom_dir / WATCH_STATUS_JSON).write_text(
+        _json.dumps({"running": True, "error_count": 7}), encoding="utf-8"
+    )
+    monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", str(custom_dir))
+
+    status = project_service.get_system_status()
+
+    assert status.watch_status == {"running": True, "error_count": 7}
+
+
+@pytest.mark.asyncio
 async def test_get_statistics(project_service: ProjectService, test_graph, test_project):
     """Test getting statistics."""
     # Get statistics
@@ -135,7 +156,7 @@ async def test_get_statistics(project_service: ProjectService, test_graph, test_
     # Assert it returns a valid ProjectStatistics object
     assert isinstance(statistics, ProjectStatistics)
     assert statistics.total_entities > 0
-    assert "test" in statistics.entity_types
+    assert "test" in statistics.note_types
 
 
 @pytest.mark.asyncio
@@ -233,9 +254,10 @@ async def test_set_default_project_async(project_service: ProjectService, test_p
             assert project.is_default is True
 
             # Make sure old default is no longer default
-            old_default_project = await project_service.repository.get_by_name(original_default)
-            if old_default_project:
-                assert old_default_project.is_default is not True
+            if original_default:
+                old_default_project = await project_service.repository.get_by_name(original_default)
+                if old_default_project:
+                    assert old_default_project.is_default is not True
 
         finally:
             # Restore original default (only if it exists in database)
@@ -327,8 +349,10 @@ async def test_add_project_with_set_default_true(project_service: ProjectService
 
         try:
             # Get original default project from database
-            original_default_project = await project_service.repository.get_by_name(
-                original_default
+            original_default_project = (
+                await project_service.repository.get_by_name(original_default)
+                if original_default
+                else None
             )
 
             # Add project with set_default=True
@@ -345,7 +369,9 @@ async def test_add_project_with_set_default_true(project_service: ProjectService
 
             # Verify original default is no longer default in database
             if original_default_project:
+                assert original_default is not None
                 refreshed_original = await project_service.repository.get_by_name(original_default)
+                assert refreshed_original is not None
                 assert refreshed_original.is_default is not True
 
             # Verify only one project has is_default=True
@@ -394,8 +420,10 @@ async def test_add_project_with_set_default_false(project_service: ProjectServic
             assert new_project.is_default is not True
 
             # Verify original default is still default
-            original_default_project = await project_service.repository.get_by_name(
-                original_default
+            original_default_project = (
+                await project_service.repository.get_by_name(original_default)
+                if original_default
+                else None
             )
             if original_default_project:
                 assert original_default_project.is_default is True
@@ -513,7 +541,9 @@ async def test_synchronize_projects_normalizes_project_names(project_service: Pr
 
             # Add project with unnormalized name directly to config
             config = config_manager.load_config()
-            config.projects[unnormalized_name] = test_project_path
+            from basic_memory.config import ProjectEntry
+
+            config.projects[unnormalized_name] = ProjectEntry(path=test_project_path)
             config_manager.save_config(config)
 
             # Verify the unnormalized name is in config
@@ -704,7 +734,9 @@ async def test_synchronize_projects_handles_case_sensitivity_bug(project_service
         try:
             # Add project with uppercase name to config (simulating the bug scenario)
             config = config_manager.load_config()
-            config.projects[config_name] = test_project_path
+            from basic_memory.config import ProjectEntry
+
+            config.projects[config_name] = ProjectEntry(path=test_project_path)
             config_manager.save_config(config)
 
             # Verify the uppercase name is in config
@@ -774,6 +806,8 @@ async def test_add_project_with_project_root_sanitizes_paths(
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None
+        config_module._CONFIG_MTIME = None
+        config_module._CONFIG_SIZE = None
 
         test_cases = [
             # (project_name, user_path, expected_sanitized_name)
@@ -841,6 +875,8 @@ async def test_add_project_with_project_root_rejects_escape_attempts(
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None
+        config_module._CONFIG_MTIME = None
+        config_module._CONFIG_SIZE = None
 
         # All of these should succeed by being sanitized to paths under project_root
         # The sanitization removes dangerous patterns, so they don't escape
@@ -927,6 +963,8 @@ async def test_add_project_with_project_root_normalizes_case(
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None
+        config_module._CONFIG_MTIME = None
+        config_module._CONFIG_SIZE = None
 
         test_cases = [
             # (input_path, expected_normalized_path)
@@ -981,6 +1019,8 @@ async def test_add_project_with_project_root_detects_case_collisions(
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None
+        config_module._CONFIG_MTIME = None
+        config_module._CONFIG_SIZE = None
 
         # First, create a project with lowercase path
         first_project = "documents-project"
@@ -1155,6 +1195,8 @@ async def test_add_project_nested_validation_with_project_root(
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None
+        config_module._CONFIG_MTIME = None
+        config_module._CONFIG_SIZE = None
 
         parent_project_name = f"cloud-parent-{os.urandom(4).hex()}"
         child_project_name = f"cloud-child-{os.urandom(4).hex()}"
@@ -1351,18 +1393,20 @@ async def test_remove_project_delete_notes_missing_directory(project_service: Pr
 
 
 @pytest.mark.asyncio
-async def test_remove_project_cloud_mode_uses_database_not_config(project_service: ProjectService):
-    """Test that in cloud mode, remove_project only checks database for default status.
+async def test_remove_project_postgres_backend_uses_database_not_config(
+    project_service: ProjectService,
+):
+    """Test that in Postgres backend, remove_project only checks database for default status.
 
-    Regression test for bug where cloud mode checked config file (stale) instead of
+    Regression test for bug where cloud backend checked config file (stale) instead of
     database (source of truth) when determining if a project is the default.
     """
     test_project_name = f"test-cloud-default-{os.urandom(4).hex()}"
     test_project_path = f"/tmp/test-cloud-{os.urandom(8).hex()}"
 
-    # Save original cloud_mode setting
+    # Save original backend/default settings
     config = project_service.config_manager.config
-    original_cloud_mode = config.cloud_mode
+    original_backend = config.database_backend
     original_default = config.default_project
 
     try:
@@ -1378,11 +1422,11 @@ async def test_remove_project_cloud_mode_uses_database_not_config(project_servic
         # (This simulates what happens when config isn't updated after API calls)
         config.default_project = test_project_name
 
-        # Enable cloud mode
-        config.cloud_mode = True
+        # Use Postgres backend semantics (database is source of truth)
+        config.database_backend = DatabaseBackend.POSTGRES
         project_service.config_manager.save_config(config)
 
-        # In cloud mode, should be able to remove the project because database says it's not default
+        # In Postgres backend, should be able to remove because database says it's not default
         # (even though stale config says it is) - this should NOT raise ValueError
         await project_service.remove_project(test_project_name, delete_notes=False)
 
@@ -1393,7 +1437,7 @@ async def test_remove_project_cloud_mode_uses_database_not_config(project_servic
     finally:
         # Restore original settings
         config = project_service.config_manager.config
-        config.cloud_mode = original_cloud_mode
+        config.database_backend = original_backend
         config.default_project = original_default
         project_service.config_manager.save_config(config)
 
@@ -1408,9 +1452,9 @@ async def test_remove_project_cloud_mode_uses_database_not_config(project_servic
 async def test_remove_project_local_mode_checks_both_config_and_database(
     project_service: ProjectService,
 ):
-    """Test that in local mode, remove_project checks both config AND database for default status.
+    """Test that in SQLite backend, remove_project checks both config AND database for default status.
 
-    In local mode, we check both sources to be safe - if either says the project is default,
+    In SQLite backend, we check both sources to be safe - if either says the project is default,
     we prevent deletion.
     """
     test_project_name = f"test-local-default-{os.urandom(4).hex()}"
@@ -1418,15 +1462,15 @@ async def test_remove_project_local_mode_checks_both_config_and_database(
 
     # Save original settings
     config = project_service.config_manager.config
-    original_cloud_mode = config.cloud_mode
+    original_backend = config.database_backend
     original_default = config.default_project
 
     try:
-        # Ensure we're in local mode before adding project
-        config.cloud_mode = False
+        # Ensure we're in SQLite backend before adding project
+        config.database_backend = DatabaseBackend.SQLITE
         project_service.config_manager.save_config(config)
 
-        # Add a test project (not default) - this will add to both DB and config in local mode
+        # Add a test project (not default) - this will add to both DB and config in SQLite mode
         await project_service.add_project(test_project_name, test_project_path, set_default=False)
 
         # Verify project exists and is NOT default in database
@@ -1441,7 +1485,7 @@ async def test_remove_project_local_mode_checks_both_config_and_database(
         config.default_project = test_project_name
         project_service.config_manager.save_config(config)
 
-        # In local mode, should NOT be able to remove because config says it's default
+        # In SQLite backend, should NOT be able to remove because config says it's default
         with pytest.raises(ValueError, match="Cannot remove the default project"):
             await project_service.remove_project(test_project_name, delete_notes=False)
 
@@ -1452,7 +1496,7 @@ async def test_remove_project_local_mode_checks_both_config_and_database(
     finally:
         # Restore original settings
         config = project_service.config_manager.config
-        config.cloud_mode = original_cloud_mode
+        config.database_backend = original_backend
         config.default_project = original_default
         project_service.config_manager.save_config(config)
 
@@ -1475,7 +1519,7 @@ async def test_remove_project_rejects_database_default_in_both_modes(
     test_project_path = f"/tmp/test-db-default-{os.urandom(8).hex()}"
 
     # Save original settings
-    original_cloud_mode = project_service.config_manager.config.cloud_mode
+    original_backend = project_service.config_manager.config.database_backend
     original_default = project_service.config_manager.config.default_project
 
     try:
@@ -1487,16 +1531,16 @@ async def test_remove_project_rejects_database_default_in_both_modes(
         assert db_project is not None
         assert db_project.is_default is True
 
-        # Test in cloud mode - should reject
+        # Test in Postgres backend - should reject
         config = project_service.config_manager.config
-        config.cloud_mode = True
+        config.database_backend = DatabaseBackend.POSTGRES
         project_service.config_manager.save_config(config)
 
         with pytest.raises(ValueError, match="Cannot remove the default project"):
             await project_service.remove_project(test_project_name, delete_notes=False)
 
-        # Test in local mode - should also reject
-        config.cloud_mode = False
+        # Test in SQLite backend - should also reject
+        config.database_backend = DatabaseBackend.SQLITE
         project_service.config_manager.save_config(config)
 
         with pytest.raises(ValueError, match="Cannot remove the default project"):
@@ -1508,7 +1552,7 @@ async def test_remove_project_rejects_database_default_in_both_modes(
     finally:
         # Restore original settings
         config = project_service.config_manager.config
-        config.cloud_mode = original_cloud_mode
+        config.database_backend = original_backend
         config.default_project = original_default
         project_service.config_manager.save_config(config)
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from basic_memory import file_utils
 from basic_memory.models.knowledge import Entity
 from basic_memory.services.exceptions import BinaryFileError, FileOperationError
 from basic_memory.services.file_service import FileService
@@ -167,6 +168,34 @@ async def test_write_unicode_content(tmp_path: Path, file_service: FileService):
     content, _ = await file_service.read_file(test_path)
 
     assert content == test_content
+
+
+@pytest.mark.asyncio
+async def test_update_frontmatter_checksum_matches_windows_crlf_persisted_bytes(
+    tmp_path: Path, file_service: FileService, monkeypatch
+):
+    """Windows-style CRLF writes should hash the stored file, not the pre-write string."""
+    test_path = tmp_path / "note.md"
+    test_path.write_text("# Note\nBody\n", encoding="utf-8")
+
+    async def fake_write_file_atomic(path: Path, content: str) -> None:
+        # Trigger: simulate Windows text-mode persistence, where logical LF strings
+        #          land on disk as CRLF bytes.
+        # Why: the regression happened when the stored bytes diverged from the LF string
+        #      used to build the checksum.
+        # Outcome: this test proves FileService returns the checksum for the stored file.
+        persisted = content.replace("\n", "\r\n").encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(persisted)
+
+    monkeypatch.setattr(file_utils, "write_file_atomic", fake_write_file_atomic)
+
+    result = await file_service.update_frontmatter_with_result(
+        test_path,
+        {"title": "Note", "type": "note"},
+    )
+
+    assert result.checksum == await file_service.compute_checksum(test_path)
 
 
 @pytest.mark.asyncio

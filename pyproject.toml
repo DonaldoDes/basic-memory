@@ -14,7 +14,7 @@ dependencies = [
     "typer>=0.9.0",
     "aiosqlite>=0.20.0",
     "greenlet>=3.1.1",
-    "pydantic[email,timezone]>=2.10.3",
+    "pydantic[email,timezone]>=2.12.0",
     "mcp>=1.23.1",
     "pydantic-settings>=2.6.1",
     "loguru>=0.7.3",
@@ -29,11 +29,11 @@ dependencies = [
     "alembic>=1.14.1",
     "pillow>=11.1.0",
     "pybars3>=0.9.7",
-    "fastmcp==2.12.3",  # Pinned - 2.14.x breaks MCP tools visibility (issue #463)
+    "fastmcp>=3.0.1,<4",
     "pyjwt>=2.10.1",
     "python-dotenv>=1.1.0",
     "pytest-aio>=1.9.0",
-    "aiofiles>=24.1.0", # Optional observability (disabled by default via config)
+    "aiofiles>=24.1.0",
     "asyncpg>=0.30.0",
     "nest-asyncio>=1.6.0", # For Alembic migrations with Postgres
     "pytest-asyncio>=1.2.0",
@@ -41,9 +41,15 @@ dependencies = [
     "mdformat>=0.7.22",
     "mdformat-gfm>=0.3.7",
     "mdformat-frontmatter>=2.0.8",
-    "openpanel>=0.0.1",  # Anonymous usage telemetry (Homebrew-style opt-out)
+    "sniffio>=1.3.1",
+    "anyio>=4.10.0",
+    "httpx>=0.28.0",
+    "fastembed>=0.7.4",
+    "sqlite-vec>=0.1.6",
+    "openai>=1.100.2",
+    "logfire>=4.19.0",
+    "psutil>=5.9.0",
 ]
-
 
 [project.urls]
 Homepage = "https://github.com/basicmachines-co/basic-memory"
@@ -64,11 +70,19 @@ addopts = "--cov=basic_memory --cov-report term-missing"
 testpaths = ["tests", "test-int"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore:The @wait_container_is_ready decorator is deprecated.*:DeprecationWarning:testcontainers\\.core\\.waiting_utils",
+    "ignore:The default datetime adapter is deprecated as of Python 3\\.12.*:DeprecationWarning:aiosqlite\\.core",
+    "ignore:codecs\\.open\\(\\) is deprecated\\. Use open\\(\\) instead\\.:DeprecationWarning:frontmatter",
+    "ignore:Parsing dates involving a day of month without a year specified is ambiguous.*:DeprecationWarning:dateparser\\.utils\\.strptime",
+]
 markers = [
     "benchmark: Performance benchmark tests (deselect with '-m \"not benchmark\"')",
     "slow: Slow-running tests (deselect with '-m \"not slow\"')",
     "postgres: Tests that run against Postgres backend (deselect with '-m \"not postgres\"')",
     "windows: Windows-specific tests (deselect with '-m \"not windows\"')",
+    "smoke: Fast end-to-end smoke tests for MCP flows",
+    "semantic: Tests requiring semantic dependencies (fastembed, sqlite-vec, openai)",
 ]
 
 [tool.ruff]
@@ -77,6 +91,7 @@ target-version = "py312"
 
 [dependency-groups]
 dev = [
+    "logfire>=4.19.0",
     "gevent>=24.11.1",
     "icecream>=2.1.3",
     "pytest>=8.3.4",
@@ -88,6 +103,11 @@ dev = [
     "freezegun>=1.5.5",
     "testcontainers[postgres]>=4.0.0",
     "psycopg>=3.2.0",
+    "pyright>=1.1.408",
+    "pytest-testmon>=2.2.0",
+    "ty>=0.0.18",
+    "cst-lsp>=0.1.3",
+    "libcst>=1.8.6",
 ]
 
 [tool.hatch.version]
@@ -106,6 +126,7 @@ ignore = ["test/"]
 defineConstant = { DEBUG = true }
 reportMissingImports = "error"
 reportMissingTypeStubs = false
+reportUnusedImport = "none"
 pythonVersion = "3.12"
 
 
@@ -139,6 +160,5 @@ omit = [
     "*/db.py",                     # Backend/runtime-dependent (sqlite/postgres/windows tuning); validated via integration tests
     "*/services/initialization.py", # Startup orchestration + background tasks (watchers); exercised indirectly in entrypoints
     "*/sync/sync_service.py",      # Heavy filesystem/db integration; covered by integration suite, not enforced in unit coverage
-    "*/telemetry.py",              # External analytics; tested lightly, excluded from strict coverage target
     "*/services/migration_service.py", # Complex migration scenarios
 ]

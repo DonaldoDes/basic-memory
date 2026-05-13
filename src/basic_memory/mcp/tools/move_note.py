@@ -1,15 +1,16 @@
 """Move note tool for Basic Memory MCP server."""
 
+from pathlib import Path, PureWindowsPath
 from textwrap import dedent
-from typing import Optional
+from typing import Annotated, Optional, Literal
 
 from loguru import logger
 from fastmcp import Context
+from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import AliasChoices, Field
 
-from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.project_context import get_active_project
-from basic_memory.telemetry import track_mcp_tool
+from basic_memory.mcp.project_context import get_project_client
 from basic_memory.utils import validate_project_path
 
 
@@ -343,44 +344,90 @@ delete_note("{identifier}")
 
 
 @mcp.tool(
-    description="Move a note to a new location, updating database and maintaining links.",
+    description="Move a note or directory to a new location, updating database and maintaining links.",
+    annotations={"destructiveHint": False, "openWorldHint": False},
 )
 async def move_note(
     identifier: str,
-    destination_path: str,
+    # Move/rename APIs across the ecosystem use `to`/`destination`/`new_path`.
+    destination_path: Annotated[
+        str,
+        Field(
+            default="",
+            validation_alias=AliasChoices(
+                "destination_path", "dest_path", "new_path", "to", "destination"
+            ),
+        ),
+    ] = "",
+    destination_folder: Annotated[
+        Optional[str],
+        Field(
+            default=None,
+            validation_alias=AliasChoices("destination_folder", "dest_folder", "to_folder"),
+        ),
+    ] = None,
+    is_directory: Annotated[
+        bool,
+        Field(default=False, validation_alias=AliasChoices("is_directory", "is_dir")),
+    ] = False,
     project: Optional[str] = None,
+    project_id: Optional[str] = None,
+    output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str:
-    """Move a note to a new file location within the same project.
+) -> str | dict:
+    """Move a note or directory to a new location within the same project.
 
-    Moves a note from one location to another within the project, updating all
-    database references and maintaining semantic content. Uses stateless architecture -
-    project parameter optional with server resolution.
+    Moves a note or directory from one location to another within the project,
+    updating all database references and maintaining semantic content. Uses stateless
+    architecture - project parameter optional with server resolution.
 
     Args:
-        identifier: Exact entity identifier (title, permalink, or memory:// URL).
+        identifier: For files: exact entity identifier (title, permalink, or memory:// URL).
+                   For directories: the directory path (e.g., "docs", "projects/2025").
                    Must be an exact match - fuzzy matching is not supported for move operations.
-                   Use search_notes() or read_note() first to find the correct identifier if uncertain.
-        destination_path: New path relative to project root (e.g., "work/meetings/2025-05-26.md")
+                   Use search_notes() or list_directory() first to find the correct path if uncertain.
+        destination_path: For files: new path relative to project root (e.g., "work/meetings/note.md")
+                         For directories: new directory path (e.g., "archive/docs")
+                         Mutually exclusive with destination_folder.
+        destination_folder: Move the note into this folder, preserving the original filename.
+                           Mutually exclusive with destination_path. Only for single-file moves.
+        is_directory: If True, moves an entire directory and all its contents.
+                     When True, identifier and destination_path should be directory paths
+                     (without file extensions). Defaults to False.
         project: Project name to move within. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
+        output_format: "text" returns existing markdown guidance/success text. "json"
+            returns machine-readable move metadata.
         context: Optional FastMCP context for performance caching.
 
     Returns:
         Success message with move details and project information.
+        For directories, includes count of files moved and any errors.
 
     Examples:
-        # Move to new folder (exact title match)
+        # Move a single note to new folder (exact title match)
         move_note("My Note", "work/notes/my-note.md")
 
         # Move by exact permalink
         move_note("my-note-permalink", "archive/old-notes/my-note.md")
+
+        # Move note to archive folder (filename preserved automatically)
+        move_note("my-note", destination_folder="archive")
 
         # Move with complex path structure
         move_note("experiments/ml-results", "archive/2025/ml-experiments.md")
 
         # Explicit project specification
         move_note("My Note", "work/notes/my-note.md", project="work-project")
+
+        # Move entire directory
+        move_note("docs", "archive/docs", is_directory=True)
+
+        # Move nested directory
+        move_note("projects/2024", "archive/projects/2024", is_directory=True)
 
         # If uncertain about identifier, search first:
         # search_notes("my note")  # Find available notes
@@ -400,11 +447,67 @@ async def move_note(
     - Re-indexes the entity for search
     - Maintains all observations and relations
     """
-    track_mcp_tool("move_note")
-    async with get_client() as client:
-        logger.debug(f"Moving note: {identifier} to {destination_path} in project: {project}")
+    # --- Parameter Validation ---
+    # Trigger: both destination_path and destination_folder provided
+    # Why: they are mutually exclusive — one specifies full path, the other just the folder
+    # Outcome: early error before any entity resolution or API calls
+    if destination_folder and destination_path:
+        error_msg = (
+            "Cannot specify both destination_path and destination_folder. Use one or the other."
+        )
+        if output_format == "json":
+            return {
+                "moved": False,
+                "title": None,
+                "permalink": None,
+                "file_path": None,
+                "source": identifier,
+                "destination": None,
+                "error": "MUTUALLY_EXCLUSIVE_PARAMS",
+            }
+        return f"# Move Failed - Invalid Parameters\n\n{error_msg}"
 
-        active_project = await get_active_project(client, project, context)
+    if not destination_folder and not destination_path:
+        error_msg = "Either destination_path or destination_folder must be provided."
+        if output_format == "json":
+            return {
+                "moved": False,
+                "title": None,
+                "permalink": None,
+                "file_path": None,
+                "source": identifier,
+                "destination": None,
+                "error": "MISSING_DESTINATION",
+            }
+        return f"# Move Failed - Missing Destination\n\n{error_msg}"
+
+    # Trigger: destination_folder used with is_directory=True
+    # Why: destination_folder preserves a single file's name — meaningless for directory moves
+    if destination_folder and is_directory:
+        error_msg = (
+            "destination_folder is only supported for single-file moves, not directory moves."
+        )
+        if output_format == "json":
+            return {
+                "moved": False,
+                "title": None,
+                "permalink": None,
+                "file_path": None,
+                "source": identifier,
+                "destination": None,
+                "error": "DESTINATION_FOLDER_NOT_FOR_DIRECTORIES",
+            }
+        return f"# Move Failed - Invalid Parameters\n\n{error_msg}"
+    async with get_project_client(project, context=context, project_id=project_id) as (
+        client,
+        active_project,
+    ):
+        destination_target = destination_folder or destination_path
+        logger.info(
+            f"MCP tool call tool=move_note project={active_project.name} "
+            f"identifier={identifier} destination={destination_target} "
+            f"is_directory={str(is_directory).lower()}"
+        )
 
         # Validate destination path to prevent path traversal attacks
         project_path = active_project.home
@@ -414,6 +517,16 @@ async def move_note(
                 destination_path=destination_path,
                 project=active_project.name,
             )
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": "SECURITY_VALIDATION_ERROR",
+                }
             return f"""# Move Failed - Security Validation Error
 
 The destination path '{destination_path}' is not allowed - paths must stay within project boundaries.
@@ -428,12 +541,114 @@ The destination path '{destination_path}' is not allowed - paths must stay withi
 move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in destination_path else destination_path}")
 ```"""
 
-        # Check for potential cross-project move attempts
+        # Handle directory moves
+        if is_directory:
+            # Import here to avoid circular import
+            from basic_memory.mcp.clients import KnowledgeClient
+
+            knowledge_client = KnowledgeClient(client, active_project.external_id)
+
+            try:
+                result = await knowledge_client.move_directory(identifier, destination_path)
+                if output_format == "json":
+                    return {
+                        "moved": result.failed_moves == 0,
+                        "title": None,
+                        "permalink": None,
+                        "file_path": None,
+                        "source": identifier,
+                        "destination": destination_path,
+                        "is_directory": True,
+                        "total_files": result.total_files,
+                        "successful_moves": result.successful_moves,
+                        "failed_moves": result.failed_moves,
+                    }
+
+                # Build success message for directory move
+                result_lines = [
+                    "# Directory Moved Successfully",
+                    "",
+                    f"**Source:** `{identifier}`",
+                    f"**Destination:** `{destination_path}`",
+                    "",
+                    "## Summary",
+                    f"- Total files: {result.total_files}",
+                    f"- Successfully moved: {result.successful_moves}",
+                    f"- Failed: {result.failed_moves}",
+                ]
+
+                if result.moved_files:
+                    result_lines.extend(["", "## Moved Files"])
+                    for file_path in result.moved_files[:10]:  # Show first 10
+                        result_lines.append(f"- `{file_path}`")
+                    if len(result.moved_files) > 10:
+                        result_lines.append(f"- ... and {len(result.moved_files) - 10} more")
+
+                if result.errors:  # pragma: no cover
+                    result_lines.extend(["", "## Errors"])
+                    for error in result.errors[:5]:  # Show first 5 errors
+                        result_lines.append(f"- `{error.path}`: {error.error}")
+                    if len(result.errors) > 5:
+                        result_lines.append(f"- ... and {len(result.errors) - 5} more errors")
+
+                result_lines.extend(["", f"<!-- Project: {active_project.name} -->"])
+
+                logger.info(
+                    f"Directory move completed: {identifier} -> {destination_path}, "
+                    f"moved={result.successful_moves}, failed={result.failed_moves}"
+                )
+
+                return "\n".join(result_lines)
+
+            except Exception as e:  # pragma: no cover
+                logger.error(
+                    f"Directory move failed for '{identifier}' to '{destination_path}': {e}"
+                )
+                if output_format == "json":
+                    return {
+                        "moved": False,
+                        "title": None,
+                        "permalink": None,
+                        "file_path": None,
+                        "source": identifier,
+                        "destination": destination_path,
+                        "is_directory": True,
+                        "error": str(e),
+                    }
+                return f"""# Directory Move Failed
+
+Error moving directory '{identifier}' to '{destination_path}': {str(e)}
+
+## Troubleshooting:
+1. **Verify the directory exists**: Use `list_directory("{identifier}")` to check
+2. **Check for conflicts**: The destination may already contain files
+3. **Try individual moves**: Move files one at a time if bulk move fails
+
+## Alternative approach:
+```
+# List directory contents first
+list_directory("{identifier}")
+
+# Then move individual files
+move_note("path/to/file.md", "{destination_path}/file.md")
+```"""
+
+        # Check for potential cross-project move attempts (file moves only)
         cross_project_error = await _detect_cross_project_move_attempt(
             client, identifier, destination_path, active_project.name
         )
         if cross_project_error:
             logger.info(f"Detected cross-project move attempt: {identifier} -> {destination_path}")
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": "CROSS_PROJECT_MOVE_NOT_SUPPORTED",
+                }
             return cross_project_error
 
         # Import here to avoid circular import
@@ -442,22 +657,118 @@ move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in dest
         # Use typed KnowledgeClient for API calls
         knowledge_client = KnowledgeClient(client, active_project.external_id)
 
-        # Get the source entity information for extension validation
+        # Resolve once and reuse the entity ID across extension validation and move.
         source_ext = "md"  # Default to .md if we can't determine source extension
+        resolved_entity_id: str | None = None
+        source_entity = None
+
+        async def _ensure_resolved_entity_id() -> str:
+            """Resolve and cache the source entity ID for the duration of this move."""
+            nonlocal resolved_entity_id
+            if resolved_entity_id is None:
+                resolved_entity_id = await knowledge_client.resolve_entity(identifier, strict=True)
+            return resolved_entity_id
+
         try:
-            # Resolve identifier to entity ID
-            entity_id = await knowledge_client.resolve_entity(identifier)
-            # Fetch source entity information to get the current file extension
-            source_entity = await knowledge_client.get_entity(entity_id)
+            resolved_entity_id = await _ensure_resolved_entity_id()
+            source_entity = await knowledge_client.get_entity(resolved_entity_id)
             if "." in source_entity.file_path:
                 source_ext = source_entity.file_path.split(".")[-1]
+        except ToolError as e:
+            # Trigger: strict=True resolve_entity raised because the entity was not found.
+            # Why: fail fast with a formatted error instead of silently falling through
+            #      to extension defaults and failing later with a confusing message.
+            # Outcome: move_note returns a user-facing not-found error immediately.
+            logger.error(f"Move failed for '{identifier}' to '{destination_path}': {e}")
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": str(e),
+                }
+            return _format_move_error_response(str(e), identifier, destination_path)
         except Exception as e:
-            # If we can't fetch the source entity, default to .md extension
+            # If we can't fetch source metadata (e.g. get_entity or file_path parsing fails),
+            # continue with extension defaults — the entity was at least resolved.
             logger.debug(f"Could not fetch source entity for extension check: {e}")
+
+        # --- Resolve destination_folder into destination_path ---
+        # Trigger: caller passed destination_folder instead of destination_path
+        # Why: extract the original filename from the resolved entity so callers
+        #      don't need a separate read_note round-trip
+        # Outcome: destination_path is set to folder/original-filename.ext
+        if destination_folder is not None:
+            if source_entity is None:
+                error_msg = (
+                    f"Could not resolve source entity '{identifier}' to extract filename "
+                    f"for destination_folder. Use destination_path with an explicit filename instead."
+                )
+                if output_format == "json":
+                    return {
+                        "moved": False,
+                        "title": None,
+                        "permalink": None,
+                        "file_path": None,
+                        "source": identifier,
+                        "destination": None,
+                        "error": "ENTITY_RESOLUTION_FAILED",
+                    }
+                return f"# Move Failed - Entity Resolution Failed\n\n{error_msg}"
+
+            source_filename = Path(source_entity.file_path).name
+            # Normalize backslashes to forward slashes for Windows compatibility,
+            # then strip leading/trailing separators
+            folder = PureWindowsPath(destination_folder).as_posix().strip("/")
+            destination_path = f"{folder}/{source_filename}" if folder else source_filename
+
+            # Validate resolved path to prevent path traversal via destination_folder
+            if not validate_project_path(destination_path, project_path):
+                logger.warning(
+                    "Attempted path traversal attack blocked via destination_folder",
+                    destination_folder=destination_folder,
+                    project=active_project.name,
+                )
+                if output_format == "json":
+                    return {
+                        "moved": False,
+                        "title": None,
+                        "permalink": None,
+                        "file_path": None,
+                        "source": identifier,
+                        "destination": destination_path,
+                        "error": "SECURITY_VALIDATION_ERROR",
+                    }
+                return f"""# Move Failed - Security Validation Error
+
+The destination folder '{destination_folder}' is not allowed - paths must stay within project boundaries.
+
+## Valid folder examples:
+- `notes`
+- `projects/2025`
+- `archive/old-notes`
+
+## Try again with a safe folder:
+```
+move_note("{identifier}", destination_folder="notes")
+```"""
 
         # Validate that destination path includes a file extension
         if "." not in destination_path or not destination_path.split(".")[-1]:
             logger.warning(f"Move failed - no file extension provided: {destination_path}")
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": "FILE_EXTENSION_REQUIRED",
+                }
             return dedent(f"""
                 # Move Failed - File Extension Required
 
@@ -476,14 +787,15 @@ move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in dest
                 All examples in Basic Memory expect file extensions to be explicitly provided.
                 """).strip()
 
-        # Get the source entity to check its file extension
-        try:
-            # Resolve identifier to entity ID (might already be cached from above)
-            entity_id = await knowledge_client.resolve_entity(identifier)
-            # Fetch source entity information
-            source_entity = await knowledge_client.get_entity(entity_id)
+        # Validate extension consistency when source metadata is available.
+        if source_entity is None:
+            try:
+                resolved_entity_id = await _ensure_resolved_entity_id()
+                source_entity = await knowledge_client.get_entity(resolved_entity_id)
+            except Exception as e:
+                logger.debug(f"Could not fetch source entity for extension check: {e}")
 
-            # Extract file extensions
+        if source_entity is not None:
             source_ext = (
                 source_entity.file_path.split(".")[-1] if "." in source_entity.file_path else ""
             )
@@ -494,6 +806,16 @@ move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in dest
                 logger.warning(
                     f"Move failed - file extension mismatch: source={source_ext}, dest={dest_ext}"
                 )
+                if output_format == "json":
+                    return {
+                        "moved": False,
+                        "title": source_entity.title,
+                        "permalink": source_entity.permalink,
+                        "file_path": source_entity.file_path,
+                        "source": identifier,
+                        "destination": destination_path,
+                        "error": "FILE_EXTENSION_MISMATCH",
+                    }
                 return dedent(f"""
                     # Move Failed - File Extension Mismatch
 
@@ -510,17 +832,22 @@ move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in dest
                     move_note("{identifier}", "{destination_path.rsplit(".", 1)[0]}.{source_ext}")
                     ```
                     """).strip()
-        except Exception as e:
-            # If we can't fetch the source entity, log it but continue
-            # This might happen if the identifier is not yet resolved
-            logger.debug(f"Could not fetch source entity for extension check: {e}")
 
         try:
-            # Resolve identifier to entity ID for the move operation
-            entity_id = await knowledge_client.resolve_entity(identifier)
+            # Resolve identifier only if earlier checks could not.
+            resolved_entity_id = await _ensure_resolved_entity_id()
 
             # Call the move API using KnowledgeClient
-            result = await knowledge_client.move_entity(entity_id, destination_path)
+            result = await knowledge_client.move_entity(resolved_entity_id, destination_path)
+            if output_format == "json":
+                return {
+                    "moved": True,
+                    "title": result.title,
+                    "permalink": result.permalink,
+                    "file_path": result.file_path,
+                    "source": identifier,
+                    "destination": destination_path,
+                }
 
             # Build success message
             result_lines = [
@@ -535,15 +862,23 @@ move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in dest
 
             # Log the operation
             logger.info(
-                "Move note completed",
-                identifier=identifier,
-                destination_path=destination_path,
-                project=active_project.name,
+                f"MCP tool response: tool=move_note project={active_project.name} "
+                f"source={identifier} destination={result.file_path} permalink={result.permalink}"
             )
 
             return "\n".join(result_lines)
 
         except Exception as e:
             logger.error(f"Move failed for '{identifier}' to '{destination_path}': {e}")
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": str(e),
+                }
             # Return formatted error message for better user experience
             return _format_move_error_response(str(e), identifier, destination_path)

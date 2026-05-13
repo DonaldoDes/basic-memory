@@ -7,7 +7,10 @@ This module provides service-layer dependencies:
 - SyncService, ProjectService, DirectoryService
 """
 
-from typing import Annotated
+import asyncio
+import os
+from pathlib import Path
+from typing import Annotated, Any, Callable, Coroutine, Mapping, Protocol
 
 from fastapi import Depends
 from loguru import logger
@@ -43,7 +46,6 @@ from basic_memory.services.link_resolver import LinkResolver
 from basic_memory.services.search_service import SearchService
 from basic_memory.sync import SyncService
 
-
 # --- Entity Parser ---
 
 
@@ -54,7 +56,9 @@ async def get_entity_parser(project_config: ProjectConfigDep) -> EntityParser:
 EntityParserDep = Annotated["EntityParser", Depends(get_entity_parser)]
 
 
-async def get_entity_parser_v2(project_config: ProjectConfigV2Dep) -> EntityParser:  # pragma: no cover
+async def get_entity_parser_v2(
+    project_config: ProjectConfigV2Dep,
+) -> EntityParser:  # pragma: no cover
     return EntityParser(project_config.home)
 
 
@@ -305,11 +309,13 @@ async def get_context_service(
     search_repository: SearchRepositoryDep,
     entity_repository: EntityRepositoryDep,
     observation_repository: ObservationRepositoryDep,
+    link_resolver: LinkResolverDep,
 ) -> ContextService:
     return ContextService(
         search_repository=search_repository,
         entity_repository=entity_repository,
         observation_repository=observation_repository,
+        link_resolver=link_resolver,
     )
 
 
@@ -320,12 +326,14 @@ async def get_context_service_v2(  # pragma: no cover
     search_repository: SearchRepositoryV2Dep,
     entity_repository: EntityRepositoryV2Dep,
     observation_repository: ObservationRepositoryV2Dep,
+    link_resolver: LinkResolverV2Dep,
 ) -> ContextService:
     """Create ContextService for v2 API."""
     return ContextService(
         search_repository=search_repository,
         entity_repository=entity_repository,
         observation_repository=observation_repository,
+        link_resolver=link_resolver,
     )
 
 
@@ -336,12 +344,14 @@ async def get_context_service_v2_external(
     search_repository: SearchRepositoryV2ExternalDep,
     entity_repository: EntityRepositoryV2ExternalDep,
     observation_repository: ObservationRepositoryV2ExternalDep,
+    link_resolver: LinkResolverV2ExternalDep,
 ) -> ContextService:
     """Create ContextService for v2 API (uses external_id)."""
     return ContextService(
         search_repository=search_repository,
         entity_repository=entity_repository,
         observation_repository=observation_repository,
+        link_resolver=link_resolver,
     )
 
 
@@ -428,14 +438,108 @@ async def get_sync_service_v2_external(
 SyncServiceV2ExternalDep = Annotated[SyncService, Depends(get_sync_service_v2_external)]
 
 
+# --- Background Task Scheduler ---
+
+
+class TaskScheduler(Protocol):
+    def schedule(self, task_name: str, **payload: Any) -> None:
+        """Schedule a background task by name."""
+
+
+def _log_task_failure(completed: asyncio.Task) -> None:
+    try:
+        completed.result()
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Background task failed", error=str(exc))
+
+
+class LocalTaskScheduler:
+    """Default scheduler that runs tasks in-process via asyncio.create_task.
+
+    In test mode (BASIC_MEMORY_ENV=test), tasks run as no-ops to avoid
+    background asyncio tasks racing against test teardown and causing
+    SQLite 'cannot commit transaction' errors.
+    """
+
+    def __init__(
+        self,
+        handlers: Mapping[str, Callable[..., Coroutine[Any, Any, None]]],
+        test_mode: bool | None = None,
+    ) -> None:
+        self._handlers = handlers
+        self._test_mode = (
+            test_mode if test_mode is not None else os.environ.get("BASIC_MEMORY_ENV") == "test"
+        )
+
+    def schedule(self, task_name: str, **payload: Any) -> None:
+        handler = self._handlers.get(task_name)
+        # Trigger: task name is not registered
+        # Why: avoid silently dropping background work
+        # Outcome: fail fast to surface misconfiguration
+        if not handler:
+            raise ValueError(f"Unknown task name: {task_name}")
+
+        # Trigger: running inside pytest (BASIC_MEMORY_ENV=test)
+        # Why: background create_task() outlives test fixtures and races
+        #      against engine disposal, causing flaky SQLite errors
+        # Outcome: skip background scheduling; tests exercise the sync
+        #          codepaths directly when they need to
+        if self._test_mode:
+            return
+
+        task = asyncio.create_task(handler(**payload))
+        task.add_done_callback(_log_task_failure)
+
+
+async def get_task_scheduler(
+    sync_service: SyncServiceV2ExternalDep,
+    search_service: SearchServiceV2ExternalDep,
+    project_config: ProjectConfigV2ExternalDep,
+    app_config: AppConfigDep,
+) -> TaskScheduler:
+    """Create a scheduler that maps task specs to coroutines."""
+
+    async def _sync_entity_vectors(entity_id: int, **_: Any) -> None:
+        await search_service.sync_entity_vectors(entity_id)
+
+    async def _sync_project(force_full: bool = False, **_: Any) -> None:
+        await sync_service.sync(
+            project_config.home,
+            project_config.name,
+            force_full=force_full,
+        )
+
+    async def _reindex_project(**_: Any) -> None:
+        await search_service.reindex_all()
+
+    scheduler = LocalTaskScheduler(
+        {
+            "sync_entity_vectors": _sync_entity_vectors,
+            "sync_project": _sync_project,
+            "reindex_project": _reindex_project,
+        },
+        test_mode=app_config.is_test_env,
+    )
+    return scheduler
+
+
+TaskSchedulerDep = Annotated[TaskScheduler, Depends(get_task_scheduler)]
+
+
 # --- Project Service ---
 
 
 async def get_project_service(
     project_repository: ProjectRepositoryDep,
+    app_config: AppConfigDep,
 ) -> ProjectService:
-    """Create ProjectService with repository."""
-    return ProjectService(repository=project_repository)
+    """Create ProjectService with repository and a system-level FileService for directory operations."""
+    # A system-level FileService for project directory creation (no project-specific base_path needed).
+    # ensure_directory() accepts absolute paths and ignores base_path for those, so Path.home() is safe.
+    entity_parser = EntityParser(Path.home())
+    markdown_processor = MarkdownProcessor(entity_parser, app_config=app_config)
+    file_service = FileService(Path.home(), markdown_processor, app_config=app_config)
+    return ProjectService(repository=project_repository, file_service=file_service)
 
 
 ProjectServiceDep = Annotated[ProjectService, Depends(get_project_service)]
@@ -477,4 +581,6 @@ async def get_directory_service_v2_external(
     )
 
 
-DirectoryServiceV2ExternalDep = Annotated[DirectoryService, Depends(get_directory_service_v2_external)]
+DirectoryServiceV2ExternalDep = Annotated[
+    DirectoryService, Depends(get_directory_service_v2_external)
+]

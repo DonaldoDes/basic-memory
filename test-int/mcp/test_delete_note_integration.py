@@ -19,7 +19,7 @@ async def test_delete_note_by_title(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Note to Delete",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Note to Delete\n\nThis note will be deleted.",
                 "tags": "test,delete",
             },
@@ -77,7 +77,7 @@ async def test_delete_note_by_permalink(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "Permalink Delete Test",
-                "folder": "tests",
+                "directory": "tests",
                 "content": "# Permalink Delete Test\n\nTesting deletion by permalink.",
                 "tags": "test,permalink",
             },
@@ -105,11 +105,8 @@ async def test_delete_note_by_permalink(mcp_server, app, test_project):
             },
         )
 
-        # Should have no results
-        assert (
-            '"results": []' in search_result.content[0].text
-            or '"results":[]' in search_result.content[0].text
-        )
+        # Default text format returns "No results found" when empty
+        assert "No results found" in search_result.content[0].text
 
 
 @pytest.mark.asyncio
@@ -140,7 +137,7 @@ The system handles multiple projects and users."""
             {
                 "project": test_project.name,
                 "title": "Project Management System",
-                "folder": "projects",
+                "directory": "projects",
                 "content": complex_content,
                 "tags": "project,management,system",
             },
@@ -208,7 +205,7 @@ async def test_delete_note_special_characters_in_title(mcp_server, app, test_pro
                 {
                     "project": test_project.name,
                     "title": title,
-                    "folder": "special",
+                    "directory": "special",
                     "content": f"# {title}\n\nContent for {title}",
                     "tags": "special,characters",
                 },
@@ -275,7 +272,7 @@ async def test_delete_note_by_file_path(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "File Path Delete",
-                "folder": "docs",
+                "directory": "docs",
                 "content": "# File Path Delete\n\nTesting deletion by file path.",
                 "tags": "test,filepath",
             },
@@ -310,8 +307,13 @@ async def test_delete_note_by_file_path(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_delete_note_case_insensitive(mcp_server, app, test_project):
-    """Test that note deletion is case insensitive for titles."""
+async def test_delete_note_rejects_case_mismatch(mcp_server, app, test_project):
+    """Test that delete_note with wrong case does not fuzzy-match to an existing note.
+
+    Strict resolution (#649) prevents destructive operations from silently
+    resolving to a different note via fuzzy search. Case-mismatched titles
+    should be rejected, not resolved to the nearest match.
+    """
 
     async with Client(mcp_server) as client:
         # Create a note with mixed case
@@ -320,13 +322,13 @@ async def test_delete_note_case_insensitive(mcp_server, app, test_project):
             {
                 "project": test_project.name,
                 "title": "CamelCase Note Title",
-                "folder": "test",
+                "directory": "test",
                 "content": "# CamelCase Note Title\n\nTesting case sensitivity.",
                 "tags": "test,case",
             },
         )
 
-        # Try to delete with different case
+        # Try to delete with different case — should NOT find the note
         delete_result = await client.call_tool(
             "delete_note",
             {
@@ -335,8 +337,28 @@ async def test_delete_note_case_insensitive(mcp_server, app, test_project):
             },
         )
 
-        # Should return True for successful deletion
-        assert "true" in delete_result.content[0].text.lower()
+        # Should return False (not found) — strict mode rejects fuzzy matches
+        assert "false" in delete_result.content[0].text.lower()
+
+        # Verify the note still exists using the exact title
+        read_result = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": "CamelCase Note Title",
+            },
+        )
+        assert "Testing case sensitivity" in read_result.content[0].text
+
+        # Delete with exact title should succeed
+        delete_result2 = await client.call_tool(
+            "delete_note",
+            {
+                "project": test_project.name,
+                "identifier": "CamelCase Note Title",
+            },
+        )
+        assert "true" in delete_result2.content[0].text.lower()
 
 
 @pytest.mark.asyncio
@@ -359,7 +381,7 @@ async def test_delete_multiple_notes_sequentially(mcp_server, app, test_project)
                 {
                     "project": test_project.name,
                     "title": title,
-                    "folder": "batch",
+                    "directory": "batch",
                     "content": f"# {title}\n\nContent for {title}",
                     "tags": "batch,test",
                 },
@@ -387,11 +409,8 @@ async def test_delete_multiple_notes_sequentially(mcp_server, app, test_project)
             },
         )
 
-        # Should have no results
-        assert (
-            '"results": []' in search_result.content[0].text
-            or '"results":[]' in search_result.content[0].text
-        )
+        # Default text format returns "No results found" when empty
+        assert "No results found" in search_result.content[0].text
 
 
 @pytest.mark.asyncio
@@ -421,7 +440,7 @@ This note contains various Unicode characters:
             {
                 "project": test_project.name,
                 "title": "Unicode Test Note",
-                "folder": "unicode",
+                "directory": "unicode",
                 "content": unicode_content,
                 "tags": "unicode,test,emoji",
             },

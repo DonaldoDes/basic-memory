@@ -1,10 +1,10 @@
 """Test general sync behavior."""
 
 import asyncio
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
+from typing import Any, cast
 
 import pytest
 
@@ -15,6 +15,7 @@ from basic_memory.schemas.search import SearchQuery
 from basic_memory.services import EntityService, FileService
 from basic_memory.services.search_service import SearchService
 from basic_memory.sync.sync_service import SyncService
+from basic_memory.utils import generate_permalink
 
 
 async def create_test_file(path: Path, content: str = "test content") -> None:
@@ -75,7 +76,8 @@ type: knowledge
     await sync_service.sync(project_config.home)
 
     # Verify forward reference
-    source = await entity_service.get_by_permalink("source")
+    project_prefix = generate_permalink(project_config.name)
+    source = await entity_service.get_by_permalink(f"{project_prefix}/source")
     assert len(source.relations) == 1
     assert source.relations[0].to_id is None
     assert source.relations[0].to_name == "target-doc"
@@ -99,8 +101,8 @@ Target content
     await sync_service.sync(project_config.home)
 
     # Verify reference is now resolved
-    source = await entity_service.get_by_permalink("source")
-    target = await entity_service.get_by_permalink("target-doc")
+    source = await entity_service.get_by_permalink(f"{project_prefix}/source")
+    target = await entity_service.get_by_permalink(f"{project_prefix}/target-doc")
     assert len(source.relations) == 1
     assert source.relations[0].to_id == target.id
     assert source.relations[0].to_name == target.title
@@ -145,8 +147,9 @@ Content
     # Sync to create both entities
     await sync_service.sync(project_config.home)
 
-    source = await entity_service.get_by_permalink("source")
-    target = await entity_service.get_by_permalink("target")
+    project_prefix = generate_permalink(project_config.name)
+    source = await entity_service.get_by_permalink(f"{project_prefix}/source")
+    target = await entity_service.get_by_permalink(f"{project_prefix}/target")
 
     # Create a resolved relation (already exists) that the unresolved one would become.
     resolved_relation = Relation(
@@ -168,7 +171,7 @@ Content
     unresolved_id = unresolved_relation.id
 
     # Verify we have the unresolved relation
-    source = await entity_service.get_by_permalink("source")
+    source = await entity_service.get_by_permalink(f"{project_prefix}/source")
     unresolved_outgoing = [r for r in source.outgoing_relations if r.to_id is None]
     assert len(unresolved_outgoing) == 1
     assert unresolved_outgoing[0].id == unresolved_id
@@ -187,7 +190,7 @@ Content
     assert len(unresolved) == 0
 
     # Verify only the resolved relation remains
-    source = await entity_service.get_by_permalink("source")
+    source = await entity_service.get_by_permalink(f"{project_prefix}/source")
     assert len(source.outgoing_relations) == 1
     assert source.outgoing_relations[0].to_id == target.id
 
@@ -225,7 +228,7 @@ A test concept.
     other = Entity(
         permalink="concept/other",
         title="Other",
-        entity_type="test",
+        note_type="test",
         file_path="concept/other.md",
         checksum="12345678",
         content_type="text/markdown",
@@ -243,7 +246,7 @@ A test concept.
 
     # Find new entity
     test_concept = next(e for e in entities if e.permalink == "concept/test-concept")
-    assert test_concept.entity_type == "knowledge"
+    assert test_concept.note_type == "knowledge"
 
     # Verify relation was created
     # with forward link
@@ -643,6 +646,7 @@ async def test_permalink_formatting(
     sync_service: SyncService, project_config: ProjectConfig, entity_service: EntityService
 ):
     """Test that permalinks are properly formatted during sync."""
+    project_prefix = generate_permalink(project_config.name)
 
     # Test cases with different filename formats
     test_files = {
@@ -676,8 +680,9 @@ Testing permalink generation.
     for filename, expected_permalink in test_files.items():
         # Find entity for this file
         entity = next(e for e in entities if e.file_path == filename)
-        assert entity.permalink == expected_permalink, (
-            f"File {filename} should have permalink {expected_permalink}"
+        expected_full_permalink = f"{project_prefix}/{expected_permalink}"
+        assert entity.permalink == expected_full_permalink, (
+            f"File {filename} should have permalink {expected_full_permalink}"
         )
 
 
@@ -744,12 +749,13 @@ Testing file timestamps
     await sync_service.sync(project_config.home)
 
     # Check explicit frontmatter dates
-    explicit_entity = await entity_service.get_by_permalink("explicit-dates")
+    project_prefix = generate_permalink(project_config.name)
+    explicit_entity = await entity_service.get_by_permalink(f"{project_prefix}/explicit-dates")
     assert explicit_entity.created_at is not None
     assert explicit_entity.updated_at is not None
 
     # Check file timestamps
-    file_entity = await entity_service.get_by_permalink("file-dates3")
+    file_entity = await entity_service.get_by_permalink(f"{project_prefix}/file-dates3")
     file_stats = file_path.stat()
 
     # Compare using epoch timestamps to handle timezone differences correctly
@@ -757,10 +763,11 @@ Testing file timestamps
     entity_created_epoch = file_entity.created_at.timestamp()
     entity_updated_epoch = file_entity.updated_at.timestamp()
 
-    # Allow 2s difference on Windows due to filesystem timing precision
-    tolerance = 2 if os.name == "nt" else 1
+    # Allow 2s difference due to filesystem timing precision and database processing delays
+    # Windows has coarser filesystem timestamps, but Postgres can also have slight timing differences
+    tolerance = 2
     assert abs(entity_created_epoch - file_stats.st_ctime) < tolerance
-    assert abs(entity_updated_epoch - file_stats.st_mtime) < tolerance  # Allow tolerance difference
+    assert abs(entity_updated_epoch - file_stats.st_mtime) < tolerance
 
 
 @pytest.mark.asyncio
@@ -793,7 +800,8 @@ Initial content for timestamp test
     await sync_service.sync(project_config.home)
 
     # Get initial entity and timestamps
-    entity_before = await entity_service.get_by_permalink("timestamp-test")
+    project_prefix = generate_permalink(project_config.name)
+    entity_before = await entity_service.get_by_permalink(f"{project_prefix}/timestamp-test")
     initial_updated_at = entity_before.updated_at
 
     # Modify the file content and update mtime to be newer than watermark
@@ -824,7 +832,7 @@ Modified content for timestamp test
     await sync_service.sync(project_config.home)
 
     # Get entity after re-sync
-    entity_after = await entity_service.get_by_permalink("timestamp-test")
+    entity_after = await entity_service.get_by_permalink(f"{project_prefix}/timestamp-test")
 
     # Verify that updated_at changed
     assert entity_after.updated_at != initial_updated_at, (
@@ -835,8 +843,8 @@ Modified content for timestamp test
     entity_updated_epoch = entity_after.updated_at.timestamp()
     file_mtime = file_stats_after_modification.st_mtime
 
-    # Allow 2s difference on Windows due to filesystem timing precision
-    tolerance = 2 if os.name == "nt" else 1
+    # Allow 2s difference due to filesystem timing precision and sync processing delays
+    tolerance = 2
     assert abs(entity_updated_epoch - file_mtime) < tolerance, (
         f"Entity updated_at ({entity_after.updated_at}) should match file mtime "
         f"({datetime.fromtimestamp(file_mtime)}) within {tolerance}s tolerance"
@@ -900,7 +908,7 @@ async def test_sync_null_checksum_cleanup(
     entity = Entity(
         permalink="concept/incomplete",
         title="Incomplete",
-        entity_type="test",
+        note_type="test",
         file_path="concept/incomplete.md",
         checksum=None,  # Null checksum
         content_type="text/markdown",
@@ -938,6 +946,7 @@ async def test_sync_permalink_resolved(
 ):
     """Test that we resolve duplicate permalinks on sync ."""
     project_dir = project_config.home
+    project_prefix = generate_permalink(project_config.name)
 
     # Create initial file
     content = """
@@ -967,13 +976,13 @@ Content for move test
     await sync_service.sync(project_config.home)
 
     file_content, _ = await file_service.read_file(new_path)
-    assert "permalink: new/moved-file" in file_content
+    assert f"permalink: {project_prefix}/new/moved-file" in file_content
 
     # Create another that has the same permalink
-    content = """
+    content = f"""
 ---
 type: knowledge
-permalink: new/moved-file
+permalink: {project_prefix}/new/moved-file
 ---
 # Test Move
 Content for move test
@@ -991,7 +1000,7 @@ Content for move test
 
     # assert permalink is unique
     file_content, _ = await file_service.read_file(old_path)
-    assert "permalink: new/moved-file-1" in file_content
+    assert f"permalink: {project_prefix}/new/moved-file-1" in file_content
 
 
 @pytest.mark.asyncio
@@ -1093,8 +1102,11 @@ async def test_sync_permalink_not_created_if_no_frontmatter(
     sync_service: SyncService,
     project_config: ProjectConfig,
     file_service: FileService,
+    app_config: BasicMemoryConfig,
 ):
-    """Test that sync resolves permalink conflicts on update."""
+    """Test that sync does not add frontmatter when ensure_frontmatter_on_sync is disabled."""
+    app_config.ensure_frontmatter_on_sync = False
+
     project_dir = project_config.home
 
     file = project_dir / "one.md"
@@ -1106,6 +1118,59 @@ async def test_sync_permalink_not_created_if_no_frontmatter(
     # Check permalink not created
     file_content, _ = await file_service.read_file(file)
     assert "permalink:" not in file_content
+
+
+@pytest.mark.asyncio
+async def test_sync_frontmatter_created_if_missing_when_enabled(
+    sync_service: SyncService,
+    project_config: ProjectConfig,
+    file_service: FileService,
+    app_config: BasicMemoryConfig,
+):
+    """Sync should add derived frontmatter when configured for missing-frontmatter files."""
+    app_config.ensure_frontmatter_on_sync = True
+
+    project_dir = project_config.home
+    file = project_dir / "one.md"
+    await create_test_file(file, "# One\n")
+
+    await sync_service.sync(project_config.home)
+
+    file_content, _ = await file_service.read_file(file)
+    project_prefix = generate_permalink(project_config.name)
+    assert "title: one" in file_content
+    assert "type: note" in file_content
+    assert f"permalink: {project_prefix}/one" in file_content
+
+    entity = await sync_service.entity_repository.get_by_file_path("one.md")
+    assert entity is not None
+    assert entity.permalink == f"{project_prefix}/one"
+
+
+@pytest.mark.asyncio
+async def test_sync_frontmatter_created_if_missing_overrides_disable_permalinks(
+    sync_service: SyncService,
+    project_config: ProjectConfig,
+    file_service: FileService,
+    app_config: BasicMemoryConfig,
+):
+    """Missing-frontmatter sync path should write permalink even when disable_permalinks is true."""
+    app_config.ensure_frontmatter_on_sync = True
+    app_config.disable_permalinks = True
+
+    project_dir = project_config.home
+    file = project_dir / "override.md"
+    await create_test_file(file, "# Override\n")
+
+    await sync_service.sync(project_config.home)
+
+    file_content, _ = await file_service.read_file(file)
+    project_prefix = generate_permalink(project_config.name)
+    assert f"permalink: {project_prefix}/override" in file_content
+
+    entity = await sync_service.entity_repository.get_by_file_path("override.md")
+    assert entity is not None
+    assert entity.permalink == f"{project_prefix}/override"
 
 
 @pytest.fixture
@@ -1124,6 +1189,7 @@ async def test_sync_permalink_updated_on_move(
 ):
     """Test that we update a permalink on a file move if set in config ."""
     project_dir = project_config.home
+    project_prefix = generate_permalink(project_config.name)
 
     # Create initial file
     content = dedent(
@@ -1145,7 +1211,7 @@ async def test_sync_permalink_updated_on_move(
 
     # verify permalink
     old_content, _ = await file_service.read_file(old_path)
-    assert "permalink: old/test-move" in old_content
+    assert f"permalink: {project_prefix}/old/test-move" in old_content
 
     # Move the file
     new_path = project_dir / "new" / "moved_file.md"
@@ -1160,7 +1226,7 @@ async def test_sync_permalink_updated_on_move(
     await sync_service.sync(project_config.home)
 
     file_content, _ = await file_service.read_file(new_path)
-    assert "permalink: new/moved-file" in file_content
+    assert f"permalink: {project_prefix}/new/moved-file" in file_content
 
 
 @pytest.mark.asyncio
@@ -1301,6 +1367,7 @@ async def test_sync_relation_to_non_markdown_file(
 ):
     """Test that sync resolves permalink conflicts on update."""
     project_dir = project_config.home
+    project_prefix = generate_permalink(project_config.name)
 
     content = f"""
 ---
@@ -1325,7 +1392,7 @@ tags: []
 title: a note
 type: note
 tags: []
-permalink: note
+permalink: {project_prefix}/note
 ---
 
 - relates_to [[{test_files["pdf"].name}]]
@@ -1358,7 +1425,7 @@ This is a test file for race condition handling.
     # on the "add" call (same effect as the race-condition branch).
     await sync_service.entity_repository.add(
         Entity(
-            entity_type="file",
+            note_type="file",
             file_path=rel_path,
             checksum="old_checksum",
             title="Test Race Condition",
@@ -1692,3 +1759,60 @@ async def test_sync_handles_file_not_found_gracefully(
     # Entity should be deleted from database
     entity = await sync_service.entity_repository.get_by_file_path("missing_file.md")
     assert entity is None, "Orphaned entity should be deleted when file is not found"
+
+
+@pytest.mark.asyncio
+async def test_sync_file_continues_on_semantic_dependency_error(
+    sync_service: SyncService, project_config: ProjectConfig
+):
+    """Test that sync_file returns the entity even when vector embedding fails.
+
+    When sqlite-vec or another semantic dependency is missing, FTS indexing
+    still succeeds. The entity should be returned successfully with a warning,
+    not treated as a file-level failure.
+    """
+    from unittest.mock import AsyncMock
+
+    from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+
+    project_dir = project_config.home
+    content = """---
+type: note
+---
+# Semantic Error Test
+
+## Observations
+- [test] This entity should still be synced despite embedding failure
+"""
+    await create_test_file(project_dir / "semantic_test.md", content)
+    await sync_service.sync(project_dir)
+
+    # Patch index_entity to raise SemanticDependenciesMissingError
+    search_service_mock = cast(Any, sync_service.search_service)
+    original_index = search_service_mock.index_entity
+    call_count = 0
+
+    async def index_with_semantic_error(entity, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise SemanticDependenciesMissingError("sqlite-vec package is missing")
+
+    search_service_mock.index_entity = AsyncMock(side_effect=index_with_semantic_error)
+
+    try:
+        # Modify the file so it gets re-synced
+        await create_test_file(
+            project_dir / "semantic_test.md",
+            content.replace("should still be synced", "updated content"),
+        )
+
+        entity, checksum = await sync_service.sync_file("semantic_test.md", new=False)
+
+        # Entity should be returned successfully despite semantic error
+        assert entity is not None, "Entity should be returned even when embedding fails"
+        assert checksum is not None
+
+        # Verify circuit breaker was NOT triggered (failure not recorded)
+        assert "semantic_test.md" not in sync_service._file_failures
+    finally:
+        search_service_mock.index_entity = original_index

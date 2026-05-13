@@ -6,6 +6,8 @@ test config + dual-backend fixtures.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from basic_memory import db
@@ -13,7 +15,9 @@ from basic_memory.config import BasicMemoryConfig, DatabaseBackend
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.services.initialization import (
     ensure_initialization,
+    initialize_app,
     initialize_database,
+    initialize_file_sync,
     reconcile_projects_with_config,
 )
 
@@ -37,11 +41,15 @@ async def test_initialize_database_creates_engine_and_allows_queries(app_config:
 
 
 @pytest.mark.asyncio
-async def test_initialize_database_raises_on_invalid_postgres_config(app_config: BasicMemoryConfig, config_manager):
+async def test_initialize_database_raises_on_invalid_postgres_config(
+    app_config: BasicMemoryConfig, config_manager
+):
     """If config selects Postgres but has no DATABASE_URL, initialization should fail."""
     await db.shutdown_db()
     try:
-        bad_config = app_config.model_copy(update={"database_backend": DatabaseBackend.POSTGRES, "database_url": None})
+        bad_config = app_config.model_copy(
+            update={"database_backend": DatabaseBackend.POSTGRES, "database_url": None}
+        )
         config_manager.save_config(bad_config)
 
         with pytest.raises(ValueError):
@@ -62,9 +70,14 @@ async def test_reconcile_projects_with_config_creates_projects_and_default(
         proj_a.mkdir(parents=True, exist_ok=True)
         proj_b.mkdir(parents=True, exist_ok=True)
 
+        from basic_memory.config import ProjectEntry
+
         updated = app_config.model_copy(
             update={
-                "projects": {"proj-a": str(proj_a), "proj-b": str(proj_b)},
+                "projects": {
+                    "proj-a": ProjectEntry(path=str(proj_a)),
+                    "proj-b": ProjectEntry(path=str(proj_b)),
+                },
                 "default_project": "proj-b",
             }
         )
@@ -74,7 +87,9 @@ async def test_reconcile_projects_with_config_creates_projects_and_default(
         await initialize_database(updated)
         await reconcile_projects_with_config(updated)
 
-        _, session_maker = await db.get_or_create_db(updated.database_path, db_type=db.DatabaseType.FILESYSTEM)
+        _, session_maker = await db.get_or_create_db(
+            updated.database_path, db_type=db.DatabaseType.FILESYSTEM
+        )
         repo = ProjectRepository(session_maker)
 
         active = await repo.get_active_projects()
@@ -89,7 +104,9 @@ async def test_reconcile_projects_with_config_creates_projects_and_default(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_projects_with_config_swallow_errors(monkeypatch, app_config: BasicMemoryConfig):
+async def test_reconcile_projects_with_config_swallow_errors(
+    monkeypatch, app_config: BasicMemoryConfig
+):
     """reconcile_projects_with_config should not raise if ProjectService sync fails."""
     await db.shutdown_db()
     try:
@@ -118,3 +135,119 @@ def test_ensure_initialization_runs_and_cleans_up(app_config: BasicMemoryConfig,
     assert db._session_maker is None  # pyright: ignore [reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+async def test_initialize_app_warns_on_frontmatter_permalink_precedence(
+    app_config: BasicMemoryConfig, monkeypatch
+):
+    app_config.database_backend = DatabaseBackend.SQLITE
+    app_config.ensure_frontmatter_on_sync = True
+    app_config.disable_permalinks = True
+
+    init_db_mock = AsyncMock()
+    reconcile_mock = AsyncMock()
+    monkeypatch.setattr("basic_memory.services.initialization.initialize_database", init_db_mock)
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config",
+        reconcile_mock,
+    )
+
+    warnings: list[str] = []
+
+    def capture_warning(message: str) -> None:
+        warnings.append(message)
+
+    monkeypatch.setattr("basic_memory.services.initialization.logger.warning", capture_warning)
+
+    await initialize_app(app_config)
+
+    assert init_db_mock.await_count == 1
+    assert reconcile_mock.await_count == 1
+    assert any(
+        "ensure_frontmatter_on_sync=True overrides disable_permalinks=True" in message
+        for message in warnings
+    )
+
+
+class _FakeWatchService:
+    """Captures init kwargs so tests can assert what the real service receives."""
+
+    last_kwargs: dict[str, object] = {}
+
+    def __init__(self, **kwargs):
+        _FakeWatchService.last_kwargs = kwargs
+
+    async def run(self):
+        return None
+
+
+def _disable_test_env_short_circuit(monkeypatch) -> None:
+    """Bypass ``is_test_env`` so ``initialize_file_sync`` actually runs.
+
+    ``is_test_env`` returns True whenever pytest is running, which would cause
+    ``initialize_file_sync`` to return before constructing a WatchService.
+    """
+    monkeypatch.setattr(BasicMemoryConfig, "is_test_env", property(lambda self: False))
+
+
+@pytest.mark.asyncio
+async def test_initialize_file_sync_passes_constrained_project_to_watch_service(
+    app_config: BasicMemoryConfig, monkeypatch
+):
+    """``BASIC_MEMORY_MCP_PROJECT`` must reach the watch service, not just the
+    one-shot background sync. Otherwise multiple ``basic-memory mcp --project X``
+    processes each spawn a watcher over every project and race on file writes.
+    """
+    _disable_test_env_short_circuit(monkeypatch)
+    monkeypatch.setenv("BASIC_MEMORY_MCP_PROJECT", "target-project")
+    monkeypatch.setattr("basic_memory.sync.WatchService", _FakeWatchService)
+    _FakeWatchService.last_kwargs = {}
+
+    await initialize_file_sync(app_config, quiet=True)
+
+    assert _FakeWatchService.last_kwargs.get("constrained_project") == "target-project"
+
+
+@pytest.mark.asyncio
+async def test_initialize_file_sync_no_constraint_when_env_unset(
+    app_config: BasicMemoryConfig, monkeypatch
+):
+    """With no env var set, the watch service is unconstrained."""
+    _disable_test_env_short_circuit(monkeypatch)
+    monkeypatch.delenv("BASIC_MEMORY_MCP_PROJECT", raising=False)
+    monkeypatch.setattr("basic_memory.sync.WatchService", _FakeWatchService)
+    _FakeWatchService.last_kwargs = {}
+
+    await initialize_file_sync(app_config, quiet=True)
+
+    assert _FakeWatchService.last_kwargs.get("constrained_project") is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_app_no_precedence_warning_when_not_conflicting(
+    app_config: BasicMemoryConfig, monkeypatch
+):
+    app_config.ensure_frontmatter_on_sync = False
+    app_config.disable_permalinks = True
+
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.initialize_database",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config",
+        AsyncMock(),
+    )
+
+    warnings: list[str] = []
+
+    def capture_warning(message: str) -> None:
+        warnings.append(message)
+
+    monkeypatch.setattr("basic_memory.services.initialization.logger.warning", capture_warning)
+
+    await initialize_app(app_config)
+
+    assert not any(
+        "ensure_frontmatter_on_sync=True overrides disable_permalinks=True" in message
+        for message in warnings
+    )

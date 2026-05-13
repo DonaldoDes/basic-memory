@@ -9,6 +9,7 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Query, Path
 from loguru import logger
 
+import logfire
 from basic_memory.deps import ContextServiceV2ExternalDep, EntityRepositoryV2ExternalDep
 from basic_memory.schemas.base import TimeFrame, parse_timeframe
 from basic_memory.schemas.memory import (
@@ -16,7 +17,7 @@ from basic_memory.schemas.memory import (
     normalize_memory_url,
 )
 from basic_memory.schemas.search import SearchItemType
-from basic_memory.api.routers.utils import to_graph_context
+from basic_memory.api.v2.utils import to_graph_context
 
 # Note: No prefix here - it's added during registration as /v2/{project_id}/memory
 router = APIRouter(tags=["memory"])
@@ -50,30 +51,55 @@ async def recent(
     Returns:
         GraphContext with recent activity and related entities
     """
-    # return all types by default
-    types = (
-        [SearchItemType.ENTITY, SearchItemType.RELATION, SearchItemType.OBSERVATION]
-        if not type
-        else type
-    )
+    with logfire.span(
+        "api.request.memory.recent_activity",
+        entrypoint="api",
+        domain="memory",
+        action="recent_activity",
+        page=page,
+        page_size=page_size,
+    ):
+        types = (
+            [SearchItemType.ENTITY, SearchItemType.RELATION, SearchItemType.OBSERVATION]
+            if not type
+            else type
+        )
 
-    logger.debug(
-        f"V2 Getting recent context for project {project_id}: `{types}` depth: `{depth}` timeframe: `{timeframe}` page: `{page}` page_size: `{page_size}` max_related: `{max_related}`"
-    )
-    # Parse timeframe
-    since = parse_timeframe(timeframe)
-    limit = page_size
-    offset = (page - 1) * page_size
+        logger.debug(
+            f"V2 Getting recent context for project {project_id}: `{types}` depth: `{depth}` timeframe: `{timeframe}` page: `{page}` page_size: `{page_size}` max_related: `{max_related}`"
+        )
+        since = parse_timeframe(timeframe)
+        limit = page_size
+        offset = (page - 1) * page_size
 
-    # Build context
-    context = await context_service.build_context(
-        types=types, depth=depth, since=since, limit=limit, offset=offset, max_related=max_related
-    )
-    recent_context = await to_graph_context(
-        context, entity_repository=entity_repository, page=page, page_size=page_size
-    )
-    logger.debug(f"V2 Recent context: {recent_context.model_dump_json()}")
-    return recent_context
+        with logfire.span(
+            "api.memory.recent_activity.build_context",
+            domain="memory",
+            action="recent_activity",
+            phase="build_context",
+            page=page,
+            page_size=page_size,
+        ):
+            context = await context_service.build_context(
+                types=types,
+                depth=depth,
+                since=since,
+                limit=limit,
+                offset=offset,
+                max_related=max_related,
+            )
+        with logfire.span(
+            "api.memory.recent_activity.shape_response",
+            domain="memory",
+            action="recent_activity",
+            phase="shape_response",
+            result_count=len(context.results),
+        ):
+            recent_context = await to_graph_context(
+                context, entity_repository=entity_repository, page=page, page_size=page_size
+            )
+        logger.debug(f"V2 Recent context: {recent_context.model_dump_json()}")
+        return recent_context
 
 
 # get_memory_context needs to be declared last so other paths can match
@@ -111,20 +137,46 @@ async def get_memory_context(
     Returns:
         GraphContext with the entity and its related context
     """
-    logger.debug(
-        f"V2 Getting context for project {project_id}, URI: `{uri}` depth: `{depth}` timeframe: `{timeframe}` page: `{page}` page_size: `{page_size}` max_related: `{max_related}`"
-    )
-    memory_url = normalize_memory_url(uri)
+    with logfire.span(
+        "api.request.memory.build_context",
+        entrypoint="api",
+        domain="memory",
+        action="build_context",
+        page=page,
+        page_size=page_size,
+    ):
+        logger.debug(
+            f"V2 Getting context for project {project_id}, URI: `{uri}` depth: `{depth}` timeframe: `{timeframe}` page: `{page}` page_size: `{page_size}` max_related: `{max_related}`"
+        )
+        memory_url = normalize_memory_url(uri)
 
-    # Parse timeframe
-    since = parse_timeframe(timeframe) if timeframe else None
-    limit = page_size
-    offset = (page - 1) * page_size
+        since = parse_timeframe(timeframe) if timeframe else None
+        limit = page_size
+        offset = (page - 1) * page_size
 
-    # Build context
-    context = await context_service.build_context(
-        memory_url, depth=depth, since=since, limit=limit, offset=offset, max_related=max_related
-    )
-    return await to_graph_context(
-        context, entity_repository=entity_repository, page=page, page_size=page_size
-    )
+        with logfire.span(
+            "api.memory.build_context.build_context",
+            domain="memory",
+            action="build_context",
+            phase="build_context",
+            page=page,
+            page_size=page_size,
+        ):
+            context = await context_service.build_context(
+                memory_url,
+                depth=depth,
+                since=since,
+                limit=limit,
+                offset=offset,
+                max_related=max_related,
+            )
+        with logfire.span(
+            "api.memory.build_context.shape_response",
+            domain="memory",
+            action="build_context",
+            phase="shape_response",
+            result_count=len(context.results),
+        ):
+            return await to_graph_context(
+                context, entity_repository=entity_repository, page=page, page_size=page_size
+            )

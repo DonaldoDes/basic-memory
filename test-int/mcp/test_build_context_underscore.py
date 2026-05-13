@@ -15,7 +15,7 @@ async def test_build_context_underscore_normalization(mcp_server, app, test_proj
             {
                 "project": test_project.name,
                 "title": "Parent Entity",
-                "folder": "testing",
+                "directory": "testing",
                 "content": "# Parent Entity\n\nMain entity for testing underscore relations.",
                 "tags": "test,parent",
             },
@@ -27,7 +27,7 @@ async def test_build_context_underscore_normalization(mcp_server, app, test_proj
             {
                 "project": test_project.name,
                 "title": "Child with Underscore",
-                "folder": "testing",
+                "directory": "testing",
                 "content": """# Child with Underscore
 
 - part_of [[Parent Entity]]
@@ -42,7 +42,7 @@ async def test_build_context_underscore_normalization(mcp_server, app, test_proj
             {
                 "project": test_project.name,
                 "title": "Child with Hyphen",
-                "folder": "testing",
+                "directory": "testing",
                 "content": """# Child with Hyphen
 
 - part-of [[Parent Entity]]
@@ -99,7 +99,8 @@ async def test_build_context_underscore_normalization(mcp_server, app, test_proj
         assert "related-to" in response_text_related.lower()
 
         # Test 4: Test exact path (non-wildcard) with underscore
-        # Exact relation permalink would be child/relation/target
+        # Previously this returned empty (no exact permalink match). Now LinkResolver
+        # resolves to the child entity, so we get its relations back.
         result_exact = await client.call_tool(
             "build_context",
             {
@@ -110,7 +111,8 @@ async def test_build_context_underscore_normalization(mcp_server, app, test_proj
 
         response_text_exact = result_exact.content[0].text  # pyright: ignore
         assert '"results"' in response_text_exact
-        assert "part-of" in response_text_exact.lower()
+        # LinkResolver resolves to child-with-underscore entity; its relation_type is "part_of"
+        assert "part_of" in response_text_exact.lower()
 
 
 @pytest.mark.asyncio
@@ -124,7 +126,7 @@ async def test_build_context_complex_underscore_paths(mcp_server, app, test_proj
             {
                 "project": test_project.name,
                 "title": "workflow_manager_agent",
-                "folder": "specs",
+                "directory": "specs",
                 "content": """# Workflow Manager Agent
 
 Specification for the workflow manager agent.
@@ -138,7 +140,7 @@ Specification for the workflow manager agent.
             {
                 "project": test_project.name,
                 "title": "task_parser",
-                "folder": "components",
+                "directory": "components",
                 "content": """# Task Parser
 
 - part_of [[workflow_manager_agent]]

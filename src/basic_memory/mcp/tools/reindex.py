@@ -12,7 +12,6 @@ from loguru import logger
 from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.server import mcp
 from basic_memory.mcp.project_context import get_active_project
-from basic_memory.telemetry import track_mcp_tool
 
 
 @mcp.tool("force_reindex")
@@ -46,8 +45,6 @@ async def force_reindex(
         force_reindex()
         force_reindex(project="my-project")
     """
-    track_mcp_tool("force_reindex")
-
     async with get_client() as client:
         if context:  # pragma: no cover
             await context.info("Starting full reindex of search index")

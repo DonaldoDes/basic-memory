@@ -26,7 +26,7 @@ async def search_entity(session_maker, test_project: Project):
         entity = Entity(
             project_id=test_project.id,
             title="Search Test Entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/search-test-entity",
             file_path="test/search_test_entity.md",
             content_type="text/markdown",
@@ -68,7 +68,7 @@ async def second_entity(session_maker, second_project: Project):
         entity = Entity(
             project_id=second_project.id,
             title="Second Project Entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/second-project-entity",
             file_path="test/second_project_entity.md",
             content_type="text/markdown",
@@ -108,6 +108,78 @@ async def test_init_search_index(search_repository, app_config):
 
 
 @pytest.mark.asyncio
+async def test_init_search_index_degrades_when_extension_loading_unavailable(
+    search_repository, monkeypatch
+):
+    """Regression for #711: when sqlite-vec cannot be loaded (e.g. python.org Python
+    3.12 ships sqlite3 without enable_load_extension), init must NOT crash. It should
+    log a warning, mark the repository as semantic-disabled, and let the rest of the
+    process come up so Claude Desktop's MCP handshake completes."""
+    if is_postgres_backend(search_repository):
+        pytest.skip("python.org enable_load_extension issue is SQLite-specific")
+
+    from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+
+    # Force the codepath even if semantic_search wasn't enabled by default.
+    search_repository._semantic_enabled = True
+
+    async def _raise_missing():
+        raise SemanticDependenciesMissingError("simulated: enable_load_extension missing")
+
+    monkeypatch.setattr(search_repository, "_ensure_vector_tables", _raise_missing)
+
+    # Must not raise — startup needs to complete even when the semantic stack is dead.
+    await search_repository.init_search_index()
+
+    assert search_repository._semantic_enabled is False, (
+        "Repository should mark itself semantic-disabled after a missing-deps error "
+        "so downstream calls short-circuit cleanly instead of re-attempting load."
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_sqlite_vec_loaded_raises_typed_error_without_extension_support(
+    search_repository, monkeypatch
+):
+    """Regression for #711: AttributeError from a sqlite3.Connection that lacks
+    enable_load_extension must surface as SemanticDependenciesMissingError so the
+    init-time handler can degrade. Otherwise the AttributeError bubbles through and
+    crashes startup before Claude Desktop completes its handshake."""
+    if is_postgres_backend(search_repository):
+        pytest.skip("enable_load_extension is SQLite-specific")
+
+    from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+    from sqlalchemy.exc import OperationalError as SAOperationalError
+
+    # Stub session that always reports vec missing on probe, then yields a connection
+    # whose driver_connection has no enable_load_extension attribute (mirroring the
+    # python.org sqlite3 build).
+    class _StubDriverConnection:
+        # Deliberately omit enable_load_extension to mimic the python.org build.
+        pass
+
+    class _StubRawConnection:
+        driver_connection = _StubDriverConnection()
+
+    class _StubAsyncConnection:
+        async def get_raw_connection(self):
+            return _StubRawConnection()
+
+    class _StubSession:
+        async def execute(self, _stmt):
+            # First (and any) probe call reports vec missing.
+            raise SAOperationalError("SELECT vec_version()", {}, Exception("no vec"))
+
+        async def connection(self):
+            return _StubAsyncConnection()
+
+    with pytest.raises(SemanticDependenciesMissingError) as exc_info:
+        await search_repository._ensure_sqlite_vec_loaded(_StubSession())
+
+    assert "enable_load_extension" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_init_search_index_preserves_data(search_repository, search_entity):
     """Regression test: calling init_search_index() twice should preserve indexed data.
 
@@ -128,7 +200,7 @@ async def test_init_search_index_preserves_data(search_repository, search_entity
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -162,7 +234,7 @@ async def test_index_item(search_repository, search_entity):
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -197,7 +269,7 @@ async def test_index_item_upsert_on_duplicate_permalink(search_repository, searc
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -220,7 +292,7 @@ async def test_index_item_upsert_on_duplicate_permalink(search_repository, searc
         permalink=search_entity.permalink,  # Same permalink!
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -254,7 +326,7 @@ async def test_bulk_index_items_upsert_on_duplicate_permalink(search_repository,
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -276,7 +348,7 @@ async def test_bulk_index_items_upsert_on_duplicate_permalink(search_repository,
         permalink=search_entity.permalink,  # Same permalink!
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -305,7 +377,7 @@ async def test_project_isolation(
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -320,7 +392,7 @@ async def test_project_isolation(
         permalink=second_entity.permalink,
         file_path=second_entity.file_path,
         entity_id=second_entity.id,
-        metadata={"entity_type": second_entity.entity_type},
+        metadata={"note_type": second_entity.note_type},
         created_at=second_entity.created_at,
         updated_at=second_entity.updated_at,
         project_id=second_project_repository.project_id,
@@ -364,7 +436,7 @@ async def test_delete_by_permalink(search_repository, search_entity):
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -397,7 +469,7 @@ async def test_delete_by_entity_id(search_repository, search_entity):
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -725,7 +797,7 @@ class TestSearchTermPreparation:
             permalink=search_entity.permalink,
             file_path=search_entity.file_path,
             entity_id=search_entity.id,
-            metadata={"entity_type": search_entity.entity_type},
+            metadata={"note_type": search_entity.note_type},
             created_at=search_entity.created_at,
             updated_at=search_entity.updated_at,
             project_id=search_repository.project_id,
@@ -759,7 +831,7 @@ class TestSearchTermPreparation:
             permalink=search_entity.permalink,
             file_path=search_entity.file_path,
             entity_id=search_entity.id,
-            metadata={"entity_type": search_entity.entity_type},
+            metadata={"note_type": search_entity.note_type},
             created_at=search_entity.created_at,
             updated_at=search_entity.updated_at,
             project_id=search_repository.project_id,
@@ -835,3 +907,140 @@ class TestSearchTermPreparation:
         # Test string that becomes empty after strip
         result3 = search_repository._prepare_single_term("\t\n")
         assert result3 == "\t\n"  # Should return original
+
+
+async def _index_entity_with_metadata(search_repository, session_maker, title, entity_metadata):
+    slug = "-".join(title.lower().split())
+    file_path = f"test/{slug}.md"
+    permalink = f"test/{slug}"
+    now = datetime.now(timezone.utc)
+
+    async with db.scoped_session(session_maker) as session:
+        entity = Entity(
+            project_id=search_repository.project_id,
+            title=title,
+            note_type="note",
+            permalink=permalink,
+            file_path=file_path,
+            content_type="text/markdown",
+            entity_metadata=entity_metadata,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(entity)
+        await session.flush()
+
+    search_row = SearchIndexRow(
+        id=entity.id,
+        type=SearchItemType.ENTITY.value,
+        title=entity.title,
+        content_stems="metadata filter test",
+        content_snippet="metadata filter test",
+        permalink=entity.permalink,
+        file_path=entity.file_path,
+        entity_id=entity.id,
+        metadata={"note_type": entity.note_type},
+        created_at=entity.created_at,
+        updated_at=entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row)
+    return entity
+
+
+@pytest.mark.asyncio
+async def test_search_metadata_filters_eq_and_in(search_repository, session_maker):
+    entity_match = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Metadata Match",
+        {"status": "in-progress", "priority": "high"},
+    )
+    await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Metadata Miss",
+        {"status": "done", "priority": "low"},
+    )
+
+    results = await search_repository.search(metadata_filters={"status": "in-progress"})
+    assert {result.id for result in results} == {entity_match.id}
+
+    results = await search_repository.search(
+        metadata_filters={"priority": {"$in": ["high", "critical"]}}
+    )
+    assert {result.id for result in results} == {entity_match.id}
+
+
+@pytest.mark.asyncio
+async def test_search_metadata_filters_contains_tags(search_repository, session_maker):
+    entity_match = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Tag Match",
+        {"tags": ["security", "oauth", "architecture"]},
+    )
+    await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Tag Miss",
+        {"tags": ["security"]},
+    )
+
+    results = await search_repository.search(metadata_filters={"tags": ["security", "oauth"]})
+    assert {result.id for result in results} == {entity_match.id}
+
+
+@pytest.mark.asyncio
+async def test_search_metadata_filters_numeric_comparisons(search_repository, session_maker):
+    entity_high = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Confidence High",
+        {"schema": {"confidence": 0.8}},
+    )
+    entity_low = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Confidence Low",
+        {"schema": {"confidence": 0.4}},
+    )
+
+    results = await search_repository.search(metadata_filters={"schema.confidence": {"$gt": 0.7}})
+    assert {result.id for result in results} == {entity_high.id}
+
+    results = await search_repository.search(
+        metadata_filters={"schema.confidence": {"$between": [0.3, 0.6]}}
+    )
+    assert {result.id for result in results} == {entity_low.id}
+
+
+# --- SQL injection safety tests ---
+# These tests verify that user-supplied filter values are parameterized and cannot
+# alter query structure. Each test passes a malicious payload and asserts the query
+# completes safely (returning empty results) rather than causing a SQL error or
+# data exfiltration.
+
+
+@pytest.mark.asyncio
+async def test_note_types_sql_injection_returns_empty(search_repository):
+    """note_types with SQL injection payload must not alter query structure."""
+    malicious_payloads = [
+        "note' OR '1'='1",
+        "note'; DROP TABLE search_index;--",
+        'note" OR 1=1--',
+        "note') UNION SELECT * FROM entity--",
+    ]
+    for payload in malicious_payloads:
+        results = await search_repository.search(note_types=[payload])
+        # Injection should be treated as a literal string value, not executed as SQL
+        assert results == [], f"Injection payload should not match: {payload}"
+
+
+@pytest.mark.asyncio
+async def test_search_item_types_parameterized(search_repository):
+    """search_item_types enum values are parameterized, not interpolated."""
+    # Normal enum usage still works
+    results = await search_repository.search(search_item_types=[SearchItemType.ENTITY])
+    # Should not raise — parameterized query handles enum values safely
+    assert isinstance(results, list)

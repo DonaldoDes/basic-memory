@@ -5,9 +5,10 @@ to the Basic Memory API, with improved error handling and logging.
 """
 
 import typing
-from typing import Optional
+from typing import Any, Optional
 
-from httpx import Response, URL, AsyncClient, HTTPStatusError
+import logfire
+from httpx import Response, URL, AsyncClient, HTTPStatusError, Headers
 from httpx._client import UseClientDefault, USE_CLIENT_DEFAULT
 from httpx._types import (
     RequestContent,
@@ -22,6 +23,55 @@ from httpx._types import (
 )
 from loguru import logger
 from mcp.server.fastmcp.exceptions import ToolError
+
+from basic_memory.config import ConfigManager
+
+
+def _classify_http_outcome(status_code: int) -> str:
+    """Map HTTP status codes to a low-cardinality outcome label."""
+    if 200 <= status_code < 300:
+        return "success"
+    if 300 <= status_code < 400:  # pragma: no cover
+        return "redirect"
+    if 400 <= status_code < 500:
+        return "client_error"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "unknown"  # pragma: no cover
+
+
+def _response_span_attrs(response: Response) -> dict[str, Any]:
+    """Attributes to attach to a request span after a response lands."""
+    return {
+        "status_code": response.status_code,
+        "is_success": response.is_success,
+        "outcome": _classify_http_outcome(response.status_code),
+    }
+
+
+def _transport_error_span_attrs(exc: Exception) -> dict[str, Any]:
+    """Attributes to attach when the transport layer fails before any response."""
+    return {
+        "is_success": False,
+        "outcome": "transport_error",
+        "error_type": type(exc).__name__,
+    }
+
+
+def _request_headers(headers: HeaderTypes | None) -> HeaderTypes | None:
+    """Merge request-local workspace permalink headers into outbound API calls."""
+    from basic_memory.workspace_context import workspace_permalink_headers
+
+    workspace_headers = workspace_permalink_headers()
+    if not workspace_headers:
+        return headers
+
+    if headers is None:
+        return workspace_headers
+
+    merged_headers = Headers(headers)
+    merged_headers.update(workspace_headers)
+    return merged_headers
 
 
 def get_error_message(
@@ -74,10 +124,77 @@ def get_error_message(
         return f"HTTP error {status_code}: {method} request to '{path}' failed"
 
 
+def _extract_response_data(response: Response) -> Any:
+    """Decode the JSON payload of an API response for error reporting.
+
+    Upstream gateways (Fly, Cloudflare, load balancers) can return HTML
+    error pages before the request reaches our FastAPI app; those have no
+    structured `detail` to surface, so we skip them. A malformed body with
+    a JSON content-type is a server bug and we let it raise.
+    """
+    if "application/json" not in response.headers.get("content-type", ""):
+        return None
+    return response.json()
+
+
+def _response_detail_text(response_data: Any) -> str | None:
+    """Extract textual error detail from API payloads."""
+    if isinstance(response_data, dict):
+        detail = response_data.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, dict):
+            nested_message = detail.get("message")
+            if isinstance(nested_message, str):
+                return nested_message
+            return str(detail)
+        if detail is not None:
+            return str(detail)
+    return None
+
+
+def _has_configured_cloud_api_key() -> bool:
+    """Check whether a cloud API key is currently configured."""
+    try:
+        return bool(ConfigManager().config.cloud_api_key)
+    except Exception:
+        return False
+
+
+def _resolve_error_message(
+    status_code: int, url: URL | str, method: str, response_data: typing.Any
+) -> str:
+    """Resolve a user-facing error message with cloud auth remediation when relevant."""
+    detail_text = _response_detail_text(response_data)
+
+    if status_code == 401 and _has_configured_cloud_api_key():
+        detail_lower = detail_text.lower() if detail_text else ""
+        if (
+            "invalid jwt" in detail_lower
+            or "invalid token" in detail_lower
+            or "authentication required" in detail_lower
+            or not detail_lower
+        ):
+            return (
+                "Authentication failed: the configured cloud API key was rejected by the server. "
+                "Basic Memory prioritizes cloud_api_key over OAuth for cloud routing. "
+                "Fix by running `bm cloud api-key save <valid-key>` "
+                "or remove `cloud_api_key` and use `bm cloud login`."
+            )
+
+    if detail_text:
+        return detail_text
+
+    return get_error_message(status_code, url, method)
+
+
 async def call_get(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     params: QueryParamTypes | None = None,
     headers: HeaderTypes | None = None,
     cookies: CookieTypes | None = None,
@@ -107,30 +224,38 @@ async def call_get(
     """
     logger.debug(f"Calling GET '{url}' params: '{params}'")
     error_message = None
+    request_span: logfire.LogfireSpan | None = None
 
     try:
-        response = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+        with logfire.span(
+            "mcp.http.request",
+            method="GET",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
+            phase="request",
+            has_query=bool(params),
+            has_body=False,
+        ) as request_span:
+            response = await client.get(
+                url,
+                params=params,
+                headers=_request_headers(headers),
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.set_attributes(_response_span_attrs(response))
 
         if response.is_success:
             return response
 
         # Handle different status codes differently
         status_code = response.status_code
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]
-        else:
-            error_message = get_error_message(status_code, url, "PUT")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "GET", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -149,12 +274,19 @@ async def call_get(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.set_attributes(_transport_error_span_attrs(e))
+        raise
 
 
 async def call_put(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     content: RequestContent | None = None,
     data: RequestData | None = None,
     files: RequestFiles | None = None,
@@ -192,22 +324,34 @@ async def call_put(
     """
     logger.debug(f"Calling PUT '{url}'")
     error_message = None
+    request_span: logfire.LogfireSpan | None = None
 
     try:
-        response = await client.put(
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+        with logfire.span(
+            "mcp.http.request",
+            method="PUT",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
+            phase="request",
+            has_query=bool(params),
+            has_body=any(value is not None for value in (content, data, files, json)),
+        ) as request_span:
+            response = await client.put(
+                url,
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                params=params,
+                headers=_request_headers(headers),
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.set_attributes(_response_span_attrs(response))
 
         if response.is_success:
             return response
@@ -215,12 +359,8 @@ async def call_put(
         # Handle different status codes differently
         status_code = response.status_code
 
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]  # pragma: no cover
-        else:
-            error_message = get_error_message(status_code, url, "PUT")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "PUT", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -239,12 +379,19 @@ async def call_put(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.set_attributes(_transport_error_span_attrs(e))
+        raise
 
 
 async def call_patch(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     content: RequestContent | None = None,
     data: RequestData | None = None,
     files: RequestFiles | None = None,
@@ -281,22 +428,34 @@ async def call_patch(
         ToolError: If the request fails with an appropriate error message
     """
     logger.debug(f"Calling PATCH '{url}'")
+    request_span: logfire.LogfireSpan | None = None
 
     try:
-        response = await client.patch(
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+        with logfire.span(
+            "mcp.http.request",
+            method="PATCH",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
+            phase="request",
+            has_query=bool(params),
+            has_body=any(value is not None for value in (content, data, files, json)),
+        ) as request_span:
+            response = await client.patch(
+                url,
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                params=params,
+                headers=_request_headers(headers),
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.set_attributes(_response_span_attrs(response))
 
         if response.is_success:
             return response
@@ -304,15 +463,8 @@ async def call_patch(
         # Handle different status codes differently
         status_code = response.status_code
 
-        # Try to extract specific error message from response body
-        try:
-            response_data = response.json()
-            if isinstance(response_data, dict) and "detail" in response_data:
-                error_message = response_data["detail"]
-            else:
-                error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
-        except Exception:  # pragma: no cover
-            error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "PATCH", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -332,23 +484,23 @@ async def call_patch(
     except HTTPStatusError as e:
         status_code = e.response.status_code
 
-        # Try to extract specific error message from response body
-        try:
-            response_data = e.response.json()
-            if isinstance(response_data, dict) and "detail" in response_data:
-                error_message = response_data["detail"]
-            else:
-                error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
-        except Exception:  # pragma: no cover
-            error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
+        response_data = _extract_response_data(e.response)
+        error_message = _resolve_error_message(status_code, url, "PATCH", response_data)
 
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.set_attributes(_transport_error_span_attrs(e))
+        raise
 
 
 async def call_post(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     content: RequestContent | None = None,
     data: RequestData | None = None,
     files: RequestFiles | None = None,
@@ -386,35 +538,43 @@ async def call_post(
     """
     logger.debug(f"Calling POST '{url}'")
     error_message = None
+    request_span: logfire.LogfireSpan | None = None
 
     try:
-        response = await client.post(
-            url=url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-        logger.debug(f"response: {response.json()}")
+        with logfire.span(
+            "mcp.http.request",
+            method="POST",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
+            phase="request",
+            has_query=bool(params),
+            has_body=any(value is not None for value in (content, data, files, json)),
+        ) as request_span:
+            response = await client.post(
+                url=url,
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                params=params,
+                headers=_request_headers(headers),
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.set_attributes(_response_span_attrs(response))
+        logger.debug(f"response: {_extract_response_data(response)}")
 
         if response.is_success:
             return response
 
         # Handle different status codes differently
         status_code = response.status_code
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]
-        else:
-            error_message = get_error_message(status_code, url, "POST")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "POST", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -433,6 +593,10 @@ async def call_post(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.set_attributes(_transport_error_span_attrs(e))
+        raise
 
 
 async def resolve_entity_id(client: AsyncClient, project_external_id: str, identifier: str) -> str:
@@ -451,7 +615,9 @@ async def resolve_entity_id(client: AsyncClient, project_external_id: str, ident
     """
     try:
         response = await call_post(
-            client, f"/v2/projects/{project_external_id}/knowledge/resolve", json={"identifier": identifier}
+            client,
+            f"/v2/projects/{project_external_id}/knowledge/resolve",
+            json={"identifier": identifier},
         )
         data = response.json()
         return data["external_id"]
@@ -460,13 +626,18 @@ async def resolve_entity_id(client: AsyncClient, project_external_id: str, ident
             raise ToolError(f"Entity not found: '{identifier}'")  # pragma: no cover
         raise ToolError(f"Error resolving identifier '{identifier}': {e}")  # pragma: no cover
     except Exception as e:
-        raise ToolError(f"Unexpected error resolving identifier '{identifier}': {e}")  # pragma: no cover
+        raise ToolError(
+            f"Unexpected error resolving identifier '{identifier}': {e}"
+        )  # pragma: no cover
 
 
 async def call_delete(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     params: QueryParamTypes | None = None,
     headers: HeaderTypes | None = None,
     cookies: CookieTypes | None = None,
@@ -496,30 +667,38 @@ async def call_delete(
     """
     logger.debug(f"Calling DELETE '{url}'")
     error_message = None
+    request_span: logfire.LogfireSpan | None = None
 
     try:
-        response = await client.delete(
-            url=url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+        with logfire.span(
+            "mcp.http.request",
+            method="DELETE",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
+            phase="request",
+            has_query=bool(params),
+            has_body=False,
+        ) as request_span:
+            response = await client.delete(
+                url=url,
+                params=params,
+                headers=_request_headers(headers),
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.set_attributes(_response_span_attrs(response))
 
         if response.is_success:
             return response
 
         # Handle different status codes differently
         status_code = response.status_code
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]  # pragma: no cover
-        else:
-            error_message = get_error_message(status_code, url, "DELETE")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "DELETE", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -538,3 +717,7 @@ async def call_delete(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.set_attributes(_transport_error_span_attrs(e))
+        raise

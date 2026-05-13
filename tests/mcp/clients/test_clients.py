@@ -34,7 +34,7 @@ class TestKnowledgeClient:
             "permalink": "test",
             "title": "Test",
             "file_path": "test.md",
-            "entity_type": "note",
+            "note_type": "note",
             "content_type": "text/markdown",
             "observations": [],
             "relations": [],
@@ -44,6 +44,7 @@ class TestKnowledgeClient:
 
         async def mock_call_post(client, url, **kwargs):
             assert "/v2/projects/proj-123/knowledge/entities" in url
+            assert kwargs.get("params") is None
             return mock_response
 
         monkeypatch.setattr(knowledge_mod, "call_post", mock_call_post)
@@ -51,6 +52,66 @@ class TestKnowledgeClient:
         mock_http = MagicMock()
         client = KnowledgeClient(mock_http, "proj-123")
         result = await client.create_entity({"title": "Test"})
+        assert result.title == "Test"
+
+    @pytest.mark.asyncio
+    async def test_update_entity(self, monkeypatch):
+        """Test update_entity calls correct endpoint without fast query params."""
+        from basic_memory.mcp.clients import knowledge as knowledge_mod
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "permalink": "test",
+            "title": "Test",
+            "file_path": "test.md",
+            "note_type": "note",
+            "content_type": "text/markdown",
+            "observations": [],
+            "relations": [],
+            "created_at": "2024-01-01T00:00:00",
+            "updated_at": "2024-01-01T00:00:00",
+        }
+
+        async def mock_call_put(client, url, **kwargs):
+            assert "/v2/projects/proj-123/knowledge/entities/entity-123" in url
+            assert kwargs.get("params") is None
+            return mock_response
+
+        monkeypatch.setattr(knowledge_mod, "call_put", mock_call_put)
+
+        mock_http = MagicMock()
+        client = KnowledgeClient(mock_http, "proj-123")
+        result = await client.update_entity("entity-123", {"title": "Test"})
+        assert result.title == "Test"
+
+    @pytest.mark.asyncio
+    async def test_patch_entity(self, monkeypatch):
+        """Test patch_entity calls correct endpoint without fast query params."""
+        from basic_memory.mcp.clients import knowledge as knowledge_mod
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "permalink": "test",
+            "title": "Test",
+            "file_path": "test.md",
+            "note_type": "note",
+            "content_type": "text/markdown",
+            "observations": [],
+            "relations": [],
+            "created_at": "2024-01-01T00:00:00",
+            "updated_at": "2024-01-01T00:00:00",
+        }
+
+        async def mock_call_patch(client, url, **kwargs):
+            assert "/v2/projects/proj-123/knowledge/entities/entity-123" in url
+            assert kwargs.get("params") is None
+            return mock_response
+
+        monkeypatch.setattr(knowledge_mod, "call_patch", mock_call_patch)
+
+        mock_http = MagicMock()
+        client = KnowledgeClient(mock_http, "proj-123")
+        result = await client.patch_entity("entity-123", {"operation": "append"})
         assert result.title == "Test"
 
     @pytest.mark.asyncio
@@ -71,6 +132,39 @@ class TestKnowledgeClient:
         client = KnowledgeClient(mock_http, "proj-123")
         result = await client.resolve_entity("my-note")
         assert result == "entity-uuid-123"
+
+    @pytest.mark.asyncio
+    async def test_get_orphans_validates_response(self, monkeypatch):
+        """Orphan responses are validated into GraphNode objects."""
+        from basic_memory.mcp.clients import knowledge as knowledge_mod
+        from basic_memory.schemas.v2.graph import GraphNode
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "entities": [
+                {
+                    "external_id": "entity-uuid-123",
+                    "title": "Orphan Note",
+                    "file_path": "notes/orphan.md",
+                    "note_type": "note",
+                }
+            ],
+            "total": 1,
+        }
+
+        async def mock_call_get(client, url, **kwargs):
+            assert "/v2/projects/proj-123/knowledge/orphans" in url
+            return mock_response
+
+        monkeypatch.setattr(knowledge_mod, "call_get", mock_call_get)
+
+        mock_http = MagicMock()
+        client = KnowledgeClient(mock_http, "proj-123")
+        result = await client.get_orphans()
+
+        assert len(result) == 1
+        assert isinstance(result[0], GraphNode)
+        assert result[0].title == "Orphan Note"
 
 
 class TestSearchClient:
@@ -146,7 +240,6 @@ class TestMemoryClient:
         client = MemoryClient(mock_http, "proj-123")
         result = await client.build_context("specs/search")
         assert result.results == []
-
 
     @pytest.mark.asyncio
     async def test_recent(self, monkeypatch):
@@ -299,7 +392,7 @@ class TestProjectClient:
         }
 
         async def mock_call_get(client, url, **kwargs):
-            assert "/projects/projects" in url
+            assert "/v2/projects" in url
             return mock_response
 
         monkeypatch.setattr(project_mod, "call_get", mock_call_get)

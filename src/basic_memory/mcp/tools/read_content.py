@@ -8,19 +8,23 @@ Files are read directly without any knowledge graph processing.
 import base64
 import io
 
-from typing import Optional
+from typing import Annotated, Optional
 
 from loguru import logger
 from PIL import Image as PILImage
 from fastmcp import Context
+from pydantic import AliasChoices, Field
 from mcp.server.fastmcp.exceptions import ToolError
 
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory.config import ConfigManager
+from basic_memory.mcp.project_context import (
+    detect_project_from_memory_url_prefix,
+    get_project_client,
+    resolve_project_and_path,
+)
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.tools.utils import call_get, resolve_entity_id
 from basic_memory.schemas.memory import memory_url_path
-from basic_memory.telemetry import track_mcp_tool
 from basic_memory.utils import validate_project_path
 
 
@@ -150,9 +154,18 @@ def optimize_image(img, content_length, max_output_bytes=350000):
             return buf.getvalue()
 
 
-@mcp.tool(description="Read a file's raw content by path or permalink")
+@mcp.tool(
+    description="Read a file's raw content by path or permalink",
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
 async def read_content(
-    path: str, project: Optional[str] = None, context: Context | None = None
+    path: Annotated[
+        str,
+        Field(validation_alias=AliasChoices("path", "file_path", "filepath", "file")),
+    ],
+    project: Optional[str] = None,
+    project_id: Optional[str] = None,
+    context: Context | None = None,
 ) -> dict:
     """Read a file's raw content by path or permalink.
 
@@ -172,6 +185,9 @@ async def read_content(
             - A permalink (docs/example)
         project: Project name to read from. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -201,17 +217,36 @@ async def read_content(
         HTTPError: If project doesn't exist or is inaccessible
         SecurityError: If path attempts path traversal
     """
-    track_mcp_tool("read_content")
-    logger.info("Reading file", path=path, project=project)
+    # Detect project from memory URL prefix before routing.
+    # project_id routes by external UUID, so it bypasses URL discovery entirely.
+    if project is None and project_id is None:
+        detected = await detect_project_from_memory_url_prefix(
+            path,
+            ConfigManager().config,
+            context=context,
+        )
+        if detected:
+            project = detected
 
-    async with get_client() as client:
-        active_project = await get_active_project(client, project, context)
+    logger.info(f"MCP tool call tool=read_content project={project} path={path}")
 
-        url = memory_url_path(path)
+    async with get_project_client(project, context=context, project_id=project_id) as (
+        client,
+        active_project,
+    ):
+        # Resolve path with project-prefix awareness for memory:// URLs.
+        # Use active_project.name so resolution stays consistent when project_id
+        # was used or `project` was wrong/ambiguous (matches the cached resolution).
+        _, url, _ = await resolve_project_and_path(client, path, active_project.name, context)
 
         # Validate path to prevent path traversal attacks
+        # For memory:// URLs, validate the extracted path (not the raw URL which
+        # has a scheme prefix that confuses path validation)
+        raw_path = memory_url_path(path) if path.startswith("memory://") else path
         project_path = active_project.home
-        if not validate_project_path(url, project_path):
+        if not validate_project_path(raw_path, project_path) or not validate_project_path(
+            url, project_path
+        ):
             logger.warning(
                 "Attempted path traversal attack blocked",
                 path=path,
@@ -231,7 +266,9 @@ async def read_content(
             raise ToolError(f"Resource not found: {url}")
 
         # Call the v2 resource endpoint
-        response = await call_get(client, f"/v2/projects/{active_project.external_id}/resource/{entity_id}")
+        response = await call_get(
+            client, f"/v2/projects/{active_project.external_id}/resource/{entity_id}"
+        )
         content_type = response.headers.get("content-type", "application/octet-stream")
         content_length = int(response.headers.get("content-length", 0))
 
@@ -240,6 +277,10 @@ async def read_content(
         # Handle text or json
         if content_type.startswith("text/") or content_type == "application/json":
             logger.debug("Processing text resource")
+            logger.info(
+                f"MCP tool response: tool=read_content project={active_project.name} "
+                f"path={url} type=text content_type={content_type}"
+            )
             return {
                 "type": "text",
                 "text": response.text,
@@ -252,6 +293,10 @@ async def read_content(
             logger.debug("Processing image")
             img = PILImage.open(io.BytesIO(response.content))
             img_bytes = optimize_image(img, content_length)
+            logger.info(
+                f"MCP tool response: tool=read_content project={active_project.name} "
+                f"path={url} type=image content_type=image/jpeg"
+            )
 
             return {
                 "type": "image",
@@ -271,6 +316,10 @@ async def read_content(
                     "type": "error",
                     "error": f"Document size {content_length} bytes exceeds maximum allowed size",
                 }
+            logger.info(
+                f"MCP tool response: tool=read_content project={active_project.name} "
+                f"path={url} type=document content_type={content_type}"
+            )
             return {
                 "type": "document",
                 "source": {

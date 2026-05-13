@@ -1,12 +1,19 @@
 """Core cloud commands for Basic Memory CLI."""
 
-import asyncio
-
 import typer
 from rich.console import Console
 
 from basic_memory.cli.app import cloud_app
+from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.cli.auth import CLIAuth
+from basic_memory.cli.analytics import (
+    track,
+    EVENT_CLOUD_LOGIN_STARTED,
+    EVENT_CLOUD_LOGIN_SUCCESS,
+    EVENT_CLOUD_LOGIN_SUB_REQUIRED,
+    EVENT_PROMO_OPTED_OUT,
+)
+from basic_memory.cli.promo import OSS_DISCOUNT_CODE
 from basic_memory.config import ConfigManager
 from basic_memory.cli.commands.cloud.api_client import (
     CloudAPIError,
@@ -30,9 +37,10 @@ console = Console()
 
 @cloud_app.command()
 def login():
-    """Authenticate with WorkOS using OAuth Device Authorization flow and enable cloud mode."""
+    """Authenticate with WorkOS using OAuth Device Authorization flow."""
 
     async def _login():
+        track(EVENT_CLOUD_LOGIN_STARTED)
         client_id, domain, host_url = get_cloud_config()
         auth = CLIAuth(client_id=client_id, authkit_domain=domain)
 
@@ -46,94 +54,90 @@ def login():
             console.print("[dim]Verifying subscription access...[/dim]")
             await make_api_request("GET", f"{host_url.rstrip('/')}/proxy/health")
 
-            # Enable cloud mode after successful login and subscription validation
-            config_manager = ConfigManager()
-            config = config_manager.load_config()
-            config.cloud_mode = True
-            config_manager.save_config(config)
-
-            console.print("[green]Cloud mode enabled[/green]")
-            console.print(f"[dim]All CLI commands now work against {host_url}[/dim]")
+            track(EVENT_CLOUD_LOGIN_SUCCESS)
+            console.print("[green]Cloud authentication successful[/green]")
+            console.print(f"[dim]Cloud host ready: {host_url}[/dim]")
 
         except SubscriptionRequiredError as e:
+            track(EVENT_CLOUD_LOGIN_SUB_REQUIRED)
             console.print("\n[red]Subscription Required[/red]\n")
             console.print(f"[yellow]{e.args[0]}[/yellow]\n")
+            console.print(
+                f"OSS discount code: [bold]{OSS_DISCOUNT_CODE}[/bold] (20% off for 3 months)\n"
+            )
             console.print(f"Subscribe at: [blue underline]{e.subscribe_url}[/blue underline]\n")
             console.print(
                 "[dim]Once you have an active subscription, run [bold]bm cloud login[/bold] again.[/dim]"
             )
             raise typer.Exit(1)
 
-    asyncio.run(_login())
+    run_with_cleanup(_login())
 
 
 @cloud_app.command()
 def logout():
-    """Disable cloud mode and return to local mode."""
-
-    # Disable cloud mode
+    """Remove stored OAuth tokens and clear cached workspace selection."""
     config_manager = ConfigManager()
-    config = config_manager.load_config()
-    config.cloud_mode = False
-    config_manager.save_config(config)
+    config = config_manager.config
+    auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
+    auth.logout()
 
-    console.print("[green]Cloud mode disabled[/green]")
-    console.print("[dim]All CLI commands now work locally[/dim]")
+    # Trigger: ending a session must invalidate the cached workspace.
+    # Why: a follow-up `bm cloud login` (often as a different user, or returning
+    #      from an org workspace to personal) inherits the previous selection
+    #      and silently routes everything through the wrong tenant. See #755.
+    # Outcome: re-login starts from a clean slate; the user picks again via
+    #      `bm cloud workspace set-default` or per-project --workspace.
+    if config.default_workspace is not None:
+        config.default_workspace = None
+        config_manager.save_config(config)
+
+    console.print("[dim]API key (if configured) remains available for cloud project routing.[/dim]")
 
 
 @cloud_app.command("status")
 def status() -> None:
-    """Check cloud mode status and cloud instance health."""
-    # Check cloud mode
+    """Check cloud authentication and connection status."""
     config_manager = ConfigManager()
     config = config_manager.load_config()
+    auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
+    tokens = auth.load_tokens()
 
-    console.print("[bold blue]Cloud Mode Status[/bold blue]")
-    if config.cloud_mode:
-        console.print("  Mode: [green]Cloud (enabled)[/green]")
-        console.print(f"  Host: {config.cloud_host}")
-        console.print("  [dim]All CLI commands work against cloud[/dim]")
-    else:
-        console.print("  Mode: [yellow]Local (disabled)[/yellow]")
-        console.print("  [dim]All CLI commands work locally[/dim]")
-        console.print("\n[dim]To enable cloud mode, run: bm cloud login[/dim]")
+    console.print("[bold blue]Cloud Status[/bold blue]")
+    console.print(f"  Host: {config.cloud_host}")
+    console.print(
+        f"  API Key: {'[green]configured[/green]' if config.cloud_api_key else '[yellow]not set[/yellow]'}"
+    )
+
+    oauth_status = "[yellow]not logged in[/yellow]"
+    if tokens:
+        if auth.is_token_valid(tokens):
+            oauth_status = "[green]token valid[/green]"
+        else:
+            oauth_status = "[yellow]token expired[/yellow]"
+    console.print(f"  OAuth: {oauth_status}")
+
+    has_credentials = bool(config.cloud_api_key) or tokens is not None
+    if not has_credentials:
+        console.print(
+            "\n[dim]No cloud credentials found. Run: bm cloud login or bm cloud api-key save <key>[/dim]"
+        )
         return
 
-    # Get cloud configuration
+    # Quick connection check — just verify we can reach the cloud
     _, _, host_url = get_cloud_config()
     host_url = host_url.rstrip("/")
 
-    # Prepare headers
-    headers = {}
-
     try:
-        console.print("\n[blue]Checking cloud instance health...[/blue]")
-
-        # Make API request to check health
-        response = asyncio.run(
-            make_api_request(method="GET", url=f"{host_url}/proxy/health", headers=headers)
+        run_with_cleanup(make_api_request(method="GET", url=f"{host_url}/proxy/health"))
+        console.print("\n[green]Cloud connected[/green]")
+    except CloudAPIError:
+        console.print("\n[yellow]Cloud not connected[/yellow]")
+        console.print(
+            "[dim]Try re-authenticating with 'bm cloud login' or 'bm cloud api-key save'.[/dim]"
         )
-
-        health_data = response.json()
-
-        console.print("[green]Cloud instance is healthy[/green]")
-
-        # Display status details
-        if "status" in health_data:
-            console.print(f"  Status: {health_data['status']}")
-        if "version" in health_data:
-            console.print(f"  Version: {health_data['version']}")
-        if "timestamp" in health_data:
-            console.print(f"  Timestamp: {health_data['timestamp']}")
-
-        console.print("\n[dim]To sync projects, use: bm project bisync --name <project>[/dim]")
-
-    except CloudAPIError as e:
-        console.print(f"[red]Error checking cloud health: {e}[/red]")
-        raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        raise typer.Exit(1)
+    except Exception:
+        console.print("\n[yellow]Cloud not connected[/yellow]")
 
 
 @cloud_app.command("setup")
@@ -141,7 +145,7 @@ def setup() -> None:
     """Set up cloud sync by installing rclone and configuring credentials.
 
     After setup, use project commands for syncing:
-      bm project add <name> <path> --local-path ~/projects/<name>
+      bm project add <name> --cloud --local-path ~/projects/<name>
       bm project bisync --name <name> --resync  # First time
       bm project bisync --name <name>            # Subsequent syncs
     """
@@ -155,12 +159,12 @@ def setup() -> None:
 
         # Step 2: Get tenant info
         console.print("\n[blue]Step 2: Getting tenant information...[/blue]")
-        tenant_info = asyncio.run(get_mount_info())
+        tenant_info = run_with_cleanup(get_mount_info())
         console.print(f"[green]Found tenant: {tenant_info.tenant_id}[/green]")
 
         # Step 3: Generate credentials
         console.print("\n[blue]Step 3: Generating sync credentials...[/blue]")
-        creds = asyncio.run(generate_mount_credentials(tenant_info.tenant_id))
+        creds = run_with_cleanup(generate_mount_credentials(tenant_info.tenant_id))
         console.print("[green]Generated secure credentials[/green]")
 
         # Step 4: Configure rclone remote
@@ -173,9 +177,9 @@ def setup() -> None:
         console.print("\n[bold green]Cloud setup completed successfully![/bold green]")
         console.print("\n[bold]Next steps:[/bold]")
         console.print("1. Add a project with local sync path:")
-        console.print("   bm project add research --local-path ~/Documents/research")
+        console.print("   bm project add research --cloud --local-path ~/Documents/research")
         console.print("\n   Or configure sync for an existing project:")
-        console.print("   bm project sync-setup research ~/Documents/research")
+        console.print("   bm cloud sync-setup research ~/Documents/research")
         console.print("\n2. Preview the initial sync (recommended):")
         console.print("   bm project bisync --name research --resync --dry-run")
         console.print("\n3. If all looks good, run the actual sync:")
@@ -191,4 +195,99 @@ def setup() -> None:
         raise typer.Exit(1)
     except Exception as e:
         console.print(f"\n[red]Unexpected error during setup: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@cloud_app.command("promo")
+def promo(enabled: bool = typer.Option(True, "--on/--off", help="Enable or disable CLI promos.")):
+    """Enable or disable CLI cloud promo messages."""
+    config_manager = ConfigManager()
+    config = config_manager.load_config()
+    config.cloud_promo_opt_out = not enabled
+    config_manager.save_config(config)
+
+    if enabled:
+        console.print("[green]Cloud promo messages enabled[/green]")
+    else:
+        track(EVENT_PROMO_OPTED_OUT)
+        console.print("[yellow]Cloud promo messages disabled[/yellow]")
+
+
+# --- API key management subcommand group ---
+
+api_key_app = typer.Typer(help="Manage cloud API keys")
+cloud_app.add_typer(api_key_app, name="api-key")
+
+
+@api_key_app.command("save")
+def api_key_save(
+    api_key: str = typer.Argument(..., help="API key (bmc_ prefixed) for cloud access"),
+) -> None:
+    """Save an existing API key to local config.
+
+    Use when you already have an API key (e.g., from the web app).
+
+    Example:
+      bm cloud api-key save bmc_abc123...
+    """
+    if not api_key.startswith("bmc_"):
+        console.print("[red]Error: API key must start with 'bmc_'[/red]")
+        raise typer.Exit(1)
+
+    config_manager = ConfigManager()
+    config = config_manager.load_config()
+    config.cloud_api_key = api_key
+    config_manager.save_config(config)
+
+    console.print("[green]API key saved[/green]")
+    console.print("[dim]Projects set to cloud mode will use this key for authentication[/dim]")
+    console.print("[dim]Set a project to cloud mode: bm project set-cloud <name>[/dim]")
+
+
+@api_key_app.command("create")
+def api_key_create(
+    name: str = typer.Argument(..., help="Human-readable name for the API key"),
+) -> None:
+    """Create a new API key via the cloud API and save it locally.
+
+    Requires active OAuth session (run 'bm cloud login' first).
+
+    Example:
+      bm cloud api-key create "my-laptop"
+    """
+
+    async def _create_key():
+        _, _, host_url = get_cloud_config()
+        host_url = host_url.rstrip("/")
+
+        console.print(f"[dim]Creating API key '{name}'...[/dim]")
+        response = await make_api_request(
+            method="POST",
+            url=f"{host_url}/api/keys",
+            json_data={"name": name},
+        )
+
+        key_data = response.json()
+        api_key = key_data.get("key")
+        if not api_key:
+            console.print("[red]Error: No key returned from API[/red]")
+            raise typer.Exit(1)
+
+        # Save to config
+        config_manager = ConfigManager()
+        config = config_manager.load_config()
+        config.cloud_api_key = api_key
+        config_manager.save_config(config)
+
+        console.print(f"[green]API key '{name}' created and saved[/green]")
+        console.print("[dim]Projects set to cloud mode will use this key for authentication[/dim]")
+        console.print("[dim]Set a project to cloud mode: bm project set-cloud <name>[/dim]")
+
+    try:
+        run_with_cleanup(_create_key())
+    except CloudAPIError as e:
+        console.print(f"[red]Error creating API key: {e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/red]")
         raise typer.Exit(1)

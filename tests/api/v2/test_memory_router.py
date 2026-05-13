@@ -38,7 +38,7 @@ async def test_get_recent_context(
     """Test getting recent activity context."""
     entity_data = {
         "title": "Recent Test Entity",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "file_path": "recent_test.md",
         "checksum": "abc123",
@@ -74,7 +74,7 @@ async def test_get_recent_context_with_pagination(
     for i in range(5):
         entity_data = {
             "title": f"Entity {i}",
-            "entity_type": "note",
+            "note_type": "note",
             "content_type": "text/markdown",
             "file_path": f"entity_{i}.md",
             "checksum": f"checksum{i}",
@@ -108,7 +108,7 @@ async def test_get_recent_context_with_type_filter(
     # Create a test entity
     entity_data = {
         "title": "Filtered Entity",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "file_path": "filtered.md",
         "checksum": "xyz789",
@@ -162,7 +162,7 @@ async def test_get_memory_context_by_permalink(
     # Create a test entity
     entity_data = {
         "title": "Context Test",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "file_path": "context_test.md",
         "checksum": "def456",
@@ -193,7 +193,7 @@ async def test_get_memory_context_by_id(
     # Create a test entity
     entity_data = {
         "title": "ID Context Test",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "file_path": "id_context_test.md",
         "checksum": "ghi789",
@@ -223,7 +223,7 @@ async def test_get_memory_context_with_depth(
     # Create a test entity
     entity_data = {
         "title": "Depth Test",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "file_path": "depth_test.md",
         "checksum": "jkl012",
@@ -268,7 +268,7 @@ async def test_get_memory_context_with_timeframe(
     # Create a test entity
     entity_data = {
         "title": "Timeframe Test",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "file_path": "timeframe_test.md",
         "checksum": "mno345",
@@ -286,6 +286,41 @@ async def test_get_memory_context_with_timeframe(
     assert response.status_code == 200
     data = response.json()
     assert "results" in data
+
+
+@pytest.mark.asyncio
+async def test_recent_context_has_more(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_repository,
+    search_service,
+    file_service,
+):
+    """has_more should be True when there are more results beyond the current page."""
+    # Create enough entities to exceed a small page_size
+    for i in range(4):
+        entity_data = {
+            "title": f"HasMore Memory {i}",
+            "note_type": "note",
+            "content_type": "text/markdown",
+            "file_path": f"hasmore_mem_{i}.md",
+            "checksum": f"hasmoremem{i}",
+        }
+        await create_test_entity(
+            test_project, entity_data, entity_repository, search_service, file_service
+        )
+
+    # Request page_size=2 — with 4 entities, has_more should be True
+    response = await client.get(
+        f"{v2_project_url}/memory/recent",
+        params={"page": 1, "page_size": 2, "type": ["entity"]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "has_more" in data
+    assert data["has_more"] is True
+    assert len(data["results"]) == 2
 
 
 @pytest.mark.asyncio

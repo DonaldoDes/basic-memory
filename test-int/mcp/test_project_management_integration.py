@@ -121,7 +121,7 @@ async def test_create_project_with_default_flag(mcp_server, app, test_project, t
 
 @pytest.mark.asyncio
 async def test_create_project_duplicate_name(mcp_server, app, test_project, tmp_path):
-    """Test creating a project with duplicate name shows error."""
+    """Test creating a project with duplicate name is idempotent."""
 
     async with Client(mcp_server) as client:
         # First create a project
@@ -135,25 +135,35 @@ async def test_create_project_duplicate_name(mcp_server, app, test_project, tmp_
             },
         )
 
-        # Try to create another project with same name
-        with pytest.raises(Exception) as exc_info:
-            await client.call_tool(
-                "create_memory_project",
-                {
-                    "project_name": "duplicate-test",
-                    "project_path": str(
-                        tmp_path.parent / (tmp_path.name + "-projects") / "project-duplicate-test-2"
-                    ),
-                },
-            )
+        # Second create with same name should succeed idempotently
+        second_result = await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": "duplicate-test",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-duplicate-test-2"
+                ),
+            },
+        )
+        second_text = second_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "already exists" in second_text.lower()
+        assert "duplicate-test" in second_text
 
-        # Should show error about duplicate name
-        error_message = str(exc_info.value)
-        assert "create_memory_project" in error_message
+        # JSON mode should explicitly report already_exists=true
+        second_json = await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": "duplicate-test",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-duplicate-test-3"
+                ),
+                "output_format": "json",
+            },
+        )
+        second_json_text = second_json.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
         assert (
-            "duplicate-test" in error_message
-            or "already exists" in error_message
-            or "Invalid request" in error_message
+            '"already_exists":true' in second_json_text
+            or '"already_exists": true' in second_json_text
         )
 
 
@@ -276,7 +286,7 @@ async def test_project_lifecycle_workflow(mcp_server, app, test_project, tmp_pat
             {
                 "project": project_name,
                 "title": "Lifecycle Test Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Lifecycle Test\\n\\nThis note tests the project lifecycle.\\n\\n- [test] Lifecycle testing",
                 "tags": "lifecycle,test",
             },
@@ -390,7 +400,7 @@ async def test_case_insensitive_project_switching(mcp_server, app, test_project,
                 {
                     "project": test_input,  # Use different case
                     "title": f"Case Test {test_input}",
-                    "folder": "case-test",
+                    "directory": "case-test",
                     "content": f"# Case Test\n\nTesting with {test_input}",
                 },
             )
@@ -427,7 +437,7 @@ async def test_case_insensitive_project_operations(mcp_server, app, test_project
             {
                 "project": project_name,
                 "title": "Case Test Note",
-                "folder": "case-test",
+                "directory": "case-test",
                 "content": "# Case Test Note\n\nTesting case-insensitive operations.\n\n- [test] Case insensitive switch\n- relates_to [[Another Note]]",
                 "tags": "case,test",
             },
@@ -478,7 +488,7 @@ async def test_case_insensitive_error_handling(mcp_server, app, test_project):
                     {
                         "project": test_case,
                         "title": "Test Note",
-                        "folder": "test",
+                        "directory": "test",
                         "content": "# Test\n\nTest content.",
                     },
                 )
@@ -524,7 +534,7 @@ async def test_case_preservation_in_project_list(mcp_server, app, test_project, 
                 {
                     "project": project_name,  # Use exact project name
                     "title": f"Test Note {project_name}",
-                    "folder": "test",
+                    "directory": "test",
                     "content": f"# Test\n\nTesting {project_name}",
                 },
             )
@@ -578,3 +588,122 @@ async def test_nested_project_paths_rejected(mcp_server, app, test_project, tmp_
 
         # Clean up parent project
         await client.call_tool("delete_project", {"project_name": parent_name})
+
+
+@pytest.mark.asyncio
+async def test_create_project_accepts_workspace_in_local_mode(
+    mcp_server, app, test_project, tmp_path
+):
+    """Passing workspace via the MCP wire is accepted by the tool schema and
+    does not break the local create path.
+
+    In local mode there is no cloud factory installed, so workspace is a no-op:
+    the request lands on the ASGI transport which has no workspace concept. This
+    test guards the schema so a future change can't accidentally drop the parameter.
+    """
+
+    async with Client(mcp_server) as client:
+        create_result = await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": "ws-local-test",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-ws-local-test"
+                ),
+                "workspace": "team-paul",
+            },
+        )
+
+        assert len(create_result.content) == 1
+        create_text = create_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "✓" in create_text
+        assert "ws-local-test" in create_text
+
+        list_result = await client.call_tool("list_memory_projects", {})
+        assert "ws-local-test" in list_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_create_project_workspace_slug_forwarded_to_factory_as_tenant_id(
+    mcp_server, app, test_project, tmp_path
+):
+    """workspace slug resolves before the tenant id flows to the cloud factory.
+
+    Simulates the cloud MCP server pattern (set_client_factory) and verifies the
+    factory receives the workspace argument. This is the chicken-and-egg case:
+    no project_id exists yet, so workspace is the only way to target a
+    non-default workspace at create time.
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, patch
+
+    from httpx import ASGITransport, AsyncClient as HttpxAsyncClient
+
+    from basic_memory.mcp import async_client
+    from basic_memory.mcp.tools import project_management
+    from basic_memory.schemas.cloud import WorkspaceInfo
+
+    captured_workspaces: list[str | None] = []
+    resolved_workspace = WorkspaceInfo(
+        tenant_id="tenant-cloud-test",
+        name="Team Paul",
+        workspace_type="organization",
+        slug="team-paul",
+        role="owner",
+        organization_id="org-team-paul",
+        is_default=False,
+        has_active_subscription=True,
+    )
+
+    @asynccontextmanager
+    async def fake_factory(workspace=None):
+        captured_workspaces.append(workspace)
+        # Yield an ASGI-backed httpx client so the create_project HTTP call
+        # actually reaches the FastAPI app and the project is created in the DB.
+        async with HttpxAsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as inner:
+            yield inner
+
+    original_factory = async_client._client_factory
+    async_client.set_client_factory(fake_factory)
+    try:
+        with patch.object(
+            project_management,
+            "resolve_workspace_parameter",
+            new_callable=AsyncMock,
+            return_value=resolved_workspace,
+        ) as mock_resolve_workspace:
+            async with Client(mcp_server) as mcp_client:
+                create_result = await mcp_client.call_tool(
+                    "create_memory_project",
+                    {
+                        "project_name": "ws-routed-project",
+                        "project_path": str(
+                            tmp_path.parent
+                            / (tmp_path.name + "-projects")
+                            / "project-ws-routed-project"
+                        ),
+                        "workspace": "team-paul",
+                    },
+                )
+
+        create_text = create_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "✓" in create_text
+        assert "ws-routed-project" in create_text
+
+        mock_resolve_workspace.assert_awaited_once()
+        await_args = mock_resolve_workspace.await_args
+        assert await_args is not None
+        assert await_args.kwargs["workspace"] == "team-paul"
+        # The factory must have been invoked with the tenant id resolved from the slug.
+        # create_memory_project opens one get_client() context, so the factory is
+        # called once per tool invocation; both list_projects and create_project
+        # share that single client.
+        assert captured_workspaces, "Factory was never invoked"
+        assert all(ws == "tenant-cloud-test" for ws in captured_workspaces), (
+            "Expected workspace='tenant-cloud-test' on every factory call, "
+            f"got {captured_workspaces}"
+        )
+    finally:
+        async_client._client_factory = original_factory

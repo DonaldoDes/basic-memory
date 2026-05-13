@@ -344,24 +344,33 @@ async def engine_session_factory(
 
     global _engine, _session_maker
 
-    # Use the same helper function as production code
-    _engine, _session_maker = _create_engine_and_session(db_path, db_type, config)
+    # Use the same helper function as production code.
+    #
+    # Keep local references so teardown can deterministically dispose the
+    # specific engine created by this context manager, even if other code calls
+    # shutdown_db() and mutates module-level globals mid-test.
+    created_engine, created_session_maker = _create_engine_and_session(db_path, db_type, config)
+    _engine, _session_maker = created_engine, created_session_maker
 
     try:
         # Verify that engine and session maker are initialized
-        if _engine is None:  # pragma: no cover
+        if created_engine is None:  # pragma: no cover
             logger.error("Database engine is None in engine_session_factory")
             raise RuntimeError("Database engine initialization failed")
 
-        if _session_maker is None:  # pragma: no cover
+        if created_session_maker is None:  # pragma: no cover
             logger.error("Session maker is None in engine_session_factory")
             raise RuntimeError("Session maker initialization failed")
 
-        yield _engine, _session_maker
+        yield created_engine, created_session_maker
     finally:
-        if _engine:
-            await _engine.dispose()
+        await created_engine.dispose()
+
+        # Only clear module-level globals if they still point to this context's
+        # engine/session. This avoids clobbering newer globals from other callers.
+        if _engine is created_engine:
             _engine = None
+        if _session_maker is created_session_maker:
             _session_maker = None
 
 
@@ -374,6 +383,7 @@ async def run_migrations(
     so it's safe to call this multiple times - it will only run pending migrations.
     """
     logger.info("Running database migrations...")
+    temp_engine: AsyncEngine | None = None
     try:
         # Get the absolute path to the alembic directory relative to this file
         alembic_dir = Path(__file__).parent / "alembic"
@@ -398,7 +408,9 @@ async def run_migrations(
 
         # Get session maker - ensure we don't trigger recursive migration calls
         if _session_maker is None:
-            _, session_maker = _create_engine_and_session(app_config.database_path, database_type)
+            temp_engine, session_maker = _create_engine_and_session(
+                app_config.database_path, database_type, app_config
+            )
         else:
             session_maker = _session_maker
 
@@ -413,6 +425,15 @@ async def run_migrations(
             await PostgresSearchRepository(session_maker, 1).init_search_index()
         else:
             await SQLiteSearchRepository(session_maker, 1).init_search_index()
+
     except Exception as e:  # pragma: no cover
         logger.error(f"Error running migrations: {e}")
         raise
+    finally:
+        # Trigger: run_migrations() created a temporary engine while module-level
+        # session maker was not initialized.
+        # Why: temporary aiosqlite worker threads can outlive CLI command execution
+        # and block process shutdown if the engine is not disposed.
+        # Outcome: always dispose temporary engines after migration work completes.
+        if temp_engine is not None:
+            await temp_engine.dispose()

@@ -41,6 +41,7 @@ async def test_unicode_content(tmp_path):
 
     assert "测试" in entity.frontmatter.metadata["tags"]
     assert "chinese" not in entity.frontmatter.metadata["tags"]
+    assert entity.content is not None
     assert "🧪" in entity.content
 
     # Verify Unicode in observations
@@ -174,6 +175,28 @@ async def test_malformed_frontmatter(tmp_path):
     parser = EntityParser(tmp_path)
     entity = await parser.parse_file(test_file)
     assert entity.frontmatter.permalink is None
+
+
+@pytest.mark.asyncio
+async def test_null_bytes_stripped(tmp_path):
+    """Test that null bytes are stripped from content before parsing.
+
+    PostgreSQL rejects null bytes (0x00) in text columns. Some files
+    (e.g. Claude agent definitions) can contain embedded nulls.
+    """
+    content = "---\ntitle: Test\ntype: note\n---\n\nSome content\x00with nulls\x00inside\n"
+
+    parser = EntityParser(tmp_path)
+    entity = await parser.parse_markdown_content(
+        file_path=tmp_path / "nulls.md",
+        content=content,
+    )
+
+    assert entity.content is not None
+    assert "\x00" not in entity.content
+    assert "Some content" in entity.content
+    assert "with nulls" in entity.content
+    assert "inside" in entity.content
 
 
 @pytest.mark.asyncio

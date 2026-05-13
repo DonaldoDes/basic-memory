@@ -14,9 +14,9 @@ Key Features:
 from datetime import datetime
 from typing import List, Optional, Dict
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
-from basic_memory.schemas.base import Relation, Permalink, EntityType, ContentType, Observation
+from basic_memory.schemas.base import Relation, Permalink, NoteType, ContentType, Observation
 
 
 class SQLAlchemyModel(BaseModel):
@@ -162,7 +162,7 @@ class EntityResponse(SQLAlchemyModel):
     {
         "permalink": "component/memory-service",
         "file_path": "MemoryService",
-        "entity_type": "component",
+        "note_type": "component",
         "entity_metadata": {}
         "content_type: "text/markdown"
         "observations": [
@@ -191,10 +191,18 @@ class EntityResponse(SQLAlchemyModel):
     permalink: Optional[Permalink]
     title: str
     file_path: str
-    entity_type: EntityType
+    note_type: NoteType
+
+    # COMPAT(v0.18): old clients expect entity_type; remove when no longer needed
+    @computed_field
+    @property
+    def entity_type(self) -> str:
+        return self.note_type
+
     entity_metadata: Optional[Dict] = None
     checksum: Optional[str] = None
     content_type: ContentType
+    external_id: Optional[str] = None
     observations: List[ObservationResponse] = []
     relations: List[RelationResponse] = []
     created_at: datetime
@@ -214,7 +222,7 @@ class EntityListResponse(SQLAlchemyModel):
             {
                 "permalink": "component/search_service",
                 "title": "SearchService",
-                "entity_type": "component",
+                "note_type": "component",
                 "description": "Knowledge graph search",
                 "observations": [
                     {
@@ -226,7 +234,7 @@ class EntityListResponse(SQLAlchemyModel):
             {
                 "permalink": "document/api_docs",
                 "title": "API_Documentation",
-                "entity_type": "document",
+                "note_type": "document",
                 "description": "API Reference",
                 "observations": [
                     {
@@ -254,7 +262,7 @@ class SearchNodesResponse(SQLAlchemyModel):
             {
                 "permalink": "component/memory-service",
                 "title": "MemoryService",
-                "entity_type": "component",
+                "note_type": "component",
                 "description": "Core service",
                 "observations": [...],
                 "relations": [...]
@@ -284,3 +292,71 @@ class DeleteEntitiesResponse(SQLAlchemyModel):
     """
 
     deleted: bool
+
+
+class DirectoryMoveError(BaseModel):
+    """Error details for a failed file move within a directory move operation."""
+
+    path: str
+    error: str
+
+
+class DirectoryDeleteError(BaseModel):
+    """Error details for a failed file delete within a directory delete operation."""
+
+    path: str
+    error: str
+
+
+class DirectoryMoveResult(SQLAlchemyModel):
+    """Response schema for directory move operations.
+
+    Returns detailed results of moving all files within a directory,
+    including counts and any errors encountered.
+
+    Example Response:
+    {
+        "total_files": 5,
+        "successful_moves": 5,
+        "failed_moves": 0,
+        "moved_files": [
+            "docs/file1.md",
+            "docs/file2.md",
+            "docs/subdir/file3.md"
+        ],
+        "errors": []
+    }
+    """
+
+    total_files: int
+    successful_moves: int
+    failed_moves: int
+    moved_files: List[str]  # List of file paths that were moved
+    errors: List[DirectoryMoveError]  # List of errors for failed moves
+
+
+class DirectoryDeleteResult(SQLAlchemyModel):
+    """Response schema for directory delete operations.
+
+    Returns detailed results of deleting all files within a directory,
+    including counts and any errors encountered.
+
+    Example Response:
+    {
+        "total_files": 5,
+        "successful_deletes": 5,
+        "failed_deletes": 0,
+        "deleted_files": [
+            "docs/file1.md",
+            "docs/file2.md",
+            "docs/subdir/file3.md"
+        ],
+        "errors": []
+    }
+    """
+
+    total_files: int
+    successful_deletes: int
+    failed_deletes: int
+    deleted_files: List[str]  # List of file paths that were deleted
+    errors: List[DirectoryDeleteError]  # List of errors for failed deletes

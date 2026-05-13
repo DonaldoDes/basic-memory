@@ -11,6 +11,26 @@ from basic_memory.schemas.project_info import ProjectItem, ProjectStatusResponse
 from basic_memory.schemas.v2 import ProjectResolveResponse
 
 
+def _project_item(project: ProjectItem | None) -> ProjectItem:
+    assert project is not None
+    return project
+
+
+@pytest.mark.asyncio
+async def test_list_projects(client: AsyncClient, test_project: Project, v2_projects_url):
+    """Test listing projects returns default_project from the database."""
+    response = await client.get(f"{v2_projects_url}/")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    # default_project must be populated from the is_default flag in the database
+    assert data["default_project"] == test_project.name
+
+    project_names = [p["name"] for p in data["projects"]]
+    assert test_project.name in project_names
+
+
 @pytest.mark.asyncio
 async def test_get_project_by_id(client: AsyncClient, test_project: Project, v2_projects_url):
     """Test getting a project by its external_id UUID."""
@@ -52,10 +72,12 @@ async def test_update_project_path_by_id(
         assert response.status_code == 200
         status_response = ProjectStatusResponse.model_validate(response.json())
         assert status_response.status == "success"
-        assert status_response.new_project.external_id == test_project.external_id
+        new_project = _project_item(status_response.new_project)
+        old_project = _project_item(status_response.old_project)
+        assert new_project.external_id == test_project.external_id
         # Normalize paths for cross-platform comparison (Windows uses backslashes, API returns forward slashes)
-        assert Path(status_response.new_project.path) == Path(new_path)
-        assert status_response.old_project.external_id == test_project.external_id
+        assert Path(new_project.path) == Path(new_path)
+        assert old_project.external_id == test_project.external_id
 
 
 @pytest.mark.asyncio
@@ -74,10 +96,12 @@ async def test_update_project_invalid_path(
 
 
 @pytest.mark.asyncio
-async def test_update_project_not_found(client: AsyncClient, v2_projects_url):
+async def test_update_project_not_found(client: AsyncClient, v2_projects_url, tmp_path):
     """Test updating a non-existent project returns 404."""
     fake_uuid = "00000000-0000-0000-0000-000000000000"
-    update_data = {"path": "/tmp/new-path"}
+    # Use tmp_path for cross-platform absolute path compatibility
+    new_path = str(tmp_path / "new-path")
+    update_data = {"path": new_path}
     response = await client.patch(
         f"{v2_projects_url}/{fake_uuid}",
         json=update_data,
@@ -105,10 +129,12 @@ async def test_set_default_project_by_id(
     status_response = ProjectStatusResponse.model_validate(response.json())
     assert status_response.status == "success"
     assert status_response.default is True
-    assert status_response.new_project.external_id == created_project.external_id
-    assert status_response.new_project.is_default is True
-    assert status_response.old_project.external_id == test_project.external_id
-    assert status_response.old_project.is_default is False
+    new_project = _project_item(status_response.new_project)
+    old_project = _project_item(status_response.old_project)
+    assert new_project.external_id == created_project.external_id
+    assert new_project.is_default is True
+    assert old_project.external_id == test_project.external_id
+    assert old_project.is_default is False
 
 
 @pytest.mark.asyncio
@@ -138,7 +164,8 @@ async def test_delete_project_by_id(
     assert response.status_code == 200
     status_response = ProjectStatusResponse.model_validate(response.json())
     assert status_response.status == "success"
-    assert status_response.old_project.external_id == created_project.external_id
+    old_project = _project_item(status_response.old_project)
+    assert old_project.external_id == created_project.external_id
     assert status_response.new_project is None
 
     # Verify it's deleted - trying to get it should return 404
@@ -167,7 +194,9 @@ async def test_delete_project_with_delete_notes_param(
         assert created_project is not None
 
         # Delete with delete_notes=true
-        response = await client.delete(f"{v2_projects_url}/{created_project.external_id}?delete_notes=true")
+        response = await client.delete(
+            f"{v2_projects_url}/{created_project.external_id}?delete_notes=true"
+        )
 
         assert response.status_code == 200
 
@@ -293,6 +322,21 @@ async def test_resolve_project_by_permalink(
 
 
 @pytest.mark.asyncio
+async def test_resolve_project_by_workspace_qualified_permalink(
+    client: AsyncClient, test_project: Project, v2_projects_url
+):
+    """Resolve the workspace/project form shown by MCP disambiguation errors."""
+    resolve_data = {"identifier": f"personal/{test_project.name}"}
+    response = await client.post(f"{v2_projects_url}/resolve", json=resolve_data)
+
+    assert response.status_code == 200
+    resolved = ProjectResolveResponse.model_validate(response.json())
+    assert resolved.external_id == test_project.external_id
+    assert resolved.name == test_project.name
+    assert resolved.resolution_method == "permalink"
+
+
+@pytest.mark.asyncio
 async def test_resolve_project_by_id(client: AsyncClient, test_project: Project, v2_projects_url):
     """Test resolving a project by external_id string returns correct project external_id."""
     resolve_data = {"identifier": test_project.external_id}
@@ -336,3 +380,71 @@ async def test_resolve_project_empty_identifier(client: AsyncClient, v2_projects
     response = await client.post(f"{v2_projects_url}/resolve", json=resolve_data)
 
     assert response.status_code == 422  # Validation error
+
+
+# --- Legacy v1 compatibility tests ---
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_list_projects_endpoint(client: AsyncClient, test_project: Project):
+    """Test that the legacy /projects/projects endpoint still works for older CLI versions.
+
+    This endpoint was removed when we migrated to v2 but older versions of
+    basic-memory-cloud CLI still call it for `bm project list`.
+
+    Note: The route must be without trailing slash to avoid 307 redirects
+    that the cloud proxy doesn't follow.
+    """
+    # The legacy v1 endpoint was at /projects/projects (no trailing slash)
+    response = await client.get("/projects/projects")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "projects" in data
+
+    # default_project must be populated, not null
+    assert data["default_project"] == test_project.name
+
+    project_names = [p["name"] for p in data["projects"]]
+    assert test_project.name in project_names
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_add_project_endpoint(client: AsyncClient, test_project: Project):
+    """Test that the legacy POST /projects/projects endpoint still works for older CLI versions.
+
+    Older versions of basic-memory-cloud CLI call POST /projects/projects to add projects.
+    The legacy route must proxy through to the same handler as v2.
+
+    Uses the existing test project name+path to exercise the idempotent path (200 OK),
+    which proves the route is connected without needing a full config manager.
+    """
+    response = await client.post(
+        "/projects/projects",
+        json={
+            "name": test_project.name,
+            "path": test_project.path,
+            "set_default": False,
+        },
+    )
+
+    # Idempotent: same name + same path returns 200
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+    assert test_project.name in data["message"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_sync_config_endpoint(client: AsyncClient):
+    """Test that the legacy POST /projects/config/sync endpoint still works for older CLI versions.
+
+    Older versions of basic-memory-cloud CLI call POST /projects/config/sync to synchronize
+    projects between config file and database. The route must be reachable.
+    """
+    response = await client.post("/projects/config/sync")
+
+    # The handler synchronizes config ↔ DB; should succeed in test environment
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"

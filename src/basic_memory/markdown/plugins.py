@@ -1,6 +1,8 @@
 """Markdown-it plugins for Basic Memory markdown parsing."""
 
 from typing import List, Any, Dict
+
+from basic_memory.utils import normalize_project_reference
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
@@ -114,7 +116,7 @@ def parse_relation(token: Token) -> Dict[str, Any] | None:
             rel_type = before
 
         # Get target
-        target = content[start + 2 : end].strip()
+        target = normalize_project_reference(content[start + 2 : end].strip())
 
         # Look for context after
         after = content[end + 2 :].strip()
@@ -160,7 +162,7 @@ def parse_inline_relations(content: str) -> List[Dict[str, Any]]:
             # No matching ]] found
             break
 
-        target = content[start + 2 : end].strip()
+        target = normalize_project_reference(content[start + 2 : end].strip())
         if target:
             relations.append({"type": "links_to", "target": target, "context": None})
 
@@ -178,12 +180,27 @@ def observation_plugin(md: MarkdownIt) -> None:
     def observation_rule(state: Any) -> None:
         """Process observations in token stream."""
         tokens = state.tokens
+        # Track blockquote nesting so Obsidian callouts (`> [!info] Title`)
+        # don't get parsed as observations with category `!info`.
+        blockquote_depth = 0
 
         for idx in range(len(tokens)):
             token = tokens[idx]
 
             # Initialize meta for all tokens
             token.meta = token.meta or {}
+
+            if token.type == "blockquote_open":
+                blockquote_depth += 1
+                continue
+            if token.type == "blockquote_close":
+                blockquote_depth -= 1
+                continue
+
+            # Skip parsing inside blockquotes — that's Obsidian callout
+            # territory, not Basic Memory observation syntax.
+            if blockquote_depth > 0:
+                continue
 
             # Parse observations in list items
             if token.type == "inline" and is_observation(token):

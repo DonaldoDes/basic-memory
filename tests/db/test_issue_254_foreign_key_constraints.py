@@ -65,7 +65,7 @@ async def test_issue_254_foreign_key_constraint_fix(project_service: ProjectServ
         # Create entity
         entity_data = {
             "title": "Issue 254 Test Entity",
-            "entity_type": "note",
+            "note_type": "note",
             "content_type": "text/markdown",
             "project_id": project.id,
             "permalink": "issue-254-entity",
@@ -137,6 +137,7 @@ async def test_issue_254_reproduction(project_service: ProjectService):
         # Create project and entity
         await project_service.add_project(test_project_name, test_project_path)
         project = await project_service.get_project(test_project_name)
+        assert project is not None
 
         from basic_memory.repository.entity_repository import EntityRepository
 
@@ -146,7 +147,7 @@ async def test_issue_254_reproduction(project_service: ProjectService):
 
         entity_data = {
             "title": "Reproduction Entity",
-            "entity_type": "note",
+            "note_type": "note",
             "content_type": "text/markdown",
             "project_id": project.id,
             "permalink": "reproduction-entity",

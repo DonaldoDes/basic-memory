@@ -39,7 +39,7 @@ async def related_results(session_maker, test_project: Project):
         source = Entity(
             project_id=test_project.id,
             title="source",
-            entity_type="test",
+            note_type="test",
             permalink="source/source",
             file_path="source/source.md",
             content_type="text/markdown",
@@ -49,7 +49,7 @@ async def related_results(session_maker, test_project: Project):
         target = Entity(
             project_id=test_project.id,
             title="target",
-            entity_type="test",
+            note_type="test",
             permalink="target/target",
             file_path="target/target.md",
             content_type="text/markdown",
@@ -78,7 +78,7 @@ async def test_create_entity(entity_repository: EntityRepository):
     entity_data = {
         "project_id": entity_repository.project_id,
         "title": "Test",
-        "entity_type": "test",
+        "note_type": "test",
         "permalink": "test/test",
         "file_path": "test/test.md",
         "content_type": "text/markdown",
@@ -112,7 +112,7 @@ async def test_create_all(entity_repository: EntityRepository):
         {
             "project_id": entity_repository.project_id,
             "title": "Test_1",
-            "entity_type": "test",
+            "note_type": "test",
             "permalink": "test/test-1",
             "file_path": "test/test_1.md",
             "content_type": "text/markdown",
@@ -122,7 +122,7 @@ async def test_create_all(entity_repository: EntityRepository):
         {
             "project_id": entity_repository.project_id,
             "title": "Test-2",
-            "entity_type": "test",
+            "note_type": "test",
             "permalink": "test/test-2",
             "file_path": "test/test_2.md",
             "content_type": "text/markdown",
@@ -191,7 +191,7 @@ async def test_update_entity_returns_with_relations_and_observations(
         target = Entity(
             project_id=test_project.id,
             title="target",
-            entity_type="test",
+            note_type="test",
             permalink="target/target",
             file_path="target/target.md",
             content_type="text/markdown",
@@ -264,12 +264,12 @@ async def test_delete_entity_with_observations(
 @pytest.mark.asyncio
 async def test_delete_entities_by_type(entity_repository: EntityRepository, sample_entity):
     """Test deleting entities by type."""
-    result = await entity_repository.delete_by_fields(entity_type=sample_entity.entity_type)
+    result = await entity_repository.delete_by_fields(note_type=sample_entity.note_type)
     assert result is True
 
     # Verify deletion
     async with db.scoped_session(entity_repository.session_maker) as session:
-        query = select(Entity).filter(Entity.entity_type == sample_entity.entity_type)
+        query = select(Entity).filter(Entity.note_type == sample_entity.note_type)
         result = await session.execute(query)
         remaining = result.scalars().all()
         assert len(remaining) == 0
@@ -311,7 +311,7 @@ async def test_entities(session_maker, test_project: Project):
             Entity(
                 project_id=test_project.id,
                 title="entity1",
-                entity_type="test",
+                note_type="test",
                 permalink="type1/entity1",
                 file_path="type1/entity1.md",
                 content_type="text/markdown",
@@ -321,7 +321,7 @@ async def test_entities(session_maker, test_project: Project):
             Entity(
                 project_id=test_project.id,
                 title="entity2",
-                entity_type="test",
+                note_type="test",
                 permalink="type1/entity2",
                 file_path="type1/entity2.md",
                 content_type="text/markdown",
@@ -331,7 +331,7 @@ async def test_entities(session_maker, test_project: Project):
             Entity(
                 project_id=test_project.id,
                 title="entity3",
-                entity_type="test",
+                note_type="test",
                 permalink="type2/entity3",
                 file_path="type2/entity3.md",
                 content_type="text/markdown",
@@ -390,7 +390,7 @@ async def test_generate_permalink_from_file_path():
         # Verify the result passes validation
         Entity(
             title="test",
-            entity_type="test",
+            note_type="test",
             permalink=result,
             file_path=input_path,
             content_type="text/markdown",
@@ -406,7 +406,7 @@ async def test_get_by_title(entity_repository: EntityRepository, session_maker):
             Entity(
                 project_id=entity_repository.project_id,
                 title="Unique Title",
-                entity_type="test",
+                note_type="test",
                 permalink="test/unique-title",
                 file_path="test/unique-title.md",
                 content_type="text/markdown",
@@ -416,7 +416,7 @@ async def test_get_by_title(entity_repository: EntityRepository, session_maker):
             Entity(
                 project_id=entity_repository.project_id,
                 title="Another Title",
-                entity_type="test",
+                note_type="test",
                 permalink="test/another-title",
                 file_path="test/another-title.md",
                 content_type="text/markdown",
@@ -426,7 +426,7 @@ async def test_get_by_title(entity_repository: EntityRepository, session_maker):
             Entity(
                 project_id=entity_repository.project_id,
                 title="Another Title",
-                entity_type="test",
+                note_type="test",
                 permalink="test/another-title-1",
                 file_path="test/another-title-1.md",
                 content_type="text/markdown",
@@ -457,6 +457,66 @@ async def test_get_by_title(entity_repository: EntityRepository, session_maker):
 
 
 @pytest.mark.asyncio
+async def test_get_by_title_returns_shortest_path_first(
+    entity_repository: EntityRepository, session_maker
+):
+    """Test that duplicate titles are returned with shortest path first.
+
+    When multiple entities share the same title in different folders,
+    the one with the shortest file path should be returned first.
+    This provides consistent, predictable link resolution.
+    """
+    async with db.scoped_session(session_maker) as session:
+        # Create entities with same title but different path lengths
+        # Insert in reverse order to ensure we're testing ordering, not insertion order
+        entities = [
+            Entity(
+                project_id=entity_repository.project_id,
+                title="My Note",
+                note_type="note",
+                permalink="archive/old/2024/my-note",
+                file_path="archive/old/2024/My Note.md",  # longest path
+                content_type="text/markdown",
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            ),
+            Entity(
+                project_id=entity_repository.project_id,
+                title="My Note",
+                note_type="note",
+                permalink="docs/my-note",
+                file_path="docs/My Note.md",  # medium path
+                content_type="text/markdown",
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            ),
+            Entity(
+                project_id=entity_repository.project_id,
+                title="My Note",
+                note_type="note",
+                permalink="my-note",
+                file_path="My Note.md",  # shortest path (root)
+                content_type="text/markdown",
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            ),
+        ]
+        session.add_all(entities)
+        await session.flush()
+
+    # Get all entities with title "My Note"
+    found = await entity_repository.get_by_title("My Note")
+
+    # Should return all 3
+    assert len(found) == 3
+
+    # Should be ordered by path length (shortest first)
+    assert found[0].file_path == "My Note.md"  # shortest
+    assert found[1].file_path == "docs/My Note.md"  # medium
+    assert found[2].file_path == "archive/old/2024/My Note.md"  # longest
+
+
+@pytest.mark.asyncio
 async def test_get_by_file_path(entity_repository: EntityRepository, session_maker):
     """Test getting an entity by title."""
     # Create test entities
@@ -465,7 +525,7 @@ async def test_get_by_file_path(entity_repository: EntityRepository, session_mak
             Entity(
                 project_id=entity_repository.project_id,
                 title="Unique Title",
-                entity_type="test",
+                note_type="test",
                 permalink="test/unique-title",
                 file_path="test/unique-title.md",
                 content_type="text/markdown",
@@ -495,7 +555,7 @@ async def test_get_distinct_directories(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 1",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/guides/file1",
                 file_path="docs/guides/file1.md",
                 content_type="text/markdown",
@@ -505,7 +565,7 @@ async def test_get_distinct_directories(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 2",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/guides/file2",
                 file_path="docs/guides/file2.md",
                 content_type="text/markdown",
@@ -515,7 +575,7 @@ async def test_get_distinct_directories(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 3",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/api/file3",
                 file_path="docs/api/file3.md",
                 content_type="text/markdown",
@@ -525,7 +585,7 @@ async def test_get_distinct_directories(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 4",
-                entity_type="test",
+                note_type="test",
                 permalink="specs/file4",
                 file_path="specs/file4.md",
                 content_type="text/markdown",
@@ -535,7 +595,7 @@ async def test_get_distinct_directories(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 5",
-                entity_type="test",
+                note_type="test",
                 permalink="notes/2024/q1/file5",
                 file_path="notes/2024/q1/file5.md",
                 content_type="text/markdown",
@@ -589,7 +649,7 @@ async def test_find_by_directory_prefix(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 1",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/file1",
                 file_path="docs/file1.md",
                 content_type="text/markdown",
@@ -599,7 +659,7 @@ async def test_find_by_directory_prefix(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 2",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/guides/file2",
                 file_path="docs/guides/file2.md",
                 content_type="text/markdown",
@@ -609,7 +669,7 @@ async def test_find_by_directory_prefix(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 3",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/api/file3",
                 file_path="docs/api/file3.md",
                 content_type="text/markdown",
@@ -619,7 +679,7 @@ async def test_find_by_directory_prefix(entity_repository: EntityRepository, ses
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 4",
-                entity_type="test",
+                note_type="test",
                 permalink="specs/file4",
                 file_path="specs/file4.md",
                 content_type="text/markdown",
@@ -674,7 +734,7 @@ async def test_find_by_directory_prefix_basic_fields_only(
         entity = Entity(
             project_id=entity_repository.project_id,
             title="Test Entity",
-            entity_type="test",
+            note_type="test",
             permalink="docs/test",
             file_path="docs/test.md",
             content_type="text/markdown",
@@ -693,7 +753,7 @@ async def test_find_by_directory_prefix_basic_fields_only(
     assert entity.title == "Test Entity"
     assert entity.file_path == "docs/test.md"
     assert entity.permalink == "docs/test"
-    assert entity.entity_type == "test"
+    assert entity.note_type == "test"
     assert entity.content_type == "text/markdown"
     assert entity.updated_at is not None
 
@@ -707,7 +767,7 @@ async def test_get_all_file_paths(entity_repository: EntityRepository, session_m
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 1",
-                entity_type="test",
+                note_type="test",
                 permalink="docs/file1",
                 file_path="docs/file1.md",
                 content_type="text/markdown",
@@ -717,7 +777,7 @@ async def test_get_all_file_paths(entity_repository: EntityRepository, session_m
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 2",
-                entity_type="test",
+                note_type="test",
                 permalink="specs/file2",
                 file_path="specs/file2.md",
                 content_type="text/markdown",
@@ -727,7 +787,7 @@ async def test_get_all_file_paths(entity_repository: EntityRepository, session_m
             Entity(
                 project_id=entity_repository.project_id,
                 title="File 3",
-                entity_type="test",
+                note_type="test",
                 permalink="notes/file3",
                 file_path="notes/file3.md",
                 content_type="text/markdown",
@@ -767,7 +827,7 @@ async def test_get_all_file_paths_performance(entity_repository: EntityRepositor
         entity1 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 1",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity1",
             file_path="test/entity1.md",
             content_type="text/markdown",
@@ -777,7 +837,7 @@ async def test_get_all_file_paths_performance(entity_repository: EntityRepositor
         entity2 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 2",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity2",
             file_path="test/entity2.md",
             content_type="text/markdown",
@@ -829,7 +889,7 @@ async def test_get_all_file_paths_project_isolation(
         entity1 = Entity(
             project_id=entity_repository.project_id,
             title="Project 1 File",
-            entity_type="test",
+            note_type="test",
             permalink="test/file1",
             file_path="test/file1.md",
             content_type="text/markdown",
@@ -848,7 +908,7 @@ async def test_get_all_file_paths_project_isolation(
         entity2 = Entity(
             project_id=project2.id,
             title="Project 2 File",
-            entity_type="test",
+            note_type="test",
             permalink="test/file2",
             file_path="test/file2.md",
             content_type="text/markdown",
@@ -875,7 +935,8 @@ async def test_get_all_file_paths_project_isolation(
 async def test_permalink_exists(entity_repository: EntityRepository, sample_entity: Entity):
     """Test checking if a permalink exists without loading full entity."""
     # Existing permalink should return True
-    assert await entity_repository.permalink_exists(sample_entity.permalink) is True  # pyright: ignore [reportArgumentType]
+    assert sample_entity.permalink is not None
+    assert await entity_repository.permalink_exists(sample_entity.permalink) is True
 
     # Non-existent permalink should return False
     assert await entity_repository.permalink_exists("nonexistent/permalink") is False
@@ -891,7 +952,7 @@ async def test_permalink_exists_project_isolation(
         entity1 = Entity(
             project_id=entity_repository.project_id,
             title="Project 1 Entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity1",
             file_path="test/entity1.md",
             content_type="text/markdown",
@@ -908,7 +969,7 @@ async def test_permalink_exists_project_isolation(
         entity2 = Entity(
             project_id=project2.id,
             title="Project 2 Entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity2",
             file_path="test/entity2.md",
             content_type="text/markdown",
@@ -930,7 +991,8 @@ async def test_get_file_path_for_permalink(
 ):
     """Test getting file_path for a permalink without loading full entity."""
     # Existing permalink should return file_path
-    file_path = await entity_repository.get_file_path_for_permalink(sample_entity.permalink)  # pyright: ignore [reportArgumentType]
+    assert sample_entity.permalink is not None
+    file_path = await entity_repository.get_file_path_for_permalink(sample_entity.permalink)
     assert file_path == sample_entity.file_path
 
     # Non-existent permalink should return None
@@ -959,7 +1021,7 @@ async def test_get_all_permalinks(entity_repository: EntityRepository, session_m
         entity1 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 1",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity1",
             file_path="test/entity1.md",
             content_type="text/markdown",
@@ -969,7 +1031,7 @@ async def test_get_all_permalinks(entity_repository: EntityRepository, session_m
         entity2 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 2",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity2",
             file_path="test/entity2.md",
             content_type="text/markdown",
@@ -989,13 +1051,32 @@ async def test_get_all_permalinks(entity_repository: EntityRepository, session_m
 
 
 @pytest.mark.asyncio
+async def test_find_by_ids_for_hydration_skips_eager_load_options(
+    entity_repository: EntityRepository, sample_entity: Entity, monkeypatch: pytest.MonkeyPatch
+):
+    """Context hydration should bypass relationship loader options."""
+
+    def fail_get_load_options():
+        raise AssertionError("hydration lookup must not eager load entity relationships")
+
+    monkeypatch.setattr(entity_repository, "get_load_options", fail_get_load_options)
+
+    found = await entity_repository.find_by_ids_for_hydration([sample_entity.id])
+
+    assert len(found) == 1
+    assert found[0].id == sample_entity.id
+    assert found[0].title == sample_entity.title
+    assert found[0].external_id == sample_entity.external_id
+
+
+@pytest.mark.asyncio
 async def test_get_permalink_to_file_path_map(entity_repository: EntityRepository, session_maker):
     """Test getting permalink -> file_path mapping for bulk operations."""
     async with db.scoped_session(session_maker) as session:
         entity1 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 1",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity1",
             file_path="test/entity1.md",
             content_type="text/markdown",
@@ -1005,7 +1086,7 @@ async def test_get_permalink_to_file_path_map(entity_repository: EntityRepositor
         entity2 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 2",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity2",
             file_path="test/entity2.md",
             content_type="text/markdown",
@@ -1028,7 +1109,7 @@ async def test_get_file_path_to_permalink_map(entity_repository: EntityRepositor
         entity1 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 1",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity1",
             file_path="test/entity1.md",
             content_type="text/markdown",
@@ -1038,7 +1119,7 @@ async def test_get_file_path_to_permalink_map(entity_repository: EntityRepositor
         entity2 = Entity(
             project_id=entity_repository.project_id,
             title="Entity 2",
-            entity_type="test",
+            note_type="test",
             permalink="test/entity2",
             file_path="test/entity2.md",
             content_type="text/markdown",
@@ -1052,3 +1133,150 @@ async def test_get_file_path_to_permalink_map(entity_repository: EntityRepositor
     assert len(mapping) == 2
     assert mapping["test/entity1.md"] == "test/entity1"
     assert mapping["test/entity2.md"] == "test/entity2"
+
+
+@pytest.mark.asyncio
+async def test_find_without_relations_returns_isolated_entities(
+    entity_repository: EntityRepository, session_maker, test_project: Project
+):
+    """Entities with no incoming or outgoing relations are returned as orphans."""
+    async with db.scoped_session(session_maker) as session:
+        orphan = Entity(
+            project_id=test_project.id,
+            title="Orphan",
+            note_type="test",
+            permalink="orphan/orphan",
+            file_path="orphan/orphan.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        source = Entity(
+            project_id=test_project.id,
+            title="Source",
+            note_type="test",
+            permalink="source/source",
+            file_path="source/source.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        target = Entity(
+            project_id=test_project.id,
+            title="Target",
+            note_type="test",
+            permalink="target/target",
+            file_path="target/target.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([orphan, source, target])
+        await session.flush()
+
+        relation = Relation(
+            project_id=test_project.id,
+            from_id=source.id,
+            to_id=target.id,
+            to_name=target.title,
+            relation_type="links_to",
+        )
+        session.add(relation)
+
+    result = await entity_repository.find_without_relations()
+    titles = {entity.title for entity in result}
+
+    assert "Orphan" in titles
+    assert "Source" not in titles
+    assert "Target" not in titles
+
+
+@pytest.mark.asyncio
+async def test_find_without_relations_excludes_unresolved_outgoing_links(
+    entity_repository: EntityRepository, session_maker, test_project: Project
+):
+    """Entities with unresolved outgoing relations are still connected source nodes."""
+    async with db.scoped_session(session_maker) as session:
+        source = Entity(
+            project_id=test_project.id,
+            title="Source",
+            note_type="test",
+            permalink="source/source",
+            file_path="source/source.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        orphan = Entity(
+            project_id=test_project.id,
+            title="Orphan",
+            note_type="test",
+            permalink="orphan/orphan",
+            file_path="orphan/orphan.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([source, orphan])
+        await session.flush()
+
+        unresolved_relation = Relation(
+            project_id=test_project.id,
+            from_id=source.id,
+            to_id=None,
+            to_name="Missing Target",
+            relation_type="links_to",
+        )
+        session.add(unresolved_relation)
+
+    result = await entity_repository.find_without_relations()
+    titles = {entity.title for entity in result}
+
+    assert "Orphan" in titles
+    assert "Source" not in titles
+
+
+@pytest.mark.asyncio
+async def test_find_without_relations_respects_project_scope(
+    entity_repository: EntityRepository, session_maker, test_project: Project
+):
+    """Orphan detection only returns isolated entities for the active project."""
+    async with db.scoped_session(session_maker) as session:
+        active_orphan = Entity(
+            project_id=test_project.id,
+            title="Active Project Orphan",
+            note_type="test",
+            permalink="active/orphan",
+            file_path="active/orphan.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        other_project = Project(name="other-project", path="/tmp/other")
+        session.add_all([active_orphan, other_project])
+        await session.flush()
+
+        other_orphan = Entity(
+            project_id=other_project.id,
+            title="Other Project Orphan",
+            note_type="test",
+            permalink="other/orphan",
+            file_path="other/orphan.md",
+            content_type="text/markdown",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add(other_orphan)
+
+    result = await entity_repository.find_without_relations()
+    titles = {entity.title for entity in result}
+
+    assert "Active Project Orphan" in titles
+    assert "Other Project Orphan" not in titles
+
+
+@pytest.mark.asyncio
+async def test_find_without_relations_empty_project(entity_repository: EntityRepository):
+    """An empty project returns no orphans."""
+    result = await entity_repository.find_without_relations()
+    assert result == []

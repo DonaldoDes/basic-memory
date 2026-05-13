@@ -8,7 +8,7 @@ import everything from basic_memory.schemas.
 # Base types and models
 from basic_memory.schemas.base import (
     Observation,
-    EntityType,
+    NoteType,
     RelationType,
     Relation,
     Entity,
@@ -41,6 +41,7 @@ from basic_memory.schemas.project_info import (
     ProjectStatistics,
     ActivityMetrics,
     SystemStatus,
+    EmbeddingStatus,
     ProjectInfoResponse,
 )
 
@@ -56,7 +57,7 @@ from basic_memory.schemas.sync_report import (
 __all__ = [
     # Base
     "Observation",
-    "EntityType",
+    "NoteType",
     "RelationType",
     "Relation",
     "Entity",
@@ -78,6 +79,7 @@ __all__ = [
     "ProjectStatistics",
     "ActivityMetrics",
     "SystemStatus",
+    "EmbeddingStatus",
     "ProjectInfoResponse",
     # Directory
     "DirectoryNode",

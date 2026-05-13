@@ -13,7 +13,7 @@ from pathlib import Path
 from loguru import logger
 
 from basic_memory import db
-from basic_memory.config import BasicMemoryConfig
+from basic_memory.config import BasicMemoryConfig, DatabaseBackend, ProjectMode
 from basic_memory.models import Project
 from basic_memory.repository import (
     ProjectRepository,
@@ -71,11 +71,13 @@ async def reconcile_projects_with_config(app_config: BasicMemoryConfig):
 
 async def initialize_file_sync(
     app_config: BasicMemoryConfig,
+    quiet: bool = True,
 ) -> None:
     """Initialize file synchronization services. This function starts the watch service and does not return
 
     Args:
         app_config: The Basic Memory project configuration
+        quiet: Whether to suppress Rich console output (True for MCP, False for CLI watch)
 
     Returns:
         The watch service task that's monitoring file changes
@@ -97,21 +99,39 @@ async def initialize_file_sync(
     )
     project_repository = ProjectRepository(session_maker)
 
+    # Filter to constrained project if MCP server was started with --project.
+    # Applied to both the initial background sync and the watch service so that
+    # running multiple `basic-memory mcp --project X` processes does not produce
+    # duplicate watchers fighting over the same files.
+    constrained_project = os.environ.get("BASIC_MEMORY_MCP_PROJECT")
+
     # Initialize watch service
     watch_service = WatchService(
         app_config=app_config,
         project_repository=project_repository,
-        quiet=True,
+        quiet=quiet,
+        constrained_project=constrained_project,
     )
 
     # Get active projects
     active_projects = await project_repository.get_active_projects()
 
-    # Filter to constrained project if MCP server was started with --project
-    constrained_project = os.environ.get("BASIC_MEMORY_MCP_PROJECT")
     if constrained_project:
         active_projects = [p for p in active_projects if p.name == constrained_project]
         logger.info(f"Background sync constrained to project: {constrained_project}")
+
+    # Skip cloud-mode projects that have no local directory.
+    # Cloud projects with a local bisync copy (absolute path) are kept for local sync.
+    cloud_skip = []
+    for p in active_projects:
+        if app_config.get_project_mode(p.name) == ProjectMode.CLOUD:
+            entry = app_config.projects.get(p.name)
+            if entry and Path(entry.path).is_absolute():
+                continue  # Cloud project with local bisync copy — keep for local sync
+            cloud_skip.append(p.name)
+    if cloud_skip:
+        active_projects = [p for p in active_projects if p.name not in cloud_skip]
+        logger.info(f"Skipping cloud-mode projects for local sync: {cloud_skip}")
 
     # Start sync for all projects as background tasks (non-blocking)
     async def sync_project_background(project: Project):
@@ -139,7 +159,10 @@ async def initialize_file_sync(
     # Don't await the tasks - let them run in background while we continue
 
     # Then start the watch service in the background
-    logger.info("Starting watch service for all projects")
+    if constrained_project:
+        logger.info(f"Starting watch service constrained to project: {constrained_project}")
+    else:
+        logger.info("Starting watch service for all projects")
 
     # run the watch service
     await watch_service.run()
@@ -162,9 +185,23 @@ async def initialize_app(
     Args:
         app_config: The Basic Memory project configuration
     """
-    # Skip initialization in cloud mode - cloud manages its own projects
-    if app_config.cloud_mode_enabled:
-        logger.debug("Skipping initialization in cloud mode - projects managed by cloud")
+    # Trigger: frontmatter enforcement is enabled while permalink generation is disabled
+    # Why: missing-frontmatter sync path needs canonical permalinks for deterministic indexing
+    # Outcome: log startup precedence so behavior is explicit to operators
+    if app_config.ensure_frontmatter_on_sync and app_config.disable_permalinks:
+        logger.warning(
+            "Config precedence: ensure_frontmatter_on_sync=True overrides "
+            "disable_permalinks=True for markdown files missing frontmatter during sync; "
+            "permalinks will be written."
+        )
+
+    # Trigger: database backend is Postgres (cloud deployment)
+    # Why: cloud deployments manage their own projects and migrations via the cloud platform.
+    # The local MCP server always uses SQLite and needs initialization even when
+    # projects are configured for cloud routing.
+    # Outcome: skip initialization only for actual cloud Postgres deployments.
+    if app_config.database_backend == DatabaseBackend.POSTGRES:
+        logger.info("Skipping local initialization - Postgres backend manages its own schema")
         return
 
     logger.info("Initializing app...")
@@ -174,7 +211,7 @@ async def initialize_app(
     # Reconcile projects from config.json with projects table
     await reconcile_projects_with_config(app_config)
 
-    logger.info("App initialization completed (migration running in background if needed)")
+    logger.info("App initialization completed")
 
 
 def ensure_initialization(app_config: BasicMemoryConfig) -> None:
@@ -183,14 +220,13 @@ def ensure_initialization(app_config: BasicMemoryConfig) -> None:
     This is a wrapper for the async initialize_app function that can be
     called from synchronous code like CLI entry points.
 
-    No-op if app_config.cloud_mode == True. Cloud basic memory manages it's own projects
+    No-op if database backend is Postgres (cloud deployment manages its own schema).
 
     Args:
         app_config: The Basic Memory project configuration
     """
-    # Skip initialization in cloud mode - cloud manages its own projects
-    if app_config.cloud_mode_enabled:
-        logger.debug("Skipping initialization in cloud mode - projects managed by cloud")
+    if app_config.database_backend == DatabaseBackend.POSTGRES:
+        logger.info("Skipping local initialization - Postgres backend manages its own schema")
         return
 
     async def _init_and_cleanup():

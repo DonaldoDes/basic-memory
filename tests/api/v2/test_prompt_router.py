@@ -9,9 +9,13 @@ from basic_memory.services.context_service import ContextService
 
 
 @pytest_asyncio.fixture
-async def context_service(entity_repository, search_service, observation_repository):
+async def context_service(
+    search_repository, entity_repository, observation_repository, link_resolver
+):
     """Create a real context service for testing."""
-    return ContextService(entity_repository, search_service, observation_repository)
+    return ContextService(
+        search_repository, entity_repository, observation_repository, link_resolver=link_resolver
+    )
 
 
 @pytest.mark.asyncio
