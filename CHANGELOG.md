@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## v0.18.0 (2026-01-28)
+
+### Features
+
+- **#527**: Add context-aware wiki link resolution with source_path support
+  ([`0023e73`](https://github.com/basicmachines-co/basic-memory/commit/0023e73))
+  - Add `source_path` parameter to `resolve_link()` for context-aware resolution
+  - Relative path resolution: `[[nested/note]]` from `folder/file.md` → `folder/nested/note.md`
+  - Proximity-based resolution for duplicate titles (prefers notes in same folder)
+  - Strict mode to disable fuzzy search fallback for wiki links
+
+- **#518**: Add directory support to move_note and delete_note tools
+  ([`0b20801`](https://github.com/basicmachines-co/basic-memory/commit/0b20801))
+  - Add `is_directory` parameter to `move_note` and `delete_note` MCP tools
+  - New `POST /move-directory` and delete directory API endpoints
+  - Rename `folder` → `directory` parameter across codebase for consistency
+
+- **#522**: Local MCP cloud mode routing
+  ([`8730067`](https://github.com/basicmachines-co/basic-memory/commit/8730067))
+  - Add `--local` and `--cloud` CLI routing flags
+  - Local MCP server (`basic-memory mcp`) automatically uses local routing
+  - Enables simultaneous use of local Claude Desktop and cloud-based clients
+  - Environment variable `BASIC_MEMORY_FORCE_LOCAL=true` for global override
+
+### Bug Fixes
+
+- **#524**: Fix MCP prompt rendering errors
+  ([`e14ba92`](https://github.com/basicmachines-co/basic-memory/commit/e14ba92))
+  - Fix "Error rendering prompt recent_activity" error
+  - Change `TimeFrame` to `str` in prompt type annotations for FastMCP compatibility
+
 ## v0.17.9 (2026-01-24)
 
 ### Bug Fixes
