@@ -238,6 +238,69 @@ def test_sanitize_for_directory_edge_cases(input_directory, expected):
     assert sanitize_for_directory(input_directory) == expected
 
 
+# -----------------------------------------------------------------------------
+# sanitize_for_directory hardening (BUG-001)
+# -----------------------------------------------------------------------------
+
+
+def test_sanitize_for_directory_with_emdash():
+    """Em-dash (U+2014) must be normalized to ASCII hyphen, not silently stripped.
+
+    Pre-fix: " — " was stripped, leaving a double-space which created a
+    distinct filesystem folder from the one the caller intended.
+    """
+    assert sanitize_for_directory("areas/Wealth — Finance") == "areas/Wealth - Finance"
+
+
+def test_sanitize_for_directory_with_endash():
+    """En-dash (U+2013) must be normalized to ASCII hyphen."""
+    assert sanitize_for_directory("areas/Wealth – Finance") == "areas/Wealth - Finance"
+
+
+def test_sanitize_for_directory_with_ampersand():
+    """Ampersand `&` must be normalized to ` and ` (verbose, semantic).
+
+    Choice rationale: ` and ` preserves human readability of folder names
+    (e.g. "Wealth and Finance") and matches the BUG-001 spec's "expected
+    behaviour" example. Folder paths support spaces, so verbosity is not a
+    technical issue.
+    """
+    assert sanitize_for_directory("areas/Wealth & Finance") == "areas/Wealth and Finance"
+
+
+def test_sanitize_for_directory_preserves_accents():
+    """Accented characters (é, è, à, ï, ô, ...) are accepted by `str.isalnum()`
+    and MUST be preserved verbatim — they are valid on POSIX and modern
+    Windows filesystems.
+    """
+    assert sanitize_for_directory("resources/Référence") == "resources/Référence"
+    assert sanitize_for_directory("areas/Études & Recherche") == "areas/Études and Recherche"
+
+
+def test_sanitize_for_directory_raises_on_emoji():
+    """Non-normalizable non-whitelist characters (emoji here) must raise
+    ValueError with a clear message including the offending character, its
+    Unicode codepoint and its position in the input.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        sanitize_for_directory("areas/🚀 Launch")
+    msg = str(exc_info.value)
+    # message must mention the offending char, its codepoint, and the input
+    assert "🚀" in msg
+    assert "U+1F680" in msg
+    assert "areas/🚀 Launch" in msg
+
+
+def test_sanitize_for_directory_raises_on_control_char():
+    """Control characters (\\t, \\n, \\x00, ...) must raise ValueError —
+    silently stripping them would mask malformed input from callers.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        sanitize_for_directory("areas/foo\tbar")
+    msg = str(exc_info.value)
+    assert "U+0009" in msg  # TAB codepoint
+
+
 # =============================================================================
 # format_file tests
 # =============================================================================
