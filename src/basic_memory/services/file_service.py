@@ -191,6 +191,16 @@ class FileService:
         If format_on_save is enabled in config, runs the configured formatter
         after writing and returns the checksum of the formatted content.
 
+        BUG-004 (Option C — last-mile path-traversal defense): after resolving
+        ``full_path`` we check that it is still contained within ``base_path``.
+        This is defense-in-depth on top of the path traversal block in
+        ``file_utils.sanitize_for_directory`` (Option A) — if a future call
+        path bypasses sanitisation (new MCP tool, API route, internal helper),
+        ``write_file`` remains the choke point that refuses to write outside
+        the project root. Detected attempts raise ``FileOperationError``
+        wrapping a ``ValueError`` whose message contains "traversal" so callers
+        can distinguish from generic write failures.
+
         Args:
             path: Where to write (Path or string)
             content: Content to write
@@ -199,11 +209,33 @@ class FileService:
             Checksum of written content (or formatted content if formatting enabled)
 
         Raises:
-            FileOperationError: If write fails
+            FileOperationError: If write fails, OR if the resolved path
+                escapes ``self.base_path`` (path traversal — BUG-004).
         """
         # Convert string to Path if needed
         path_obj = self.base_path / path if isinstance(path, str) else path
         full_path = path_obj if path_obj.is_absolute() else self.base_path / path_obj
+
+        # BUG-004: last-mile defense. Resolve symlinks and `..` segments and
+        # verify the final path is still under base_path. We resolve via
+        # `os.path.normpath` semantics (Path.resolve) which collapses `..`
+        # without requiring the parent dirs to exist (strict=False default).
+        # We compare against `self.base_path` which was already resolved at
+        # __init__ (see FileService.__init__: `base_path.resolve()`).
+        try:
+            resolved_full = full_path.resolve()
+            if not resolved_full.is_relative_to(self.base_path):
+                raise ValueError(
+                    f"Path traversal blocked: resolved path {resolved_full} "
+                    f"escapes project root {self.base_path}"
+                )
+        except ValueError:
+            # ValueError from is_relative_to (Py<3.9 only) or from our raise.
+            # Re-raise as FileOperationError to match the function's contract.
+            raise FileOperationError(
+                f"Path traversal blocked: {full_path} resolves outside "
+                f"project root {self.base_path}"
+            )
 
         try:
             with logfire.span(

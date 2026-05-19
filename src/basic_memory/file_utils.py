@@ -515,13 +515,24 @@ def sanitize_for_directory(directory: str) -> str:
           is a deliberate fork choice (Option B) over the previous silent
           strip, which produced filesystem folders distinct from the intended
           path and broke Obsidian wikilinks.
+        * Rejects path traversal segments ``..`` AFTER the silent strip
+          (BUG-004): inputs like ``"<>../etc"`` would otherwise pass
+          ``validate_project_path`` (the segment ``<>..`` is not literally
+          ``..``) but the strip turns them into a real ``..`` segment,
+          producing end-to-end path traversal. We therefore re-check
+          segments here, post-strip, and raise ``ValueError`` mentioning
+          "traversal" if any equals ``..``. Note that a segment merely
+          *containing* ``..`` (e.g. ``"foo..bar"``) is NOT a traversal and
+          remains legitimate.
         * Compresses consecutive spaces and path separators, then trims
           leading/trailing slashes.
 
     Raises:
         ValueError: When ``directory`` contains a character outside the
             whitelist that cannot be normalised (e.g. emoji, control chars,
-            non-Latin scripts not covered by ``isalnum``-friendly codepoints).
+            non-Latin scripts not covered by ``isalnum``-friendly codepoints),
+            OR when any path segment equals ``..`` after the silent strip of
+            filesystem-reserved characters (path traversal — BUG-004).
     """
     if not directory:
         return ""
@@ -535,6 +546,19 @@ def sanitize_for_directory(directory: str) -> str:
     # segment). This preserves the legacy contract that callers can pass
     # ``"my<>dir"`` and get back ``"mydir"`` without raising.
     sanitized = re.sub(r'[<>:"|?*]', "", sanitized)
+
+    # BUG-004: block path traversal segments produced by the silent strip.
+    # Must run AFTER the strip (otherwise inputs like "<>../etc" slip through
+    # since "<>.." != "..") and BEFORE the trailing path-separator
+    # compression (which could merge segments and mask the issue). We split
+    # on both POSIX and Windows separators so attackers cannot bypass via
+    # backslashes (e.g. "<>..\\etc").
+    for seg in re.split(r"[\\/]+", sanitized):
+        if seg == "..":
+            raise ValueError(
+                f"Path traversal segment '..' detected in folder {directory!r} "
+                f"after sanitization — refusing to construct escape-capable path"
+            )
 
     # Pre-filter normalisation: convert known typographic substitutes BEFORE
     # the whitelist check so they survive sanitisation.

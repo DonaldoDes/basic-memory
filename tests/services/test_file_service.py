@@ -388,3 +388,78 @@ async def test_read_file_content_markdown_unchanged(
 
     content = await file_service.read_file_content(md_path)
     assert content == "hello"
+
+
+# -----------------------------------------------------------------------------
+# Path traversal last-mile defense (BUG-004, Option C) — [ADVERSARIAL]
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_write_file_raises_on_relative_path_escape(
+    tmp_path: Path, file_service: FileService
+):
+    """[ADVERSARIAL] BUG-004 Option C: a relative path containing `..`
+    segments that escapes base_path on resolve must be rejected even if it
+    bypassed earlier validation layers. Last-mile defense-in-depth.
+
+    Scenario: a hypothetical earlier-layer bug lets `"../escape.md"` through
+    to write_file. base_path is tmp_path, so resolved path is tmp_path's
+    parent — outside the project root.
+    """
+    escape_path = "../escape.md"
+    with pytest.raises(FileOperationError) as exc_info:
+        await file_service.write_file(escape_path, "pwned")
+    # Must mention "traversal" or "escape" — not a generic "failed to write"
+    msg = str(exc_info.value).lower()
+    assert "traversal" in msg or "escape" in msg or "outside" in msg
+    # And the file must not exist anywhere
+    assert not (tmp_path.parent / "escape.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_file_raises_on_absolute_path_outside_base(
+    tmp_path: Path, file_service: FileService
+):
+    """[ADVERSARIAL] BUG-004 Option C: an absolute path pointing outside
+    base_path must be rejected. This catches attacks where the path_obj is
+    already absolute (e.g. `/etc/evil.md` injected somewhere upstream).
+    """
+    # Use a path that is absolute and clearly outside base_path
+    outside = tmp_path.parent / "outside_evil.md"
+    with pytest.raises(FileOperationError) as exc_info:
+        await file_service.write_file(outside, "pwned")
+    msg = str(exc_info.value).lower()
+    assert "traversal" in msg or "escape" in msg or "outside" in msg
+    assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_file_raises_on_nested_traversal_to_escape(
+    tmp_path: Path, file_service: FileService
+):
+    """[ADVERSARIAL] BUG-004 Option C: a path with nested `..` segments
+    that resolves outside base_path must be rejected. Example:
+    `subdir/../../escape.md` — looks innocent at first segment but the
+    resolved form is `tmp_path.parent / escape.md`.
+    """
+    nested = "subdir/../../escape.md"
+    with pytest.raises(FileOperationError) as exc_info:
+        await file_service.write_file(nested, "pwned")
+    msg = str(exc_info.value).lower()
+    assert "traversal" in msg or "escape" in msg or "outside" in msg
+    assert not (tmp_path.parent / "escape.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_file_accepts_legitimate_relative_path(
+    tmp_path: Path, file_service: FileService
+):
+    """[ADVERSARIAL] BUG-004 Option C negative case: a legitimate relative
+    path inside base_path must continue to work — the escape check must not
+    over-reject valid writes.
+    """
+    legit = "subdir/note.md"
+    checksum = await file_service.write_file(legit, "hello")
+    assert checksum is not None
+    assert (tmp_path / "subdir" / "note.md").exists()
