@@ -158,6 +158,107 @@ Permalink = Annotated[str, MinLen(1)]
 """Unique identifier in format '{path}/{normalized_name}'."""
 
 
+# ---------------------------------------------------------------------------
+# Permalink format validation (BUG-002)
+# ---------------------------------------------------------------------------
+#
+# Permalinks must be URI-safe identifiers usable as keys in `memory://` URI
+# resolution. They are produced by `generate_permalink()` (see basic_memory.utils)
+# which intentionally preserves periods inside version-number segments (e.g.
+# `version-2.0.0`, `feature-v3.0-update`) — these are valid and tested.
+#
+# This validator catches the *broken* shapes seen in production:
+#
+# 1. **Numeric prefix `^\d+[.-]`** — the root cause of the 11 corrupted vault
+#    notes fixed on 2026-05-19. Patterns like `3.-foo`, `42-bar` are legacy
+#    Bear-import artifacts and break URI resolution.
+#
+# 2. **Adjacent/edge dots** — `..`, leading `.`, trailing `.`, or dots adjacent
+#    to a separator (`-./`, `/.foo`, `foo./bar`) are malformed. Dots are only
+#    allowed between alphanumerics within a kebab segment (e.g. `v2.0`).
+#
+# 3. **Non-kebab characters** — uppercase, spaces, `?`, `&`, `#`, etc. break
+#    URL encoding and case-insensitive lookup.
+#
+# `None` (auto-generate) and `""` (permalinks disabled) are sentinels and pass
+# through unchanged.
+
+# First char must be lowercase alphanumeric (no leading `-`, `/`, `_`, `.`).
+# Allowed body chars: lowercase ASCII, digits, `/`, `_`, `-`, `.`.
+_VALID_PERMALINK_PATTERN = re.compile(r"^[a-z0-9][a-z0-9/_.\-]*$")
+
+# Numeric prefix bug: `3.-foo`, `42.-bar`, `7-baz` — number followed by `.` or `-`
+# at the very start of the permalink. This is the actual Bear-import artifact.
+_NUMERIC_PREFIX_PATTERN = re.compile(r"^\d+[.-]")
+
+# Dots adjacent to separators or doubled — `..`, `.-`, `-.`, `./`, `/.` — are
+# always malformed regardless of context. Also trailing dot is invalid.
+_MALFORMED_DOT_PATTERN = re.compile(r"\.\.|\.-|-\.|\./|/\.|\.$")
+
+
+def validate_permalink_format(value: Optional[str]) -> Optional[str]:
+    """Validate that a permalink string respects the URI-safe write-time format.
+
+    Permalinks may contain dots only within version-number segments (e.g.
+    `version-2.0.0`). Dots adjacent to separators (`.-`, `-.`, `./`, `/.`),
+    doubled dots (`..`), trailing dots, and the legacy Bear numeric-prefix
+    pattern (`3.-foo`, `42-bar`) are rejected at write time.
+
+    Args:
+        value: The permalink string to validate. `None` means "auto-generate
+            via `generate_permalink`"; the empty string `""` is the sentinel
+            for "permalinks disabled". Both pass through unchanged.
+
+    Returns:
+        The unchanged value if it passes validation.
+
+    Raises:
+        ValueError: If the permalink starts with a numeric prefix, contains
+            malformed dot patterns, or has characters outside the kebab-case
+            allowed set. The error message always includes the offending value.
+
+    Examples:
+        >>> validate_permalink_format(None) is None
+        True
+        >>> validate_permalink_format("") == ""
+        True
+        >>> validate_permalink_format("my-note/sub")
+        'my-note/sub'
+        >>> validate_permalink_format("version-2.0.0")
+        'version-2.0.0'
+        >>> validate_permalink_format("3.-bad")  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+        ValueError: Invalid permalink '3.-bad': numeric prefix not allowed ...
+    """
+    # None = auto-generate downstream via generate_permalink; "" = permalinks disabled.
+    if value is None or value == "":
+        return value
+    # 1. Numeric prefix — the root cause of the 11 corrupted vault notes (BUG-002).
+    #    Check this first because `3.-foo` also matches malformed-dot rules but
+    #    the numeric-prefix diagnostic is the more actionable one.
+    if _NUMERIC_PREFIX_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid permalink {value!r}: numeric prefix not allowed "
+            f"(e.g. '3.-' or '42-' — legacy Bear-import artifact that breaks "
+            f"memory:// URI resolution)"
+        )
+    # 2. Malformed dot patterns — `..`, `.-`, `-.`, `./`, `/.`, trailing `.`.
+    #    Dots are only valid inside a kebab segment between alphanumerics.
+    if _MALFORMED_DOT_PATTERN.search(value):
+        raise ValueError(
+            f"Invalid permalink {value!r}: malformed dot pattern "
+            f"(dots may only appear between alphanumerics, e.g. 'v2.0'; "
+            f"forbidden: '..', '.-', '-.', './', '/.', trailing '.')"
+        )
+    # 3. Non-kebab characters — uppercase, spaces, special chars, leading dash/slash.
+    if not _VALID_PERMALINK_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid permalink {value!r}: must match {_VALID_PERMALINK_PATTERN.pattern} "
+            f"(kebab-case, lowercase ASCII, no leading dash/slash, no special chars)"
+        )
+    return value
+
+
 NoteType = Annotated[str, BeforeValidator(to_snake_case), MinLen(1), MaxLen(200)]
 """Classification of note (e.g., 'note', 'person', 'spec', 'schema'). """
 
@@ -304,3 +405,28 @@ class Entity(BaseModel):
                 mime_type, _ = mimetypes.guess_type(path.name)
                 self.content_type = mime_type or "text/plain"
         return self
+
+    @model_validator(mode="after")
+    def _validate_initial_permalink(self) -> "Entity":
+        """Validate `_permalink` set at construction time.
+
+        Covers the case where a caller passes `_permalink` via `model_validate`.
+        Subsequent direct attribute assignment is covered by `__setattr__` below
+        (BUG-002: pydantic `field_validator` does not apply to private attrs).
+        """
+        validate_permalink_format(self._permalink)
+        return self
+
+    def __setattr__(self, name: str, value: object) -> None:  # noqa: D401
+        """Validate `_permalink` on direct attribute assignment (BUG-002).
+
+        Pydantic v2 does not run `field_validator` on private attributes (those
+        prefixed with `_`), and `validate_assignment=True` only covers public
+        fields. Several call sites (`entity_service.py`) set `_permalink` via
+        direct attribute assignment after construction — this hook ensures any
+        invalid permalink (dot, numeric prefix, non-kebab-case) is rejected at
+        write time with a clear error pointing at the offending value.
+        """
+        if name == "_permalink":
+            validate_permalink_format(value)  # type: ignore[arg-type]
+        super().__setattr__(name, value)

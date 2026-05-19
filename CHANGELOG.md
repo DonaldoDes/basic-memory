@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+- **BUG-002**: Validate permalink format at write time on the `Entity` schema
+  - Rejects the legacy Bear-import numeric-prefix pattern (`3.-foo`, `42-bar`) that broke `memory://` URI resolution
+  - Rejects malformed dot patterns (`..`, `.-`, `-.`, `./`, `/.`, trailing `.`)
+  - Rejects non-kebab characters (uppercase, spaces, special chars, leading dash/slash)
+  - Dots inside version-number segments (`v2.0`, `1.2.3`) remain valid — preserves existing `generate_permalink()` contract
+  - Validation runs both at `model_validate` time and on direct `_permalink` attribute assignment (via `__setattr__` override) to cover the `entity_service.py` write paths
+  - Existing local DBs may contain pre-fix invalid permalinks; run `basic-memory reset --reindex` after upgrading if you see `Invalid permalink` errors during sync
+
 ## v0.20.3 (2026-03-26)
 
 ### Bug Fixes
