@@ -301,6 +301,85 @@ def test_sanitize_for_directory_raises_on_control_char():
     assert "U+0009" in msg  # TAB codepoint
 
 
+# -----------------------------------------------------------------------------
+# Path traversal via strip-bypass (BUG-004) — [ADVERSARIAL]
+# -----------------------------------------------------------------------------
+
+
+def test_sanitize_for_directory_raises_on_strip_bypass_traversal():
+    """[ADVERSARIAL] BUG-004: `<>..` passes validate_project_path (segment
+    `<>..` != `..` verbatim) but the silent strip of `<>` turns it into `..`,
+    enabling end-to-end path traversal. Post-strip segments equal to `..`
+    must raise ValueError with a message mentioning "traversal".
+    """
+    with pytest.raises(ValueError, match="traversal"):
+        sanitize_for_directory("<>../etc")
+
+
+def test_sanitize_for_directory_raises_on_direct_traversal():
+    """[ADVERSARIAL] BUG-004: a direct `..` segment (no strip needed) must
+    also be rejected by sanitize_for_directory — the function must not rely
+    on an upstream caller having already filtered traversal segments.
+    Defense-in-depth: sanitize_for_directory becomes self-sufficient.
+    """
+    with pytest.raises(ValueError, match="traversal"):
+        sanitize_for_directory("../etc")
+
+
+def test_sanitize_for_directory_raises_on_multiple_traversal():
+    """[ADVERSARIAL] BUG-004: compound traversal via multiple strip-bypass
+    segments — `a/<>../<>../b` strips to `a/../../b` which escapes two levels.
+    Each `..` segment produced by sanitization must trigger a rejection.
+    """
+    with pytest.raises(ValueError, match="traversal"):
+        sanitize_for_directory("a/<>../<>../b")
+
+
+def test_sanitize_for_directory_raises_on_traversal_with_filesystem_reserved():
+    """[ADVERSARIAL] BUG-004: combination of all silently-stripped chars
+    (`<>:|?*`) preceding `..` — `foo/<>:|?*../bar` strips to `foo/../bar`,
+    a single-level traversal that is still escape-capable when joined to a
+    base path.
+    """
+    with pytest.raises(ValueError, match="traversal"):
+        sanitize_for_directory("foo/<>:|?*../bar")
+
+
+def test_sanitize_for_directory_raises_on_isolated_strip_bypass_traversal():
+    """[ADVERSARIAL] BUG-004: even a folder that resolves to a single `..`
+    segment post-strip (no leading or trailing path components) must raise.
+    `<>..` alone strips to `..` — parent-of-root reference.
+    """
+    with pytest.raises(ValueError, match="traversal"):
+        sanitize_for_directory("<>..")
+
+
+def test_sanitize_for_directory_raises_on_traversal_windows_style():
+    """[ADVERSARIAL] BUG-004: Windows-style separator must also be detected
+    after the strip — `<>..\\etc` (backslash variant) must raise just like
+    the POSIX form.
+    """
+    with pytest.raises(ValueError, match="traversal"):
+        sanitize_for_directory("<>..\\etc")
+
+
+def test_sanitize_for_directory_accepts_filename_containing_dotdot():
+    """[ADVERSARIAL] BUG-004 negative case: a segment that *contains* `..`
+    but is not equal to `..` after strip is a legitimate filename and MUST
+    NOT be rejected. The check must be on segment equality, not substring
+    containment — otherwise `foo..bar` (a real-world filename) would break.
+    """
+    assert sanitize_for_directory("docs/foo..bar") == "docs/foo..bar"
+
+
+def test_sanitize_for_directory_accepts_reserved_chars_then_non_traversal():
+    """[ADVERSARIAL] BUG-004 negative case: regression guard — stripping
+    `<>:|?*` followed by non-`..` content must continue to succeed (preserves
+    BUG-001 legacy contract from test_sanitize_for_directory_edge_cases).
+    """
+    assert sanitize_for_directory("my/directory<>:|?*sub") == "my/directorysub"
+
+
 # =============================================================================
 # format_file tests
 # =============================================================================
