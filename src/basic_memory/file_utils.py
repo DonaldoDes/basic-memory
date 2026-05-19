@@ -468,11 +468,60 @@ def sanitize_for_filename(text: str, replacement: str = "-") -> str:
     return text.strip(replacement)
 
 
+#: Pre-filter normalisation table for ``sanitize_for_directory``.
+#:
+#: BUG-001: silently stripping non-whitelist characters produced double-spaces
+#: when the offending character was surrounded by spaces (e.g. ``" — "`` or
+#: ``" & "``), creating a filesystem folder distinct from the one the caller
+#: intended. We instead normalise common typographic substitutes BEFORE the
+#: whitelist filter, so that ``"Wealth & Finance"`` becomes a single, valid
+#: ASCII path.
+#:
+#: Design choice for ``&`` → ``" and "`` (verbose, not ``-``):
+#:   1. Preserves human readability of folder names.
+#:   2. Matches the BUG-001 spec "Comportement attendu" example.
+#:   3. Folder paths support spaces, so verbosity is harmless.
+#:
+#: Any character left after normalisation that is not in the whitelist will
+#: raise ``ValueError`` (see below) rather than be silently dropped.
+_DIRECTORY_NORMALIZATION_MAP = {
+    "—": "-",  # em-dash —  → ASCII hyphen
+    "–": "-",  # en-dash –  → ASCII hyphen
+    "&": " and ",  # ampersand  → " and "
+}
+
+
 def sanitize_for_directory(directory: str) -> str:
     """
-    Sanitize directory path to be safe for use in file system paths.
-    Removes leading/trailing whitespace, compresses multiple slashes,
-    and removes special characters except for /, -, and _.
+    Sanitize a directory path to be safe for use in file system paths.
+
+    Behaviour:
+        * Trims leading/trailing whitespace and an optional leading ``./``.
+        * Strips filesystem-reserved characters ``<>:"|?*`` silently — these
+          are never valid in a folder name on Windows and are aligned with
+          the behaviour of ``sanitize_for_filename`` (legacy contract,
+          preserved for backward compatibility).
+        * Normalises typographic substitutes BEFORE the whitelist check, to
+          avoid the double-space corruption documented in BUG-001:
+
+            - em-dash ``—`` (U+2014) → ``-``
+            - en-dash ``–`` (U+2013) → ``-``
+            - ampersand ``&``        → ``" and "`` (then space-compressed)
+
+        * Accepts: alphanumerics (incl. accented letters via ``str.isalnum()``),
+          ``.``, space, ``-``, ``_``, ``\\``, ``/``.
+        * Rejects: any other character — raises ``ValueError`` with the
+          offending character, its Unicode codepoint and its position. This
+          is a deliberate fork choice (Option B) over the previous silent
+          strip, which produced filesystem folders distinct from the intended
+          path and broke Obsidian wikilinks.
+        * Compresses consecutive spaces and path separators, then trims
+          leading/trailing slashes.
+
+    Raises:
+        ValueError: When ``directory`` contains a character outside the
+            whitelist that cannot be normalised (e.g. emoji, control chars,
+            non-Latin scripts not covered by ``isalnum``-friendly codepoints).
     """
     if not directory:
         return ""
@@ -482,10 +531,31 @@ def sanitize_for_directory(directory: str) -> str:
     if sanitized.startswith("./"):
         sanitized = sanitized[2:]
 
-    # ensure no special characters (except for a few that are allowed)
-    sanitized = "".join(
-        c for c in sanitized if c.isalnum() or c in (".", " ", "-", "_", "\\", "/")
-    ).rstrip()
+    # Strip filesystem-reserved chars silently (Windows-invalid in any path
+    # segment). This preserves the legacy contract that callers can pass
+    # ``"my<>dir"`` and get back ``"mydir"`` without raising.
+    sanitized = re.sub(r'[<>:"|?*]', "", sanitized)
+
+    # Pre-filter normalisation: convert known typographic substitutes BEFORE
+    # the whitelist check so they survive sanitisation.
+    for src, dst in _DIRECTORY_NORMALIZATION_MAP.items():
+        sanitized = sanitized.replace(src, dst)
+
+    # Whitelist check: every remaining character must be alphanumeric (which
+    # accepts accents) or one of the allowed punctuation/separator chars.
+    # Any other character is a hard error — we no longer strip silently.
+    allowed_punct = {".", " ", "-", "_", "\\", "/"}
+    for i, c in enumerate(sanitized):
+        if not (c.isalnum() or c in allowed_punct):
+            raise ValueError(
+                f"Invalid character {c!r} (U+{ord(c):04X}) at position {i} "
+                f"in folder {directory!r}"
+            )
+
+    # compress multiple, repeated spaces (e.g. " & " → "  and  " → " and ")
+    sanitized = re.sub(r" +", " ", sanitized)
+
+    sanitized = sanitized.rstrip()
 
     # compress multiple, repeated instances of path separators
     sanitized = re.sub(r"[\\/]+", "/", sanitized)
