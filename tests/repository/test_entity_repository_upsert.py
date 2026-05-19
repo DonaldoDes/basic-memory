@@ -3,10 +3,12 @@
 import pytest
 from datetime import datetime, timezone
 
+from basic_memory import db
 from basic_memory.models.knowledge import Entity
 from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.services.exceptions import SyncFatalError
+from basic_memory.utils import generate_permalink
 
 
 @pytest.mark.asyncio
@@ -510,3 +512,97 @@ async def test_upsert_entity_with_invalid_project_id(entity_repository: EntityRe
     assert "project_id=99999 does not exist" in error_msg
     assert "project may have been deleted" in error_msg.lower()
     assert "sync will be terminated" in error_msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_handle_permalink_conflict_with_none_permalink_generates_clean(
+    entity_repository: EntityRepository,
+):
+    """BUG-003: _handle_permalink_conflict must not produce 'None-1' when entity.permalink is None.
+
+    Trigger: an entity reaches the permalink-conflict handler with permalink=None
+             (edge case during sync, race, or upstream code path that forgot to derive it).
+    Why: f-string concat f"{None}-{suffix}" silently yields the literal string "None-1",
+         which persists an invalid permalink in DB (corruption is silent — no exception).
+    Outcome: the handler must derive a valid permalink from file_path via generate_permalink()
+             BEFORE entering the suffix loop, so the final permalink is a clean kebab-case
+             rooted in the file_path (or that base + "-N" if a real conflict exists).
+    """
+    # Pre-existing entity occupying a permalink slot — irrelevant which one, we just
+    # want to ensure the suffix loop CAN run if the handler chooses to add a suffix.
+    occupied = Entity(
+        project_id=entity_repository.project_id,
+        title="Occupier",
+        note_type="note",
+        permalink="docs/some-doc",
+        file_path="docs/occupier.md",
+        content_type="text/markdown",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    await entity_repository.add(occupied)
+
+    # New entity with permalink explicitly set to None — this is the bug trigger.
+    entity = Entity(
+        project_id=entity_repository.project_id,
+        title="Some Doc",
+        note_type="note",
+        permalink=None,
+        file_path="docs/some-doc.md",
+        content_type="text/markdown",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    # Call the handler directly inside a fresh session — this mirrors the call site
+    # in upsert_entity() (line 439) but isolates the behaviour under test.
+    async with db.scoped_session(entity_repository.session_maker) as session:
+        result = await entity_repository._handle_permalink_conflict(entity, session)
+
+    # The literal "None-..." string must never appear — that is the bug.
+    assert result.permalink is not None
+    assert not result.permalink.startswith("None"), (
+        f"permalink leaked the literal 'None' string: {result.permalink!r}"
+    )
+
+    # Permalink must derive from file_path. file_path 'docs/some-doc.md' yields the
+    # kebab-case base 'docs/some-doc' which is already occupied → expect '-1' suffix.
+    expected_base = generate_permalink("docs/some-doc.md")
+    assert result.permalink == f"{expected_base}-1"
+
+
+@pytest.mark.asyncio
+async def test_handle_permalink_conflict_with_none_permalink_no_collision(
+    entity_repository: EntityRepository,
+):
+    """BUG-003 edge case: None permalink + no real conflict on the derived base.
+
+    Trigger: entity.permalink is None but no other entity holds the derived permalink.
+    Why: after the guard derives a permalink from file_path, the suffix loop will
+         still run at least once (current implementation always appends a suffix
+         in the conflict handler). The result must still be valid (no 'None').
+    Outcome: result.permalink starts with the kebab-case derived from file_path,
+             never with the literal 'None'.
+    """
+    entity = Entity(
+        project_id=entity_repository.project_id,
+        title="Fresh Doc",
+        note_type="note",
+        permalink=None,
+        file_path="docs/fresh-doc.md",
+        content_type="text/markdown",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    async with db.scoped_session(entity_repository.session_maker) as session:
+        result = await entity_repository._handle_permalink_conflict(entity, session)
+
+    assert result.permalink is not None
+    assert not result.permalink.startswith("None"), (
+        f"permalink leaked the literal 'None' string: {result.permalink!r}"
+    )
+
+    expected_base = generate_permalink("docs/fresh-doc.md")
+    # No collision on the derived base → handler appends '-1' (no entity occupied it).
+    assert result.permalink == f"{expected_base}-1"

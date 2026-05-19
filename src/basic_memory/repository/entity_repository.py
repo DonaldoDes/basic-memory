@@ -15,6 +15,7 @@ from sqlalchemy.engine import Row
 from basic_memory import db
 from basic_memory.models.knowledge import Entity, Observation, Relation
 from basic_memory.repository.repository import Repository
+from basic_memory.utils import generate_permalink
 
 
 class EntityRepository(Repository[Entity]):
@@ -532,6 +533,12 @@ class EntityRepository(Repository[Entity]):
 
     async def _handle_permalink_conflict(self, entity: Entity, session: AsyncSession) -> Entity:
         """Handle permalink conflicts by generating a unique permalink."""
+        # Guard against None/empty permalink — without this, the f-string below would
+        # serialize None as the literal string "None" and persist "None-1", "None-2", ...
+        # (silent corruption: no exception, invalid permalink in DB). See BUG-003.
+        if not entity.permalink:
+            entity.permalink = generate_permalink(entity.file_path)
+
         base_permalink = entity.permalink
         suffix = 1
 
