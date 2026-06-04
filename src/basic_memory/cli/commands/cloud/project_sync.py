@@ -23,26 +23,33 @@ from basic_memory.cli.commands.cloud.rclone_commands import (
 )
 from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.cli.commands.routing import force_routing
-from basic_memory.config import ConfigManager, ProjectEntry
+from basic_memory.config import BasicMemoryConfig, ConfigManager, ProjectEntry
 from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.clients import ProjectClient
+from basic_memory.mcp.project_context import get_available_workspaces
+from basic_memory.schemas.cloud import WorkspaceInfo
 from basic_memory.schemas.project_info import ProjectItem
 from basic_memory.utils import generate_permalink, normalize_project_path
 
 console = Console()
 
+TEAM_WORKSPACE_BISYNC_UNSUPPORTED = (
+    "The bisync operation is only supported on Personal workspaces.\n"
+    "Use `bm cloud sync --name {name}` instead."
+)
+
 
 # --- Shared helpers ---
 
 
-def _has_cloud_credentials(config) -> bool:
+def _has_cloud_credentials(config: BasicMemoryConfig) -> bool:
     """Return whether cloud credentials are available (API key or OAuth token)."""
     from basic_memory.config import has_cloud_credentials
 
     return has_cloud_credentials(config)
 
 
-def _require_cloud_credentials(config) -> None:
+def _require_cloud_credentials(config: BasicMemoryConfig) -> None:
     """Exit with actionable guidance when cloud credentials are missing."""
     if _has_cloud_credentials(config):
         return
@@ -50,6 +57,54 @@ def _require_cloud_credentials(config) -> None:
     console.print("[red]Error: cloud credentials are required for this command[/red]")
     console.print("[dim]Run 'bm cloud login' or 'bm cloud api-key save <key>' first[/dim]")
     raise typer.Exit(1)
+
+
+async def _get_workspace_for_project(name: str, config: BasicMemoryConfig) -> WorkspaceInfo:
+    """Resolve the cloud workspace targeted by a project-scoped sync command."""
+    workspaces = await get_available_workspaces()
+    if not workspaces:
+        raise ValueError("No accessible cloud workspaces found for this account")
+
+    entry = config.projects.get(name)
+    workspace_id = entry.workspace_id if entry and entry.workspace_id else config.default_workspace
+    if workspace_id:
+        workspace = next(
+            (item for item in workspaces if item.tenant_id == workspace_id),
+            None,
+        )
+        if workspace is None:
+            raise ValueError(
+                f"Configured workspace '{workspace_id}' for project '{name}' is not accessible"
+            )
+        return workspace
+
+    default_workspaces = [item for item in workspaces if item.is_default]
+    if len(default_workspaces) == 1:
+        return default_workspaces[0]
+
+    if len(workspaces) == 1:
+        return workspaces[0]
+
+    raise ValueError(
+        f"Project '{name}' does not have an unambiguous cloud workspace. "
+        "Set a default workspace with `bm cloud workspace set-default <workspace>` "
+        "or attach the project with `bm project set-cloud <name> --workspace <workspace>`."
+    )
+
+
+def _require_personal_workspace(name: str, config: BasicMemoryConfig) -> WorkspaceInfo:
+    """Exit before bisync work when the target workspace is not personal."""
+    try:
+        workspace = run_with_cleanup(_get_workspace_for_project(name, config))
+    except Exception as exc:
+        console.print(f"[red]Error resolving workspace for project '{name}': {exc}[/red]")
+        raise typer.Exit(1)
+
+    if workspace.workspace_type != "personal":
+        console.print(f"[red]{TEAM_WORKSPACE_BISYNC_UNSUPPORTED.format(name=name)}[/red]")
+        raise typer.Exit(1)
+
+    return workspace
 
 
 async def _get_cloud_project(name: str) -> ProjectItem | None:
@@ -63,7 +118,7 @@ async def _get_cloud_project(name: str) -> ProjectItem | None:
 
 
 def _get_sync_project(
-    name: str, config, project_data: ProjectItem
+    name: str, config: BasicMemoryConfig, project_data: ProjectItem
 ) -> tuple[SyncProject, str | None]:
     """Build a SyncProject and resolve local_sync_path from config.
 
@@ -152,6 +207,7 @@ def bisync_project_command(
     """
     config = ConfigManager().config
     _require_cloud_credentials(config)
+    _require_personal_workspace(name, config)
 
     try:
         # Get tenant info for bucket name
@@ -253,6 +309,10 @@ def bisync_reset(
     """
     import shutil
 
+    config = ConfigManager().config
+    if _has_cloud_credentials(config):
+        _require_personal_workspace(name, config)
+
     try:
         state_path = get_project_bisync_state(name)
 
@@ -336,8 +396,8 @@ def setup_project_sync(
         console.print(f"[green]Sync configured for project '{name}'[/green]")
         console.print(f"\nLocal sync path: {resolved_path}")
         console.print("\nNext steps:")
-        console.print(f"  1. Preview: bm cloud bisync --name {name} --resync --dry-run")
-        console.print(f"  2. Sync: bm cloud bisync --name {name} --resync")
+        console.print(f"  1. Preview: bm cloud sync --name {name} --dry-run")
+        console.print(f"  2. Sync: bm cloud sync --name {name}")
     except Exception as e:
         console.print(f"[red]Error configuring sync: {str(e)}[/red]")
         raise typer.Exit(1)

@@ -11,7 +11,7 @@ compatibility with existing MCP tools.
 import asyncio
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Awaitable, Callable, Optional, List, Tuple, cast
+from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, Tuple, cast
 from uuid import UUID
 
 from httpx import AsyncClient
@@ -25,7 +25,14 @@ from mcp.server.fastmcp.exceptions import ToolError
 import logfire
 from basic_memory.config import BasicMemoryConfig, ConfigManager, ProjectMode, has_cloud_credentials
 from basic_memory.project_resolver import ProjectResolver
-from basic_memory.schemas.cloud import WorkspaceInfo, WorkspaceListResponse
+from basic_memory.schemas.cloud import (
+    WorkspaceInfo,
+    WorkspaceListResponse,
+    format_workspace_choices,
+    format_workspace_selection_choices,
+    workspace_matches_exact_identifier,
+    workspace_matches_identifier,
+)
 from basic_memory.schemas.project_info import ProjectItem, ProjectList
 from basic_memory.schemas.v2 import ProjectResolveResponse
 from basic_memory.schemas.memory import memory_url_path
@@ -135,6 +142,15 @@ async def _set_cached_active_project(
         await context.set_state("default_project_name", active_project.name)
 
 
+async def _clear_cached_active_project(context: Optional[Context]) -> None:
+    """Clear cached project metadata that may no longer match the active route."""
+    if not context:
+        return
+
+    await context.set_state("active_project", None)
+    await context.set_state("default_project_name", None)
+
+
 async def _get_cached_active_workspace(context: Optional[Context]) -> Optional[WorkspaceInfo]:
     """Return the cached active workspace from context when available."""
     if not context:
@@ -160,8 +176,7 @@ async def _set_cached_active_workspace(
         # Why: project names are only unique inside one workspace, so a cached
         #   ProjectItem from the previous tenant can point at the wrong project
         # Outcome: force the next validation call to resolve within the new tenant
-        await context.set_state("active_project", None)
-        await context.set_state("default_project_name", None)
+        await _clear_cached_active_project(context)
 
     await context.set_state("active_workspace", active_workspace.model_dump())
 
@@ -297,29 +312,6 @@ async def get_project_names(client: AsyncClient, headers: HeaderTypes | None = N
     response = await call_get(client, "/v2/projects/", headers=headers)
     project_list = ProjectList.model_validate(response.json())
     return [project.name for project in project_list.projects]
-
-
-def _workspace_matches_identifier(workspace: WorkspaceInfo, identifier: str) -> bool:
-    """Return True when identifier matches workspace tenant_id, slug, or name."""
-    if workspace.tenant_id == identifier:
-        return True
-    if workspace.slug.casefold() == identifier.casefold():
-        return True
-    return workspace.name.lower() == identifier.lower()
-
-
-def _workspace_choices(workspaces: list[WorkspaceInfo]) -> str:
-    """Format deterministic workspace choices for prompt-style errors."""
-    return "\n".join(
-        [
-            (
-                f"- {item.name} "
-                f"(slug={item.slug}, type={item.workspace_type}, "
-                f"role={item.role}, tenant_id={item.tenant_id})"
-            )
-            for item in workspaces
-        ]
-    )
 
 
 def _workspace_project_index_from_state(raw: object) -> WorkspaceProjectIndex | None:
@@ -541,6 +533,28 @@ def _cloud_workspace_discovery_available(config: BasicMemoryConfig) -> bool:
     )
 
 
+def _workspace_identifier_discovery_available(
+    identifier: str,
+    config: BasicMemoryConfig,
+) -> bool:
+    """Return True when an identifier is allowed to consult workspace discovery."""
+    if _cloud_workspace_discovery_available(config):
+        return True
+
+    from basic_memory.mcp.async_client import (
+        _explicit_routing,
+        _force_local_mode,
+    )
+
+    if _explicit_routing() and _force_local_mode():
+        return False
+
+    return (
+        has_cloud_credentials(config)
+        and _split_workspace_identifier_segments(identifier) is not None
+    )
+
+
 async def resolve_workspace_qualified_memory_url(
     identifier: str,
     context: Optional[Context] = None,
@@ -624,7 +638,7 @@ async def _resolve_workspace_segments(
     return WorkspaceMemoryUrlResolution(entry=entry, canonical_path=canonical_path)
 
 
-def _format_qualified_choices(entries: tuple[WorkspaceProjectEntry, ...]) -> str:
+def _format_qualified_choices(entries: Sequence[WorkspaceProjectEntry]) -> str:
     """Format qualified project choices for collision errors."""
     return " or ".join(entry.qualified_name for entry in entries)
 
@@ -750,7 +764,7 @@ async def _ensure_workspace_project_index(
                 )
             continue
 
-        workspace_entries = cast(tuple[WorkspaceProjectEntry, ...], result)
+        workspace_entries = result
         successful_fetches += 1
         entries_list.extend(workspace_entries)
 
@@ -853,7 +867,7 @@ async def resolve_workspace_project_identifier(
             )
         return matches[0]
 
-    matches = index.entries_by_permalink.get(project_permalink, ())
+    matches = list(index.entries_by_permalink.get(project_permalink, ()))
     if not matches:
         failed_note = ""
         if index.failed_workspaces:
@@ -987,7 +1001,9 @@ async def resolve_workspace_parameter(
             cached_raw = await context.get_state("active_workspace")
             if isinstance(cached_raw, dict):
                 cached_workspace = WorkspaceInfo.model_validate(cached_raw)
-                if workspace is None or _workspace_matches_identifier(cached_workspace, workspace):
+                if workspace is None or workspace_matches_exact_identifier(
+                    cached_workspace, workspace
+                ):
                     logger.debug(
                         f"Using cached workspace from context: {cached_workspace.tenant_id}"
                     )
@@ -1003,19 +1019,17 @@ async def resolve_workspace_parameter(
         selected_workspace: WorkspaceInfo | None = None
 
         if workspace:
-            matches = [
-                item for item in workspaces if _workspace_matches_identifier(item, workspace)
-            ]
+            matches = [item for item in workspaces if workspace_matches_identifier(item, workspace)]
             if not matches:
                 raise ValueError(
                     f"Workspace '{workspace}' was not found.\n"
-                    f"Available workspaces:\n{_workspace_choices(workspaces)}"
+                    f"Available workspaces:\n{format_workspace_choices(workspaces)}"
                 )
             if len(matches) > 1:
                 raise ValueError(
-                    f"Workspace name '{workspace}' matches multiple workspaces. "
-                    "Use tenant_id instead.\n"
-                    f"Available workspaces:\n{_workspace_choices(workspaces)}"
+                    f"Workspace '{workspace}' matches multiple workspaces. "
+                    "Choose one of these matching workspaces by slug or tenant_id:\n"
+                    f"{format_workspace_selection_choices(matches)}"
                 )
             selected_workspace = matches[0]
         elif len(workspaces) == 1:
@@ -1023,8 +1037,8 @@ async def resolve_workspace_parameter(
         else:
             raise ValueError(
                 "Multiple workspaces are available. Ask the user which workspace to use, then retry "
-                "with the 'workspace' argument set to the tenant_id or unique name.\n"
-                f"Available workspaces:\n{_workspace_choices(workspaces)}"
+                "with the 'workspace' argument set to the tenant_id or unique name/slug/type.\n"
+                f"Available workspaces:\n{format_workspace_choices(workspaces)}"
             )
 
         await _set_cached_active_workspace(context, selected_workspace)
@@ -1342,11 +1356,23 @@ async def detect_project_from_identifier_prefix(
         # Outcome: keep unqualified search/title input on the active/default project route.
         return None
 
-    if _cloud_workspace_discovery_available(config):
-        workspace_resolution = await resolve_workspace_qualified_identifier(
-            identifier,
-            context=context,
+    if _workspace_identifier_discovery_available(identifier, config):
+        workspace_discovery_fallback_errors = (
+            "not found",
+            "no accessible workspaces",
+            "unable to discover",
         )
+        try:
+            workspace_resolution = await resolve_workspace_qualified_identifier(
+                identifier,
+                context=context,
+            )
+        except ValueError as exc:
+            message = str(exc).lower()
+            if any(error in message for error in workspace_discovery_fallback_errors):
+                return None
+            raise
+
         if workspace_resolution is not None:
             return workspace_resolution.project_identifier
 
@@ -1361,7 +1387,7 @@ async def detect_project_from_identifier_prefix(
             )
         except ValueError as exc:
             message = str(exc).lower()
-            if "not found" in message or "no accessible workspaces" in message:
+            if any(error in message for error in workspace_discovery_fallback_errors):
                 return None
             raise
 
@@ -1478,9 +1504,54 @@ async def get_project_client(
     if project_id and not cloud_available:
         project_mode = ProjectMode.LOCAL
 
+    # Trigger: project_id is a local external_id in a mixed local+cloud setup.
+    # Why: UUIDs are not local config keys, so get_project_mode() treats them as
+    #   cloud projects. A local-first probe avoids making local UUIDs depend on
+    #   healthy cloud workspace discovery.
+    # Outcome: resolve the effective UUID against local ASGI first; if it is not
+    #   local, preserve the existing cloud workspace lookup path.
+    if (
+        project_id
+        and config.projects
+        and not factory_mode
+        and not explicit_cloud_routing
+        and project_mode == ProjectMode.CLOUD
+    ):
+        try:
+            canonical_project_id = str(UUID(resolved_project))
+        except ValueError:
+            pass
+        else:
+            with logfire.span(
+                "routing.local_project_id_probe",
+                project_id=canonical_project_id,
+            ):
+                async with get_client() as client:
+                    try:
+                        active_project = await get_active_project(
+                            client,
+                            canonical_project_id,
+                            context,
+                        )
+                    except ToolError as exc:
+                        if "not found" not in str(exc).lower():
+                            raise
+                    else:
+                        route_mode = "local_asgi"
+                        await _clear_cached_active_workspace_for_local_route(context)
+                        with logfire.span(
+                            "routing.client_session",
+                            project_name=active_project.name,
+                            route_mode=route_mode,
+                        ):
+                            logger.debug("Using local ASGI routing for project_id")
+                            yield client, active_project
+                        return
+
     if factory_mode or project_mode == ProjectMode.CLOUD or explicit_cloud_routing:
         route_mode = "factory" if factory_mode else "cloud_proxy"
         active_ws: WorkspaceInfo | None = None
+        resolved_entry: WorkspaceProjectEntry | None = None
         workspace_id: str
         project_for_api = _unqualified_project_identifier(resolved_project)
 
@@ -1503,6 +1574,13 @@ async def get_project_client(
 
         if active_ws is not None:
             await _set_cached_active_workspace(context, active_ws)
+        if resolved_entry is not None:
+            cached_project = await _get_cached_active_project(context)
+            if (
+                cached_project is not None
+                and cached_project.external_id != resolved_entry.project.external_id
+            ):
+                await _clear_cached_active_project(context)
         with logfire.span(
             "routing.client_session",
             project_name=project_for_api,

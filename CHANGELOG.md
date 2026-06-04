@@ -12,6 +12,194 @@
   - Validation runs both at `model_validate` time and on direct `_permalink` attribute assignment (via `__setattr__` override) to cover the `entity_service.py` write paths
   - Existing local DBs may contain pre-fix invalid permalinks; run `basic-memory reset --reindex` after upgrading if you see `Invalid permalink` errors during sync
 
+### Core
+
+- Consolidated the Basic Memory satellite repositories into the main
+  `basic-memory` tree as the canonical source, discovery, documentation,
+  issue, and release home.
+- Added root marketplace/package validation for the consolidated repository
+  layout while keeping Phase 1 focused on parity.
+- Added root and package-local justfile targets so Claude Code, skills,
+  Hermes, and OpenClaw builds can be verified from the monorepo.
+
+### Skills
+
+- Added the shared Basic Memory `SKILL.md` collection under top-level
+  `skills/`.
+- Updated skills documentation to point at `basicmachines-co/basic-memory`
+  and document manual copy as the temporary fallback when subpath installs are
+  unavailable.
+
+### Claude Code
+
+- Added the Claude Code plugin under `plugins/claude-code/` with its native
+  `.claude-plugin`, hooks, skills, agent, changelog, and docs.
+- Added the root Claude marketplace manifest pointing `basic-memory` to
+  `./plugins/claude-code`.
+
+### Hermes
+
+- Added the Hermes memory provider plugin under `integrations/hermes/` with
+  its native Python module, `plugin.yaml`, skill, tests, docs, and release
+  metadata.
+- Updated Hermes install and development docs for monorepo subpath usage.
+
+### OpenClaw
+
+- Added the OpenClaw plugin under `integrations/openclaw/` with its native
+  npm/TypeScript package shape, tests, docs, and release metadata.
+- Updated OpenClaw package metadata to point at the monorepo subdirectory and
+  changed skill bundling to copy from the top-level `skills/` source.
+
+## v0.21.5 (2026-05-26)
+
+Workspace/project routing fixes for MCP, plus a SQLite vector reindex stability fix.
+
+### Bug Fixes
+
+- **#854**: MCP project listing now keeps duplicate cloud project rows distinct by
+  workspace, so only the selected workspace row inherits local project state.
+- **#853**: `write_note` returns workspace-qualified permalinks for cloud
+  workspace writes, allowing follow-up `memory://` reads to route back to the
+  correct workspace/project.
+- **#852**: Full SQLite vector reindex now loads `sqlite-vec` before dropping
+  `vec0` virtual tables, preventing reindex crashes.
+- **#838**: Local ASGI database initialization is preloaded so MCP routing can
+  safely enter local project contexts.
+
+## v0.21.1 (2026-05-16)
+
+CI-only release. No user-facing changes.
+
+### Maintenance
+
+- **#833**: Replace `mislav/bump-homebrew-formula-action` with an inline
+  bash bump step. The action's `resolveRedirect` HEAD-requests
+  `api.github.com /repos/.../tarball/<ref>` expecting HTTP 302; GitHub now
+  returns 303 for authenticated requests on that endpoint, which broke
+  the v0.21.0 Homebrew job and required a manual tap bump. The inline
+  step does the same work (curl + sha256sum, clone tap, sed-bump
+  `url`/`sha256`, commit, push) without any third-party dependency.
+
+## v0.21.0 (2026-05-16)
+
+Workspace-aware everywhere: every MCP tool and CLI command now routes through the
+same workspace/project model, the search and sync paths are noticeably faster,
+and a handful of long-standing parsing and routing footguns are gone.
+
+### Breaking Changes
+
+- Relation parsing no longer treats unquoted multi-word text before a wikilink as a
+  custom relation type. Use single-token relation types like `relates_to [[Target]]`,
+  or quote multi-word relation types like `"relates to" [[Target]]` or
+  `'relates to' [[Target]]`.
+  - Bare list wikilinks like `- [[Target]]` now index as `links_to`.
+  - Prose list items like `- some other thing [[Target]]` now index as `links_to`.
+  - To preserve existing multi-word relation types on re-sync, quote them before upgrading.
+  - See **#824**.
+
+### Features
+
+- **#816**: `bm orphan` CLI command surfaces entities whose underlying markdown
+  files are gone, with a flag to clean them out.
+- **#789**: Create projects directly by cloud workspace slug from MCP
+  (`create_memory_project(workspace=...)`).
+- **#757**: Discover projects across every accessible cloud workspace in MCP's
+  project list — no more per-workspace blind spots.
+- **#766**: MCP tools accept training-data-friendly parameter aliases
+  (`q`/`search`/`text` for `query`, etc.) so models reach for them naturally.
+- **#776**: `bm db reset` refuses to run while a `basic-memory mcp` process is
+  alive, so resets can no longer corrupt an open session.
+- **#791**: Search responses include result totals so pagers can stop guessing.
+- **#719**: Cloud `note_content` tenant schema primitive lands on the backend.
+- **#715**: `bm project add` accepts a `--visibility` flag for cloud projects.
+
+### Bug Fixes
+
+#### Search and recent activity
+- **#832**: SQLite project deletion now sweeps `search_index`,
+  `search_vector_chunks`, and `search_vector_embeddings`, so a project that
+  reuses a recycled auto-increment id can't inherit the previous tenant's content.
+- **#812**: `recent_activity` orders and filters by `updated_at`, so edits bubble
+  to the top instead of staying pinned to creation time.
+- **#807**: Multi-project `search_notes` is opt-in (`search_all_projects=True`);
+  default search stays scoped to the resolved project.
+- **#785**: `recent_activity` caps responses and emits an explicit truncation
+  footer instead of silently dropping rows.
+- **#713**: Eliminated an N+1 query in search result hydration.
+
+#### Workspace / project routing
+- **#822**: `bm project list` now includes projects from every workspace, not
+  just the current one.
+- **#813**, **#808**, **#806**, **#803**, **#801**, **#795**, **#790**, **#778**,
+  **#777**, **#722**, **#712**, **#704**: Workspace-qualified permalink routing
+  is centralized and applied consistently across `edit_note`, `delete_project`,
+  `build_context`, `memory://` URLs, factory-mode project listing, cloud uploads,
+  and the API client.
+
+#### Sync
+- **#827**: `rclone bisync` filters from `.bmignore` are preserved across syncs.
+- **#815**: Watch service ignores hidden paths relative to the watched project,
+  not just relative to `$HOME`.
+- **#814**: `scan` subprocesses no longer go through the shell, avoiding quoting
+  issues with paths that contain special characters.
+- **#759**: Watch service stays inside `--project` scope.
+- **#746**: Canonical markdown is preserved during single-file sync.
+
+#### Parsing
+- **#796**: Picoschema modifier descriptions (`field?(modifier, description)`)
+  parse correctly.
+- **#769**: Obsidian callout blocks are skipped by the observation parser
+  instead of being mis-extracted as observations.
+
+#### CLI
+- **#775**: `bm project set-cloud` / `set-local` cleans up local DB state for
+  the affected project.
+- **#773**: `bm cloud logout` clears `default_workspace`.
+- **#780**: `bm cloud setup` hint points at `bm cloud sync-setup`.
+- **#734**: `bm project info` shows cloud index freshness.
+- **#718**: Private cloud projects display under their `display_name` instead of
+  raw UUID.
+- **#768**: `read_note` / `view_note` drop no-op pagination params from their
+  signatures.
+
+#### Stability
+- **#774**: `sqlite-vec` failures during init degrade gracefully to keyword-only
+  search instead of crashing startup.
+- **#733**: Delete-vector and cloud-sync cleanup is now consistent.
+- **#702**: Race conditions in concurrent `delete_entity` are resolved.
+- **#724**: `external_id` is preserved when entities are re-upserted during a
+  re-index.
+- **#728**: Vector init no longer issues runtime `ALTER TABLE`.
+- **#744**: `BASIC_MEMORY_CONFIG_DIR` is honored across remaining call sites.
+- **#743**: FastEmbed cache lives under the data dir instead of `/tmp`.
+- **#752**: Cloud projects report `source=cloud` in factory mode.
+- Stripped null bytes from markdown content before DB insert.
+- Allowed long `relation_type` values in API responses.
+
+#### Installer
+- **#772**: Docker-compose config volume mounts under the `appuser` home.
+- **#695**: Bumped `brew outdated` timeout from 15s to 60s.
+
+### Performance
+
+- **#828**: CLI startup no longer pulls in the local ASGI FastAPI app when it
+  isn't needed.
+- **#751**, **#726**, **#717**, **#714**, single-file/batch indexing: marked
+  speedups on the sync hot path; unchanged markdown is skipped entirely.
+- **#731**, **#723**: Vector sync is faster on both backends, with tuned
+  fastembed defaults.
+
+### Maintenance
+
+- **#825**: Dependency refresh + security hardening.
+- Updated to `fastmcp` 3.3.1.
+- **#754**: Removed in-house telemetry wrappers in favor of direct `logfire`
+  usage.
+- **#736**: `ty` is now the default typechecker.
+- **#771**, **#770**, **#716**: New regression guards for vector-row cleanup,
+  long relation types, and recent activity hydration.
+
 ## v0.20.3 (2026-03-26)
 
 ### Bug Fixes

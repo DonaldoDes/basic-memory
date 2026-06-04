@@ -4,10 +4,12 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from basic_memory.cli.app import app
-from basic_memory.config import ProjectMode
+from basic_memory.config import ProjectEntry, ProjectMode
+from basic_memory.schemas.cloud import WorkspaceInfo
 
 runner = CliRunner()
 
@@ -28,6 +30,9 @@ def test_cloud_sync_commands_skip_explicit_cloud_project_sync(monkeypatch, argv,
     config_manager.save_config(config)
 
     monkeypatch.setattr(project_sync_command, "_require_cloud_credentials", lambda _config: None)
+    monkeypatch.setattr(
+        project_sync_command, "_require_personal_workspace", lambda _name, _config: None
+    )
     monkeypatch.setattr(
         project_sync_command,
         "get_mount_info",
@@ -64,6 +69,9 @@ def test_cloud_bisync_fails_fast_when_sync_entry_disappears(monkeypatch, config_
 
     monkeypatch.setattr(project_sync_command, "_require_cloud_credentials", lambda _config: None)
     monkeypatch.setattr(
+        project_sync_command, "_require_personal_workspace", lambda _name, _config: None
+    )
+    monkeypatch.setattr(
         project_sync_command,
         "get_mount_info",
         lambda: _async_value(SimpleNamespace(bucket_name="tenant-bucket")),
@@ -88,5 +96,271 @@ def test_cloud_bisync_fails_fast_when_sync_entry_disappears(monkeypatch, config_
     assert "unexpectedly missing after validation" in result.output
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cloud", "bisync", "--name", "research"],
+        ["cloud", "bisync-reset", "research"],
+    ],
+)
+def test_cloud_bisync_commands_block_organization_workspace(monkeypatch, argv, config_manager):
+    """Bisync commands should fail before setup/execution for Team workspaces."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.cloud_api_key = "bmc_test"
+    config.projects["research"] = ProjectEntry(
+        path="/tmp/research",
+        mode=ProjectMode.CLOUD,
+        workspace_id="team-tenant",
+        local_sync_path="/tmp/research",
+    )
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value([_workspace("team-tenant", "organization", "team")]),
+    )
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_mount_info",
+        lambda: pytest.fail("workspace guard should run before mount lookup"),
+    )
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_project_bisync_state",
+        lambda _name: pytest.fail("workspace guard should run before bisync state lookup"),
+    )
+
+    result = runner.invoke(app, argv)
+
+    assert result.exit_code == 1, result.output
+    output = " ".join(result.output.split())
+    assert "The bisync operation is only supported on Personal workspaces" in output
+    assert "Use `bm cloud sync --name research` instead" in output
+
+
+def test_cloud_sync_allows_organization_workspace(monkeypatch, config_manager):
+    """Team workspaces can still use the one-way sync command."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.cloud_api_key = "bmc_test"
+    config.projects["research"] = ProjectEntry(
+        path="/tmp/research",
+        mode=ProjectMode.CLOUD,
+        workspace_id="team-tenant",
+        local_sync_path="/tmp/research",
+    )
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: pytest.fail("sync should not require a personal workspace"),
+    )
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_mount_info",
+        lambda: _async_value(SimpleNamespace(bucket_name="tenant-bucket")),
+    )
+    monkeypatch.setattr(
+        project_sync_command,
+        "_get_cloud_project",
+        lambda _name: _async_value(
+            SimpleNamespace(name="research", external_id="external-project-id", path="research")
+        ),
+    )
+    monkeypatch.setattr(
+        project_sync_command,
+        "_get_sync_project",
+        lambda _name, _config, _project_data: (SimpleNamespace(name="research"), "/tmp/research"),
+    )
+    monkeypatch.setattr(project_sync_command, "project_sync", lambda *args, **kwargs: True)
+
+    result = runner.invoke(app, ["cloud", "sync", "--name", "research"])
+
+    assert result.exit_code == 0, result.output
+    assert "research synced successfully" in result.output
+
+
+def test_require_personal_workspace_allows_personal_workspace(monkeypatch, config_manager):
+    """Personal workspaces keep the existing rclone sync path available."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.projects["research"] = ProjectEntry(
+        path="/tmp/research",
+        mode=ProjectMode.CLOUD,
+        workspace_id="personal-tenant",
+        local_sync_path="/tmp/research",
+    )
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value([_workspace("personal-tenant", "personal", "personal")]),
+    )
+
+    workspace = project_sync_command._require_personal_workspace("research", config)
+
+    assert workspace.tenant_id == "personal-tenant"
+
+
+def test_require_personal_workspace_uses_default_workspace(monkeypatch, config_manager):
+    """When no project workspace is set, the single cloud default is used."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.default_workspace = None
+    config.projects["research"] = ProjectEntry(path="/tmp/research", mode=ProjectMode.CLOUD)
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value(
+            [
+                _workspace("team-tenant", "organization", "team"),
+                _workspace("personal-tenant", "personal", "personal", is_default=True),
+            ]
+        ),
+    )
+
+    workspace = project_sync_command._require_personal_workspace("research", config)
+
+    assert workspace.tenant_id == "personal-tenant"
+
+
+def test_require_personal_workspace_uses_single_workspace(monkeypatch, config_manager):
+    """A single accessible workspace is unambiguous even when none is marked default."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.default_workspace = None
+    config.projects["research"] = ProjectEntry(path="/tmp/research", mode=ProjectMode.CLOUD)
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value([_workspace("personal-tenant", "personal", "personal")]),
+    )
+
+    workspace = project_sync_command._require_personal_workspace("research", config)
+
+    assert workspace.tenant_id == "personal-tenant"
+
+
+def test_require_personal_workspace_reports_no_accessible_workspaces(monkeypatch, config_manager):
+    """Workspace resolution exits with a clear error when the account has no workspaces."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.default_workspace = None
+    config.projects["research"] = ProjectEntry(path="/tmp/research", mode=ProjectMode.CLOUD)
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value([]),
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        project_sync_command._require_personal_workspace("research", config)
+
+    assert exc_info.value.exit_code == 1
+
+
+def test_require_personal_workspace_reports_inaccessible_configured_workspace(
+    monkeypatch, config_manager
+):
+    """A configured workspace id must be present in the accessible workspace list."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.projects["research"] = ProjectEntry(
+        path="/tmp/research",
+        mode=ProjectMode.CLOUD,
+        workspace_id="missing-tenant",
+    )
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value([_workspace("personal-tenant", "personal", "personal")]),
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        project_sync_command._require_personal_workspace("research", config)
+
+    assert exc_info.value.exit_code == 1
+
+
+def test_require_personal_workspace_reports_ambiguous_workspace(monkeypatch, config_manager):
+    """Multiple accessible workspaces need an explicit project or account default."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    config = config_manager.load_config()
+    config.default_workspace = None
+    config.projects["research"] = ProjectEntry(path="/tmp/research", mode=ProjectMode.CLOUD)
+    config_manager.save_config(config)
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: _async_value(
+            [
+                _workspace("personal-tenant-a", "personal", "personal-a"),
+                _workspace("personal-tenant-b", "personal", "personal-b"),
+            ]
+        ),
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        project_sync_command._require_personal_workspace("research", config)
+
+    assert exc_info.value.exit_code == 1
+
+
+def test_bisync_reset_skips_workspace_check_without_credentials(monkeypatch, tmp_path):
+    """Resetting local bisync state stays harmless when no cloud credentials exist."""
+    project_sync_command = importlib.import_module("basic_memory.cli.commands.cloud.project_sync")
+
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_available_workspaces",
+        lambda: pytest.fail("workspace lookup requires cloud credentials"),
+    )
+    monkeypatch.setattr(
+        project_sync_command,
+        "get_project_bisync_state",
+        lambda _name: tmp_path / "missing-state",
+    )
+
+    result = runner.invoke(app, ["cloud", "bisync-reset", "research"])
+
+    assert result.exit_code == 0, result.output
+    assert "No bisync state found for project 'research'" in result.output
+
+
 async def _async_value(value):
     return value
+
+
+def _workspace(
+    tenant_id: str, workspace_type: str, slug: str, *, is_default: bool = False
+) -> WorkspaceInfo:
+    return WorkspaceInfo(
+        tenant_id=tenant_id,
+        workspace_type=workspace_type,
+        slug=slug,
+        name=slug.title(),
+        role="owner",
+        is_default=is_default,
+        has_active_subscription=True,
+    )

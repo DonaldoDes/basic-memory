@@ -9,7 +9,8 @@ from sqlalchemy import select
 
 from basic_memory import db
 from basic_memory.mcp.tools import list_memory_projects, create_memory_project, delete_project
-from basic_memory.mcp.tools.project_management import _merge_projects
+from basic_memory.config import BasicMemoryConfig, ProjectEntry
+from basic_memory.mcp.tools.project_management import _merge_projects, _merge_workspace_projects
 from basic_memory.models.project import Project
 from basic_memory.schemas.project_info import ProjectItem, ProjectList
 
@@ -699,7 +700,9 @@ async def test_list_memory_projects_factory_mode(app, test_project):
     assert "Workspace: Personal (personal default)" in result
     assert "Workspace: Team Paul (team-paul)" in result
     assert "- personal-main (cloud) [personal-project-uuid]" in result
-    assert "- team-specs (cloud) [team-project-uuid]" in result
+    assert (
+        "- team-specs (cloud) [team-project-uuid] - cloud-only (local sync unsupported)" in result
+    )
 
 
 @pytest.mark.asyncio
@@ -758,6 +761,9 @@ async def test_list_memory_projects_factory_mode_json_includes_workspace(app, te
     assert proj["workspace_slug"] == "my-org"
     assert proj["workspace_is_default"] is False
     assert proj["qualified_name"] == "my-org/cloud-proj"
+    assert proj["sync_supported"] is False
+    assert proj["sync_reason"] == "organization workspace"
+    assert proj["local_usage"] == "cloud-only"
 
 
 @pytest.mark.asyncio
@@ -827,6 +833,9 @@ async def test_list_memory_projects_json_with_cloud(app, test_project):
     # Backward-compat: path prefers local
     assert main_proj["path"] == "/home/user/basic-memory"
     assert main_proj["is_default"] is True
+    assert main_proj["sync_supported"] is True
+    assert main_proj["sync_reason"] is None
+    assert main_proj["local_usage"] == "sync-supported"
 
     # cloud-only
     cloud_proj = by_name["cloud-only"]
@@ -836,6 +845,9 @@ async def test_list_memory_projects_json_with_cloud(app, test_project):
     assert cloud_proj["path"] == "/cloud-only"
     assert cloud_proj["workspace_slug"] == "personal"
     assert cloud_proj["qualified_name"] == "personal/cloud-only"
+    assert cloud_proj["sync_supported"] is True
+    assert cloud_proj["sync_reason"] is None
+    assert cloud_proj["local_usage"] == "sync-supported"
 
 
 # --- Unit test for _merge_projects ---
@@ -862,6 +874,9 @@ def test_merge_projects_local_only():
     assert all(p["workspace_name"] is None for p in merged)
     assert all(p["workspace_type"] is None for p in merged)
     assert all(p["workspace_tenant_id"] is None for p in merged)
+    assert all(p["sync_supported"] is True for p in merged)
+    assert all(p["sync_reason"] is None for p in merged)
+    assert all(p["local_usage"] == "sync-supported" for p in merged)
 
 
 def test_merge_projects_cloud_only():
@@ -884,6 +899,9 @@ def test_merge_projects_cloud_only():
     assert merged[0]["workspace_name"] == "Personal"
     assert merged[0]["workspace_type"] == "personal"
     assert merged[0]["workspace_tenant_id"] == "tenant-123"
+    assert merged[0]["sync_supported"] is True
+    assert merged[0]["sync_reason"] is None
+    assert merged[0]["local_usage"] == "sync-supported"
 
 
 def test_merge_projects_overlap():
@@ -907,6 +925,226 @@ def test_merge_projects_overlap():
     assert merged[0]["workspace_name"] == "Acme Corp"
     assert merged[0]["workspace_type"] == "organization"
     assert merged[0]["workspace_tenant_id"] == "org-456"
+    assert merged[0]["sync_supported"] is False
+    assert merged[0]["sync_reason"] == "organization workspace"
+    assert merged[0]["local_usage"] == "cloud-only"
+
+
+def test_merge_workspace_projects_attaches_local_state_to_one_duplicate_workspace(tmp_path):
+    """A same-name team workspace project should stay cloud-only (#848)."""
+    local_path = str(tmp_path / "main")
+    local_main = _make_project("main", local_path, is_default=True)
+    local_list = _make_list([local_main], default="main")
+    personal_main = _make_project(
+        "main",
+        "/cloud/personal-main",
+        id=10,
+        external_id="personal-main-uuid",
+    )
+    team_main = _make_project(
+        "main",
+        "/cloud/team-main",
+        id=11,
+        external_id="team-main-uuid",
+    )
+    personal_ws = _make_workspace(
+        "personal-tenant",
+        "Personal",
+        slug="personal",
+        is_default=True,
+    )
+    team_ws = _make_workspace(
+        "team-tenant",
+        "Team",
+        workspace_type="organization",
+        slug="team",
+    )
+    workspace_index = _make_workspace_index(
+        [
+            (personal_ws, [personal_main]),
+            (team_ws, [team_main]),
+        ]
+    )
+    config = BasicMemoryConfig(projects={"main": ProjectEntry(path=local_path)})
+
+    merged = _merge_workspace_projects(local_list, workspace_index.entries, config=config)
+
+    by_qualified_name = {project["qualified_name"]: project for project in merged}
+    personal_project = by_qualified_name["personal/main"]
+    team_project = by_qualified_name["team/main"]
+
+    assert personal_project["source"] == "local+cloud"
+    assert personal_project["local_path"] == local_path
+    assert personal_project["path"] == local_path
+    assert team_project["source"] == "cloud"
+    assert team_project["local_path"] is None
+    assert team_project["path"] == "/cloud/team-main"
+    assert team_project["sync_supported"] is False
+    assert team_project["sync_reason"] == "organization workspace"
+    assert team_project["local_usage"] == "cloud-only"
+
+
+def test_merge_workspace_projects_uses_configured_workspace_for_local_state(tmp_path):
+    """Per-project workspace_id should select the attached duplicate row."""
+    local_path = str(tmp_path / "main")
+    local_main = _make_project("main", local_path, is_default=True)
+    local_list = _make_list([local_main], default="main")
+    personal_main = _make_project(
+        "main",
+        "/cloud/personal-main",
+        id=10,
+        external_id="personal-main-uuid",
+    )
+    team_main = _make_project(
+        "main",
+        "/cloud/team-main",
+        id=11,
+        external_id="team-main-uuid",
+    )
+    personal_ws = _make_workspace(
+        "personal-tenant",
+        "Personal",
+        slug="personal",
+        is_default=True,
+    )
+    team_ws = _make_workspace(
+        "team-tenant",
+        "Team",
+        workspace_type="organization",
+        slug="team",
+    )
+    workspace_index = _make_workspace_index(
+        [
+            (personal_ws, [personal_main]),
+            (team_ws, [team_main]),
+        ]
+    )
+    config = BasicMemoryConfig(
+        projects={
+            "main": ProjectEntry(
+                path=local_path,
+                workspace_id="team-tenant",
+            )
+        }
+    )
+
+    merged = _merge_workspace_projects(local_list, workspace_index.entries, config=config)
+
+    by_qualified_name = {project["qualified_name"]: project for project in merged}
+    personal_project = by_qualified_name["personal/main"]
+    team_project = by_qualified_name["team/main"]
+
+    assert personal_project["source"] == "cloud"
+    assert personal_project["local_path"] is None
+    assert personal_project["path"] == "/cloud/personal-main"
+    assert team_project["source"] == "local+cloud"
+    assert team_project["local_path"] == local_path
+    assert team_project["path"] == local_path
+
+
+def test_merge_workspace_projects_uses_default_workspace_for_local_state(tmp_path):
+    """Global default_workspace should attach local state before cloud default fallback."""
+    local_path = str(tmp_path / "main")
+    local_main = _make_project("main", local_path, is_default=True)
+    local_list = _make_list([local_main], default="main")
+    personal_main = _make_project(
+        "main",
+        "/cloud/personal-main",
+        id=10,
+        external_id="personal-main-uuid",
+    )
+    team_main = _make_project(
+        "main",
+        "/cloud/team-main",
+        id=11,
+        external_id="team-main-uuid",
+    )
+    personal_ws = _make_workspace(
+        "personal-tenant",
+        "Personal",
+        slug="personal",
+        is_default=True,
+    )
+    team_ws = _make_workspace(
+        "team-tenant",
+        "Team",
+        workspace_type="organization",
+        slug="team",
+    )
+    workspace_index = _make_workspace_index(
+        [
+            (personal_ws, [personal_main]),
+            (team_ws, [team_main]),
+        ]
+    )
+    config = BasicMemoryConfig(
+        projects={"main": ProjectEntry(path=local_path)},
+        default_workspace="team-tenant",
+    )
+
+    merged = _merge_workspace_projects(local_list, workspace_index.entries, config=config)
+
+    by_qualified_name = {project["qualified_name"]: project for project in merged}
+    personal_project = by_qualified_name["personal/main"]
+    team_project = by_qualified_name["team/main"]
+
+    assert personal_project["source"] == "cloud"
+    assert personal_project["local_path"] is None
+    assert personal_project["path"] == "/cloud/personal-main"
+    assert team_project["source"] == "local+cloud"
+    assert team_project["local_path"] == local_path
+    assert team_project["path"] == local_path
+
+
+def test_merge_workspace_projects_sorted_fallback_attaches_personal_workspace(tmp_path):
+    """When config has no preference and no cloud default exists, use stable priority."""
+    local_path = str(tmp_path / "main")
+    local_main = _make_project("main", local_path, is_default=True)
+    local_list = _make_list([local_main], default="main")
+    personal_main = _make_project(
+        "main",
+        "/cloud/personal-main",
+        id=10,
+        external_id="personal-main-uuid",
+    )
+    team_main = _make_project(
+        "main",
+        "/cloud/team-main",
+        id=11,
+        external_id="team-main-uuid",
+    )
+    personal_ws = _make_workspace(
+        "personal-tenant",
+        "Personal",
+        slug="personal",
+        is_default=False,
+    )
+    team_ws = _make_workspace(
+        "team-tenant",
+        "Team",
+        workspace_type="organization",
+        slug="team",
+    )
+    workspace_index = _make_workspace_index(
+        [
+            (team_ws, [team_main]),
+            (personal_ws, [personal_main]),
+        ]
+    )
+    config = BasicMemoryConfig(projects={"main": ProjectEntry(path=local_path)})
+
+    merged = _merge_workspace_projects(local_list, workspace_index.entries, config=config)
+
+    by_qualified_name = {project["qualified_name"]: project for project in merged}
+    personal_project = by_qualified_name["personal/main"]
+    team_project = by_qualified_name["team/main"]
+
+    assert personal_project["source"] == "local+cloud"
+    assert personal_project["local_path"] == local_path
+    assert personal_project["path"] == local_path
+    assert team_project["source"] == "cloud"
+    assert team_project["local_path"] is None
+    assert team_project["path"] == "/cloud/team-main"
 
 
 # --- Workspace passthrough tests ---

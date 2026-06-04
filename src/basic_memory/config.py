@@ -21,11 +21,25 @@ from basic_memory.utils import setup_logging, generate_permalink
 
 DATABASE_NAME = "memory.db"
 APP_DATABASE_NAME = "memory.db"  # Using the same name but in the app directory
-DATA_DIR_NAME = ".basic-memory"
+DATA_DIR_NAME = "basic-memory"
 CONFIG_FILE_NAME = "config.json"
 WATCH_STATUS_JSON = "watch-status.json"
+CONFIG_DIR_MODE = 0o700
+CONFIG_FILE_MODE = 0o600
 
 Environment = Literal["test", "dev", "user"]
+
+
+def _secure_config_dir(path: Path) -> None:
+    """Restrict config directory permissions on platforms with POSIX modes."""
+    if os.name != "nt":
+        path.chmod(CONFIG_DIR_MODE)
+
+
+def _secure_config_file(path: Path) -> None:
+    """Restrict config file permissions because config can contain cloud credentials."""
+    if os.name != "nt":
+        path.chmod(CONFIG_FILE_MODE)
 
 
 class ProjectMode(str, Enum):
@@ -55,15 +69,18 @@ def resolve_data_dir() -> Path:
 
     Single source of truth for the per-user state directory. Honors
     ``BASIC_MEMORY_CONFIG_DIR`` so each process/worktree can isolate config
-    and database state; otherwise falls back to ``<user home>/.basic-memory``.
+    and database state; otherwise falls back to ``<user home>/.basic-memory``,
+    and then to ``XDG_CONFIG_HOME``.
 
     Cross-platform: ``Path.home()`` reads ``$HOME`` on POSIX and
     ``%USERPROFILE%`` on Windows, so there's no need to check ``$HOME``
     explicitly here.
     """
-    if config_dir := os.getenv("BASIC_MEMORY_CONFIG_DIR"):
-        return Path(config_dir)
-    return Path.home() / DATA_DIR_NAME
+    if basic_memory_dir := os.getenv("BASIC_MEMORY_CONFIG_DIR"):
+        return Path(basic_memory_dir)
+    if xdg_config := os.getenv("XDG_CONFIG_HOME"):
+        return Path(xdg_config) / DATA_DIR_NAME
+    return Path.home() / ("." + DATA_DIR_NAME)
 
 
 def default_fastembed_cache_dir() -> str:
@@ -168,13 +185,15 @@ class BasicMemoryConfig(BaseSettings):
     env: Environment = Field(default="dev", description="Environment name")
 
     projects: Dict[str, ProjectEntry] = Field(
-        default_factory=lambda: {
-            "main": ProjectEntry(
-                path=str(Path(os.getenv("BASIC_MEMORY_HOME", Path.home() / "basic-memory")))
-            )
-        }
-        if os.getenv("BASIC_MEMORY_HOME")
-        else {},
+        default_factory=lambda: (
+            {
+                "main": ProjectEntry(
+                    path=str(Path(os.getenv("BASIC_MEMORY_HOME", Path.home() / "basic-memory")))
+                )
+            }
+            if os.getenv("BASIC_MEMORY_HOME")
+            else {}
+        ),
         description="Mapping of project names to their ProjectEntry configuration",
     )
     default_project: Optional[str] = Field(
@@ -276,6 +295,11 @@ class BasicMemoryConfig(BaseSettings):
     semantic_embedding_parallel: int | None = Field(
         default=None,
         description="Optional FastEmbed embed() parallelism override.",
+        gt=0,
+    )
+    import_upload_max_bytes: int = Field(
+        default=100 * 1024 * 1024,
+        description="Maximum uploaded JSON export size accepted by API import endpoints.",
         gt=0,
     )
     semantic_vector_k: int = Field(
@@ -776,6 +800,7 @@ class ConfigManager:
 
         # Ensure config directory exists
         self.config_dir.mkdir(parents=True, exist_ok=True)
+        _secure_config_dir(self.config_dir)
 
     @property
     def config(self) -> BasicMemoryConfig:
@@ -888,6 +913,7 @@ class ConfigManager:
                     # Create backup before overwriting so users can revert if needed
                     backup_path = self.config_file.with_suffix(".json.bak")
                     shutil.copy2(self.config_file, backup_path)
+                    _secure_config_file(backup_path)
                     logger.info(f"Migrating config to current format (backup: {backup_path})")
                     save_basic_memory_config(self.config_file, _CONFIG_CACHE)
 
@@ -1043,9 +1069,12 @@ def has_cloud_credentials(config: BasicMemoryConfig) -> bool:
 def save_basic_memory_config(file_path: Path, config: BasicMemoryConfig) -> None:
     """Save configuration to file."""
     try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _secure_config_dir(file_path.parent)
         # Use model_dump with mode='json' to serialize datetime objects properly
         config_dict = config.model_dump(mode="json")
         file_path.write_text(json.dumps(config_dict, indent=2))
+        _secure_config_file(file_path)
     except Exception as e:  # pragma: no cover
         logger.error(f"Failed to save config: {e}")
 
