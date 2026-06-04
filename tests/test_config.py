@@ -1,5 +1,7 @@
 """Test configuration management."""
 
+import os
+import stat
 import tempfile
 import pytest
 from datetime import datetime
@@ -306,14 +308,32 @@ class TestDataDirHelpers:
     """Module-level helpers that resolve the Basic Memory data directory."""
 
     def test_resolve_data_dir_defaults_to_home_dot_basic_memory(self, config_home, monkeypatch):
-        """Without BASIC_MEMORY_CONFIG_DIR, resolver returns ~/.basic-memory."""
+        """Without BASIC_MEMORY_CONFIG_DIR and XDG_CONFIG_HOME, resolver returns ~/.basic-memory."""
         monkeypatch.delenv("BASIC_MEMORY_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
         assert resolve_data_dir() == config_home / ".basic-memory"
 
     def test_resolve_data_dir_honors_config_dir_env(self, tmp_path, monkeypatch):
         """BASIC_MEMORY_CONFIG_DIR overrides the default location."""
         custom = tmp_path / "elsewhere"
+        monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", str(custom))
+
+        assert resolve_data_dir() == custom
+
+    def test_resolve_data_dir_honors_xdg_config_home(self, tmp_path, monkeypatch):
+        """XDG_CONFIG_HOME is honored when BASIC_MEMORY_CONFIG_DIR is not set."""
+        monkeypatch.delenv("BASIC_MEMORY_CONFIG_DIR", raising=False)
+        xdg_config = tmp_path / "xdg-config"
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+
+        assert resolve_data_dir() == xdg_config / "basic-memory"
+
+    def test_basic_memory_config_dir_takes_precedence_over_xdg(self, tmp_path, monkeypatch):
+        """BASIC_MEMORY_CONFIG_DIR takes precedence over XDG_CONFIG_HOME."""
+        xdg_config = tmp_path / "xdg-config"
+        custom = tmp_path / "custom-config"
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
         monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", str(custom))
 
         assert resolve_data_dir() == custom
@@ -448,6 +468,23 @@ class TestConfigManager:
 
         with pytest.raises(ValueError, match="Project 'nonexistent' not found"):
             config_manager.set_default_project("nonexistent")
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable to Windows")
+    def test_save_config_uses_private_permissions(self, temp_config_manager):
+        """Config can contain cloud credentials, so writes should enforce private modes."""
+        config_manager = temp_config_manager
+        config = config_manager.load_config()
+        config.cloud_api_key = "bmc_test123"
+
+        config_manager.config_dir.chmod(0o777)
+        config_manager.config_file.chmod(0o666)
+        config_manager.save_config(config)
+
+        dir_mode = stat.S_IMODE(config_manager.config_dir.stat().st_mode)
+        file_mode = stat.S_IMODE(config_manager.config_file.stat().st_mode)
+
+        assert dir_mode == 0o700
+        assert file_mode == 0o600
 
     def test_disable_permalinks_flag_default(self):
         """Test that disable_permalinks flag defaults to False."""

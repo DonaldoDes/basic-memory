@@ -7,302 +7,312 @@
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
 
-## 🚀 Basic Memory Cloud is Live!
+## Skip the install — try Basic Memory in the cloud
 
-- **Cross-device and multi-platform support is here.** Your knowledge graph now works on desktop, web, and mobile.
-- **Cloud is optional.** The local-first open-source workflow continues as always.
-- **OSS discount:** use code `BMFOSS` for 20% off for 3 months.
+Claude, Codex, or Cursor connected in 30 seconds. No Python, no JSON, no
+terminal. **$15.00/mo locked in for life** (12.50/mo yearly pricing). 7-day free
+trial — cancel any time before day 7 if it's not for you. Beta pricing —
+sign up now and your rate never goes up. OSS users: code `BMFOSS` takes
+another 20% off for 3 months.
 
-[Sign up now →](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme)
+[Start free trial →](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme&utm_content=banner)
 
-with a 7 day free trial
+### Basic Memory Teams is now available!
+
+Give your team a single, shared cloud workspace. Knowledge isn't confined to one person — anything a teammate writes is immediately available to everyone else and to their AI assistants. 
+Edit a note together in real time, hand work off between humans and agents, and build one connected knowledge base instead of scattered copies. Same pricing - start with one user and add more as needed. 
+
+---
 
 # Basic Memory
 
-Basic Memory lets you build persistent knowledge through natural conversations with Large Language Models (LLMs) like
-Claude, while keeping everything in simple Markdown files on your computer. It uses the Model Context Protocol (MCP) to
-enable any compatible LLM to read and write to your local knowledge base.
+### Your AI never forgets again.
 
-## What's New in v0.19.0
+Pick up right where you left off — in Claude, Codex, Cursor, ChatGPT, or
+anything that speaks [MCP](https://modelcontextprotocol.io). Your knowledge
+lives as Markdown files that both you and your AI can read, write, and
+search.
 
-- **Semantic Vector Search** — find notes by meaning, not just keywords. Combines full-text and vector similarity for hybrid search with FastEmbed embeddings.
-- **Schema System** — infer, validate, and diff the structure of your knowledge base with `schema_infer`, `schema_validate`, and `schema_diff` tools.
-- **Per-Project Cloud Routing** — route individual projects through the cloud while others stay local, using API key authentication (`basic-memory project set-cloud`).
-- **FastMCP 3.0** — upgraded to FastMCP 3.0 with tool annotations for better client integration.
-- **CLI Overhaul** — JSON output mode (`--json`) for scripting, workspace-aware commands, and an htop-inspired project dashboard.
-- **Smarter Editing** — `edit_note` append/prepend auto-creates notes if they don't exist; `write_note` has an overwrite guard to prevent accidental data loss.
-- **Richer Search Results** — matched chunk text returned in search results for better context.
+- **Local-first.** Plain text on your disk. Forever.
+- **Two-way.** AI and humans write to the same files; sync keeps them in step.
+- **A real knowledge graph.** Observations and wikilinks compound into context.
+- **Semantic search.** Find notes by meaning, not just keywords.
+- **MCP-native.** Works with every major AI client and IDE.
+- **Progressive tool discovery.** Every tool is tagged with behavior hints
+  (read-only, destructive, idempotent) so agents pick the right tool on
+  demand — no wasted context trying things to see what they do.
+- **Cloud, optional.** Sync across devices when you want — never required.
 
-See the full [CHANGELOG](CHANGELOG.md) for details.
+## Get started
 
-- Website: [basicmemory.com](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme)
-- Documentation: [docs.basicmemory.com](https://docs.basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme)
-- Community: [Discord](https://discord.gg/tyvKNccgqN?utm_source=github&utm_medium=referral&utm_campaign=readme)
+Pick the path that fits you. Both run the same product on the same Markdown.
 
-## Pick up your conversation right where you left off
+<table>
+<tr>
+<th width="50%">☁️ &nbsp; Cloud</th>
+<th width="50%">💻 &nbsp; Local install</th>
+</tr>
+<tr>
+<td valign="top">
 
-- AI assistants can load context from local files in a new conversation
-- Notes are saved locally as Markdown files in real time
-- No project knowledge or special prompting required
+**30 seconds.** Sign up, connect your AI client, done.
+
+- Works in any browser
+- Mobile, web, desktop
+- Cross-device sync built in
+- We handle hosting, backups, snapshots
+
+**$15.00/mo locked for life** · 7-day free trial · cancel any time
+
+[**Start free trial →**](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme&utm_content=quickstart)
+
+</td>
+<td valign="top">
+
+**2 minutes.** Install, configure your AI client, run.
+
+- Free forever (AGPL-3.0)
+- All data on your disk
+- Air-gapped friendly
+- Requires Python via [`uv`](https://docs.astral.sh/uv/)
+
+```bash
+uv tool install basic-memory
+```
+
+[**Configure your client ↓**](#connect-your-ai-client)
+
+</td>
+</tr>
+</table>
+
+## What people are saying
+
+> Basic Memory changed my whole relationship with LLMs. I switched from GPT
+> and Gemini to exclusively Claude and Claude Code because of this
+> integration and am completely revamping all our company's processes around
+> a Basic Memory workflow.
+>
+> — **Alex**, TrainerDay
+
+> Basic Memory is the missing 'wow' factor in AI chatbots. Now I can't
+> imagine Claude or Claude Code without it.
+>
+> — **Caleb**, Caleb Picker Consulting
+
+> I don't code without Basic Memory anymore. It's such a time saver to be
+> able to refer to projects I don't currently have active and keep a running
+> log of all my learnings and ProTips.
+>
+> — **@groksrc**, Developer
+
+More on [basicmemory.com](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme).
+
+## Basic Memory Cloud
+
+The hosted version of Basic Memory. Same product, same Markdown files, same
+MCP tools — we just host the database, run the sync, and put it on your
+phone.
+
+### What you get
+
+- **Every device, same brain.** Your knowledge graph on web, mobile, and
+  desktop. No copy-paste between machines.
+- **Connect any MCP client.** Claude Desktop, Claude Code, Codex, Cursor,
+  ChatGPT (Custom GPTs), VS Code — one-click connect from the web app.
+- **Bidirectional sync to local.** Edit on your phone, see it in Obsidian on
+  your laptop. rclone-powered with conflict resolution.
+- **Snapshots and backups.** Point-in-time restore. Browse history. Never
+  lose a note.
+- **No lock-in.** Your notes are plain Markdown. Export to local Markdown any
+  time — same files, same format, same wikilinks. Cancel anytime, your data
+  stays yours.
+
+Built on WorkOS AuthKit, Neon Postgres, and Tigris S3.
+
+### Pricing
+
+**$15.00/mo, locked in for the life of your subscription** (regular price
+$19). Sign up during beta and the rate never goes up — as long as you stay
+subscribed, you keep the price. One plan, no tiers, no surprise upgrades.
+Unlimited notes, unlimited projects, every feature.
+
+- 7-day free trial. Cancel any time before day 7 if it's not for you.
+- Cancel anytime after that too — export your notes whenever you want.
+- OSS users: code `BMFOSS` for another 20% off for 3 months (~$11.40/mo).
+
+[**Start your 7-day free trial →**](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme&utm_content=cloud-section)
+
+## Cloud vs. local
+
+|  | Cloud | Local |
+|---|---|---|
+| **Setup time** | 30 seconds | 2 minutes (requires Python) |
+| **Cost** | $15.00/mo, locked for life (7-day trial) | Free |
+| **Storage** | We host (Tigris S3) | Your disk |
+| **Cross-device sync** | Built in | Manual (Git, Syncthing, etc.) |
+| **Mobile access** | Yes (web + app) | No |
+| **Air-gapped** | No | Yes |
+| **Your data stays yours** | Yes — export anytime | Yes — already there |
+| **Source code** | AGPL-3.0 | AGPL-3.0 |
+| **Snapshots & backups** | Built in | Roll your own |
+
+Both paths use the same OSS engine and the same Markdown files. There's no
+lock-in either way — flip between them when your needs change.
+
+## Works with the tools you already use
+
+| Client | Transport | Notes |
+|---|---|---|
+| Cloud web app | https | Sign in at basicmemory.com — no install |
+| [Claude Desktop](#claude-desktop) | stdio/https | macOS / Windows / Linux |
+| [Claude Code](#claude-code) | stdio/https | `claude mcp add` |
+| [Codex](#codex-cli) | stdio/https | OpenAI's coding agent |
+| [Cursor](#cursor) | stdio/https | `.cursor/mcp.json` |
+| [VS Code](#vs-code) | stdio/https | Native MCP support |
+| [ChatGPT](#chatgpt) | https | Custom GPT actions (`search` / `fetch`) |
+| [Obsidian](#obsidian) | — | Reads/writes the same Markdown directly |
+| Anything MCP | stdio/https | If it speaks MCP, it works |
+
+## Official agent packages
+
+This repository is also the canonical home for Basic Memory's host-native
+agent packages. The core Python package, Claude Code plugin, shared skills,
+Hermes plugin, and OpenClaw plugin all ship from the same source tree.
+
+Maintainers can verify the whole consolidated surface from the repo root:
+
+```bash
+just package-check
+```
+
+Package-local justfiles are also available when working inside one host:
+
+```bash
+just package-check-claude-code
+just package-check-skills
+just package-check-hermes
+just package-check-openclaw
+```
+
+### Claude Code plugin
+
+The Claude Code plugin is the bridge between Claude's working memory and Basic
+Memory — session-start briefings, pre-compaction checkpoints, an opt-in capture
+output style, and `/basic-memory:setup` · `:remember` · `:share` · `:status`.
+
+**Connect the Basic Memory MCP server first** — see [Connect your AI
+client](#connect-your-ai-client). The plugin's hooks and skills call it, so it's a
+hard prerequisite. Then add the marketplace and install:
+
+```bash
+claude plugin marketplace add basicmachines-co/basic-memory \
+  --sparse .claude-plugin plugins/claude-code
+claude plugin install basic-memory@basicmachines-co
+```
+
+Source: [`plugins/claude-code`](plugins/claude-code).
+
+### Shared skills
+
+Framework-agnostic `SKILL.md` files live in [`skills/`](skills). If your
+Skills CLI supports subpath installs:
+
+```bash
+npx skills add basicmachines-co/basic-memory --path skills
+```
+
+If it does not, copy the `memory-*` directories from `skills/` into your
+agent's skills directory as a temporary Phase 1 install path.
+
+### Hermes
+
+Hermes keeps its native plugin shape under [`integrations/hermes`](integrations/hermes):
+
+```bash
+hermes plugins install basicmachines-co/basic-memory --path integrations/hermes
+```
+
+If your Hermes build lacks subpath installs, use the final deprecated
+`basicmachines-co/hermes-basic-memory` pointer release until host support
+lands.
+
+### OpenClaw
+
+OpenClaw stays package-native and publishes from
+[`integrations/openclaw`](integrations/openclaw):
+
+```bash
+openclaw plugins install @basicmemory/openclaw-basic-memory
+```
+
+## Pick up where you left off
 
 https://github.com/user-attachments/assets/a55d8238-8dd0-454a-be4c-8860dbbd0ddc
 
-## Quick Start
+## Connect your AI client
 
-```bash
-# Install with uv (recommended)
-uv tool install basic-memory
+If you went the [Cloud](#get-started) route, the web app walks you through
+client connect. The snippets below are for local installs.
 
-# Configure Claude Desktop (edit ~/Library/Application Support/Claude/claude_desktop_config.json)
-# Add this to your config:
+### Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
 {
   "mcpServers": {
     "basic-memory": {
       "command": "uvx",
-      "args": [
-        "basic-memory",
-        "mcp"
-      ]
+      "args": ["basic-memory", "mcp"]
     }
   }
 }
-# Now in Claude Desktop, you can:
-# - Write notes with "Create a note about coffee brewing methods"
-# - Read notes with "What do I know about pour over coffee?"
-# - Search with "Find information about Ethiopian beans"
-
 ```
 
-You can view shared context via files in `~/basic-memory` (default directory location).
+Restart Claude Desktop. Notes live in `~/basic-memory` by default.
 
-## Automatic Updates
+<details>
+<summary><b>Claude Code, Codex CLI, Cursor, VS Code, ChatGPT, Obsidian</b></summary>
 
-Basic Memory includes a default-on auto-update flow for CLI installs.
-
-- **Auto-install supported:** `uv tool` and Homebrew installs
-- **Default check interval:** every 24 hours (`86400` seconds)
-- **MCP-safe behavior:** update checks run silently in `basic-memory mcp` mode
-- **`uvx` behavior:** skipped (runtime is ephemeral and managed by `uvx`)
-
-Manual update commands:
+### Claude Code
 
 ```bash
-# Check now and install if supported
-bm update
-
-# Check only, do not install
-bm update --check
+claude mcp add basic-memory -- uvx basic-memory mcp
 ```
 
-Config options in `~/.basic-memory/config.json`:
+For the full memory bridge — session briefings, pre-compaction checkpoints, and
+the `/basic-memory:*` commands — also install the [Claude Code
+plugin](#claude-code-plugin) on top of this.
+
+### Codex CLI
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.basic-memory]
+command = "uvx"
+args = ["basic-memory", "mcp"]
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
 
 ```json
 {
-  "auto_update": true,
-  "update_check_interval": 86400
+  "mcpServers": {
+    "basic-memory": {
+      "command": "uvx",
+      "args": ["basic-memory", "mcp"]
+    }
+  }
 }
 ```
 
-To disable automatic updates, set `"auto_update": false`.
+### VS Code
 
-## Why Basic Memory?
-
-Most LLM interactions are ephemeral - you ask a question, get an answer, and everything is forgotten. Each conversation
-starts fresh, without the context or knowledge from previous ones. Current workarounds have limitations:
-
-- Chat histories capture conversations but aren't structured knowledge
-- RAG systems can query documents but don't let LLMs write back
-- Vector databases require complex setups and often live in the cloud
-- Knowledge graphs typically need specialized tools to maintain
-
-Basic Memory addresses these problems with a simple approach: structured Markdown files that both humans and LLMs can
-read
-and write to. The key advantages:
-
-- **Local-first:** All knowledge stays in files you control
-- **Bi-directional:** Both you and the LLM read and write to the same files
-- **Structured yet simple:** Uses familiar Markdown with semantic patterns
-- **Traversable knowledge graph:** LLMs can follow links between topics
-- **Standard formats:** Works with existing editors like Obsidian
-- **Lightweight infrastructure:** Just local files indexed in a local SQLite database
-
-With Basic Memory, you can:
-
-- Have conversations that build on previous knowledge
-- Create structured notes during natural conversations
-- Have conversations with LLMs that remember what you've discussed before
-- Navigate your knowledge graph semantically
-- Keep everything local and under your control
-- Use familiar tools like Obsidian to view and edit notes
-- Build a personal knowledge base that grows over time
-- Sync your knowledge to the cloud with bidirectional synchronization
-- Authenticate and manage cloud projects with subscription validation
-- Mount cloud storage for direct file access
-
-## How It Works in Practice
-
-Let's say you're exploring coffee brewing methods and want to capture your knowledge. Here's how it works:
-
-1. Start by chatting normally:
-
-```
-I've been experimenting with different coffee brewing methods. Key things I've learned:
-
-- Pour over gives more clarity in flavor than French press
-- Water temperature is critical - around 205°F seems best
-- Freshly ground beans make a huge difference
-```
-
-... continue conversation.
-
-2. Ask the LLM to help structure this knowledge:
-
-```
-"Let's write a note about coffee brewing methods."
-```
-
-LLM creates a new Markdown file on your system (which you can see instantly in Obsidian or your editor):
-
-```markdown
----
-title: Coffee Brewing Methods
-permalink: coffee-brewing-methods
-tags:
-- coffee
-- brewing
----
-
-# Coffee Brewing Methods
-
-## Observations
-
-- [method] Pour over provides more clarity and highlights subtle flavors
-- [technique] Water temperature at 205°F (96°C) extracts optimal compounds
-- [principle] Freshly ground beans preserve aromatics and flavor
-
-## Relations
-
-- relates_to [[Coffee Bean Origins]]
-- requires [[Proper Grinding Technique]]
-- affects [[Flavor Extraction]]
-```
-
-The note embeds semantic content and links to other topics via simple Markdown formatting.
-
-3. You see this file on your computer in real time in the current project directory (default `~/$HOME/basic-memory`).
-
-- Realtime sync can be enabled via running `basic-memory sync --watch`
-
-4. In a chat with the LLM, you can reference a topic:
-
-```
-Look at `coffee-brewing-methods` for context about pour over coffee
-```
-
-The LLM can now build rich context from the knowledge graph. For example:
-
-```
-Following relation 'relates_to [[Coffee Bean Origins]]':
-- Found information about Ethiopian Yirgacheffe
-- Notes on Colombian beans' nutty profile
-- Altitude effects on bean characteristics
-
-Following relation 'requires [[Proper Grinding Technique]]':
-- Burr vs. blade grinder comparisons
-- Grind size recommendations for different methods
-- Impact of consistent particle size on extraction
-```
-
-Each related document can lead to more context, building a rich semantic understanding of your knowledge base.
-
-This creates a two-way flow where:
-
-- Humans write and edit Markdown files
-- LLMs read and write through the MCP protocol
-- Sync keeps everything consistent
-- All knowledge stays in local files.
-
-## Technical Implementation
-
-Under the hood, Basic Memory:
-
-1. Stores everything in Markdown files
-2. Uses a SQLite database for searching and indexing
-3. Extracts semantic meaning from simple Markdown patterns
-    - Files become `Entity` objects
-    - Each `Entity` can have `Observations`, or facts associated with it
-    - `Relations` connect entities together to form the knowledge graph
-4. Maintains the local knowledge graph derived from the files
-5. Provides bidirectional synchronization between files and the knowledge graph
-6. Implements the Model Context Protocol (MCP) for AI integration
-7. Exposes tools that let AI assistants traverse and manipulate the knowledge graph
-8. Uses memory:// URLs to reference entities across tools and conversations
-
-The file format is just Markdown with some simple markup:
-
-Each Markdown file has:
-
-### Frontmatter
-
-```markdown
-title: <Entity title>
-type: <The type of Entity> (e.g. note)
-permalink: <a uri slug>
-
-- <optional metadata> (such as tags) 
-```
-
-### Observations
-
-Observations are facts about a topic.
-They can be added by creating a Markdown list with a special format that can reference a `category`, `tags` using a
-"#" character, and an optional `context`.
-
-Observation Markdown format:
-
-```markdown
-- [category] content #tag (optional context)
-```
-
-Examples of observations:
-
-```markdown
-- [method] Pour over extracts more floral notes than French press
-- [tip] Grind size should be medium-fine for pour over #brewing
-- [preference] Ethiopian beans have bright, fruity flavors (especially from Yirgacheffe)
-- [fact] Lighter roasts generally contain more caffeine than dark roasts
-- [experiment] Tried 1:15 coffee-to-water ratio with good results
-- [resource] James Hoffman's V60 technique on YouTube is excellent
-- [question] Does water temperature affect extraction of different compounds differently?
-- [note] My favorite local shop uses a 30-second bloom time
-```
-
-### Relations
-
-Relations are links to other topics. They define how entities connect in the knowledge graph.
-
-Markdown format:
-
-```markdown
-- relation_type [[WikiLink]] (optional context)
-```
-
-Examples of relations:
-
-```markdown
-- pairs_well_with [[Chocolate Desserts]]
-- grown_in [[Ethiopia]]
-- contrasts_with [[Tea Brewing Methods]]
-- requires [[Burr Grinder]]
-- improves_with [[Fresh Beans]]
-- relates_to [[Morning Routine]]
-- inspired_by [[Japanese Coffee Culture]]
-- documented_in [[Coffee Journal]]
-```
-
-## Using with VS Code
-
-Add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing `Ctrl + Shift + P` and typing `Preferences: Open User Settings (JSON)`.
+Add to your User Settings (JSON):
 
 ```json
 {
@@ -317,355 +327,302 @@ Add the following JSON block to your User Settings (JSON) file in VS Code. You c
 }
 ```
 
-Optionally, you can add it to a file called `.vscode/mcp.json` in your workspace. This will allow you to share the configuration with others.
+### ChatGPT
 
-```json
-{
-  "servers": {
-    "basic-memory": {
-      "command": "uvx",
-      "args": ["basic-memory", "mcp"]
-    }
-  }
-}
+Basic Memory exposes OpenAI-compatible `search` and `fetch` tools for Custom
+GPT actions. See the [ChatGPT integration
+guide](https://docs.basicmemory.com/integrations/chatgpt/?utm_source=github&utm_medium=referral&utm_campaign=readme).
+
+### Obsidian
+
+No setup. Point Obsidian at `~/basic-memory` (or your project folder) and the
+same wikilinks, frontmatter, and Markdown your AI writes appear in your graph
+view. Edit either side — sync handles the rest.
+
+</details>
+
+Try a prompt:
+
+```
+"Create a note about our project architecture decisions."
+"Find information about JWT auth in my notes."
+"What have I been working on this week?"
 ```
 
-You can use Basic Memory with VS Code to easily retrieve and store information while coding.
+## What's New
 
-## Using with Claude Desktop
+- **Automatic updates.** Basic Memory keeps itself up to date for `uv tool`
+  and Homebrew installs; `bm update` triggers a manual check.
+- **Semantic vector search.** Find notes by meaning, not just keywords.
+  Hybrid full-text + vector ranking with FastEmbed embeddings, on SQLite or
+  Postgres.
+- **Schema system.** Infer, validate, and diff the structure of your
+  knowledge base with `schema_infer`, `schema_validate`, `schema_diff`.
+- **Per-project cloud routing.** Route individual projects through the cloud
+  while others stay local, via API key (`bm project set-cloud`).
+- **Smarter editing.** `edit_note` append/prepend auto-creates notes when
+  missing; `write_note` guards against accidental overwrites.
+- **Richer search results.** Matched chunk text is included so the LLM gets
+  context, not just hits.
+- **FastMCP 3.0 + tool annotations.** Every tool ships with MCP behavior
+  hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`) so agents can discover capabilities progressively at
+  runtime instead of guessing or burning tokens.
+- **CLI overhaul.** `--json` output for scripting, workspace-aware commands,
+  and an htop-inspired project dashboard.
 
-Basic Memory is built using the MCP (Model Context Protocol) and works with the Claude desktop app (https://claude.ai/):
+Full [CHANGELOG](CHANGELOG.md) for v0.18 → v0.20.
 
-1. Configure Claude Desktop to use Basic Memory:
+## Why Basic Memory
 
-Edit your MCP configuration file (usually located at `~/Library/Application Support/Claude/claude_desktop_config.json`
-for OS X):
+Most LLM conversations are ephemeral. You ask a question, get an answer, then
+everything is forgotten. Workarounds have limits:
 
-```json
-{
-  "mcpServers": {
-    "basic-memory": {
-      "command": "uvx",
-      "args": [
-        "basic-memory",
-        "mcp"
-      ]
-    }
-  }
-}
+- **Chat history** captures conversations but isn't structured knowledge.
+- **RAG** lets the LLM query your documents but not write back to them.
+- **Vector DBs** need complex infra and usually live in someone else's cloud.
+- **Knowledge graphs** need specialized tooling to maintain.
+
+Basic Memory takes a simpler path: **structured Markdown files that humans
+and LLMs both read and write.**
+
+- All knowledge stays in plain files you control.
+- Both sides read and write to the same files.
+- Familiar Markdown with semantic patterns — no new format to learn.
+- A traversable graph the LLM can follow link by link.
+- Works with the editors you already use (Obsidian, VS Code, anything).
+- Just files plus a local SQLite index. No servers required.
+
+## How it works
+
+You're chatting normally about coffee:
+
+> I've been experimenting with brewing methods. Pour over gives more clarity
+> than French press, water at 205°F seems best, and freshly ground beans
+> make a huge difference.
+
+Ask the LLM to capture it:
+
+> "Make a note on coffee brewing methods."
+
+A Markdown file appears in your project directory in real time:
+
+```markdown
+---
+title: Coffee Brewing Methods
+permalink: coffee-brewing-methods
+tags: [coffee, brewing]
+---
+
+# Coffee Brewing Methods
+
+## Observations
+- [method] Pour over highlights subtle flavors over body
+- [technique] Water at 205°F (96°C) extracts optimal compounds
+- [principle] Freshly ground beans preserve aromatics
+
+## Relations
+- relates_to [[Coffee Bean Origins]]
+- requires [[Proper Grinding Technique]]
+- affects [[Flavor Extraction]]
 ```
 
-If you want to use a specific project (see [Multiple Projects](#multiple-projects) below), update your Claude Desktop
-config:
+Next session, the LLM picks up the thread. It follows the relations to
+surface what you already know about Ethiopian beans and burr grinders, and
+builds on it instead of starting over. You see the same files in Obsidian or
+your editor. Edit them by hand — the AI sees your changes too.
 
-```json
-{
-  "mcpServers": {
-    "basic-memory": {
-      "command": "uvx",
-      "args": [
-        "basic-memory",
-        "mcp",
-        "--project",
-        "your-project-name"
-      ]
-    }
-  }
-}
+Real two-way flow: humans edit Markdown, LLMs read/write through MCP, sync
+keeps everything consistent, and the source of truth is always your files.
+
+## The Markdown format
+
+Each file is an `Entity`. Entities have `Observations` (facts about them) and
+`Relations` (links to other entities). That's the whole grammar.
+
+### Frontmatter
+
+```markdown
+---
+title: <Entity title>
+type: note
+permalink: <uri-slug>
+tags: [optional, list]
+---
 ```
 
-2. Sync your knowledge:
+### Observations
+
+Facts about the entity. Categories in `[brackets]`, tags with `#`, optional
+context in parens.
+
+```markdown
+- [method] Pour over highlights subtle flavors
+- [tip] Grind medium-fine for V60 #brewing
+- [fact] Lighter roasts contain more caffeine than dark
+- [resource] James Hoffmann's V60 technique on YouTube
+- [question] How does temperature affect compound extraction?
+```
+
+### Relations
+
+Wiki-style links that form the graph. Single-token relation types, or quote
+multi-word ones.
+
+```markdown
+- pairs_well_with [[Chocolate Desserts]]
+- grown_in [[Ethiopia]]
+- requires [[Burr Grinder]]
+- "pairs well with" [[Dark Chocolate]]
+```
+
+Bare `- [[Target]]` and prose `- Worth checking out [[Target]]` index as
+`links_to`. Full reference in the
+[docs](https://docs.basicmemory.com/getting-started/note-formatting/?utm_source=github&utm_medium=referral&utm_campaign=readme).
+
+## MCP tools
+
+Basic Memory exposes these tools to any MCP client. Every tool is annotated
+with MCP behavior hints (read-only, destructive, idempotent, open-world) so
+agents can pick the right one without trial-and-error:
+
+- **Content:** `write_note`, `read_note`, `edit_note`, `move_note`,
+  `delete_note`, `read_content`, `view_note`
+- **Search & discovery:** `search`, `search_notes`, `recent_activity`,
+  `list_directory`
+- **Knowledge graph:** `build_context` (navigates `memory://` URLs),
+  `canvas` (Obsidian canvas generation)
+- **Projects:** `list_memory_projects`, `create_memory_project`,
+  `get_current_project`, `sync_status`
+- **Schema:** `schema_infer`, `schema_validate`, `schema_diff`
+- **Cloud:** `cloud_info`, `release_notes`
+
+All MCP tools default to text output; pass `output_format="json"` for
+structured responses. Full tool reference in the
+[docs](https://docs.basicmemory.com/?utm_source=github&utm_medium=referral&utm_campaign=readme).
+
+## CLI essentials
 
 ```bash
-# One-time sync of local knowledge updates
-basic-memory sync
-
-# Run realtime sync process (recommended)
-basic-memory sync --watch
-```
-
-3. Cloud features (optional, requires subscription):
-
-```bash
-# Authenticate with cloud (stores OAuth token locally)
-basic-memory cloud login
-
-# (Optional) install/configure rclone for file sync commands
-basic-memory cloud setup
-
-# Check cloud auth + health
-basic-memory cloud status
-```
-
-**Per-Project Cloud Routing** (API key based):
-
-Individual projects can be routed through the cloud while others stay local. This uses an API key for routed
-project calls:
-
-```bash
-# Save an API key (create one in the web app or via CLI)
-basic-memory cloud set-key bmc_abc123...
-# Or create one via CLI (requires OAuth login first)
-basic-memory cloud create-key "my-laptop"
-
-# Set a project to route through cloud
-basic-memory project set-cloud research
-
-# Revert a project to local mode
-basic-memory project set-local research
-
-# List projects and route metadata
+# Projects
 basic-memory project list
+basic-memory project add research ~/research
+basic-memory project set-cloud research   # route through cloud
+basic-memory project set-local research   # revert
+
+# Health & maintenance
+basic-memory status
+basic-memory doctor              # file <-> DB consistency check
+basic-memory tool edit-note ...  # CLI access to MCP tools
+basic-memory update              # check for and install updates
+
+# Imports
+basic-memory import claude conversations
+basic-memory import chatgpt
+basic-memory import memory-json
 ```
 
-`basic-memory cloud login` / `basic-memory cloud logout` are authentication commands. They do not change default CLI
-routing behavior.
+Routing flags (`--local` / `--cloud`) force a target when you're in mixed
+mode. Full CLI reference in the
+[docs](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme).
 
-**Routing Flags**:
+## Auto-updates
 
-Use routing flags to disambiguate command targets:
+CLI installs check for updates every 24 hours by default and apply them
+silently (so the MCP server keeps responding).
 
-```bash
-# Force local routing for this command
-basic-memory status --local
-basic-memory project list --local
-basic-memory project ls --name main --local
+- Supported install sources: `uv tool`, Homebrew
+- Skipped for `uvx` (ephemeral runtime managed by uv)
+- Manual: `bm update` (check + apply) or `bm update --check` (check only)
 
-# Force cloud routing for this command
-basic-memory status --cloud
-basic-memory project info my-project --cloud
-basic-memory project ls --name main --cloud
+Disable in `~/.basic-memory/config.json`:
+
+```json
+{ "auto_update": false }
 ```
-
-No-flag behavior defaults to local when no project context is present.
-
-The local MCP server routes per transport: `--transport stdio` honors per-project routing
-(local or cloud), while `--transport streamable-http` and `--transport sse` always route locally.
-
-**CLI Note Editing (`tool edit-note`):**
-
-```bash
-# Append content
-basic-memory tool edit-note project-plan --operation append --content $'\n## Next Steps\n- Finalize rollout'
-
-# Find/replace with replacement count validation
-basic-memory tool edit-note docs/api --operation find_replace --find-text "v0.14.0" --content "v0.15.0" --expected-replacements 2
-
-# Replace a section body
-basic-memory tool edit-note docs/setup --operation replace_section --section "## Installation" --content $'Updated install steps\n- Run just install'
-
-# JSON metadata output for integrations
-basic-memory tool edit-note docs/setup --operation append --content $'\n- Added note' --format json
-```
-
-4. In Claude Desktop, the LLM can now use these tools:
-
-**Content Management:**
-```
-write_note(title, content, folder, tags, output_format="text"|"json") - Create or update notes
-read_note(identifier, page, page_size, output_format="text"|"json") - Read notes by title or permalink
-read_content(path) - Read raw file content (text, images, binaries)
-view_note(identifier) - View notes as formatted artifacts
-edit_note(identifier, operation, content, output_format="text"|"json") - Edit notes incrementally
-move_note(identifier, destination_path, output_format="text"|"json") - Move notes with database consistency
-delete_note(identifier, output_format="text"|"json") - Delete notes from knowledge base
-```
-
-**Knowledge Graph Navigation:**
-```
-build_context(url, depth, timeframe, output_format="json"|"text") - Navigate knowledge graph via memory:// URLs
-recent_activity(type, depth, timeframe, output_format="text"|"json") - Find recently updated information
-list_directory(dir_name, depth) - Browse directory contents with filtering
-```
-
-**Search & Discovery:**
-```
-search(query, page, page_size) - Search across your knowledge base
-search_notes(query, page, page_size, search_type, types, entity_types, after_date, metadata_filters, tags, status, project) - Search with filters (query is optional for filter-only searches)
-```
-
-**Project Management:**
-```
-list_memory_projects(output_format="text"|"json") - List all available projects
-create_memory_project(project_name, project_path, output_format="text"|"json") - Create new projects
-get_current_project() - Show current project stats
-sync_status() - Check synchronization status
-```
-
-`output_format` defaults to `"text"` for these tools, preserving current human-readable responses.
-`build_context` defaults to `"json"` and can be switched to `"text"` when compact markdown output is preferred.
-
-**Cloud Discovery (opt-in):**
-```
-cloud_info() - Show optional Cloud overview and setup guidance
-release_notes() - Show latest release notes
-```
-
-**Visualization:**
-```
-canvas(nodes, edges, title, folder) - Generate knowledge visualizations
-```
-
-5. Example prompts to try:
-
-```
-"Create a note about our project architecture decisions"
-"Find information about JWT authentication in my notes"
-"Create a canvas visualization of my project components"
-"Read my notes on the authentication system"
-"What have I been working on in the past week?"
-```
-
-## Further info
-
-See the [Documentation](https://docs.basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme) for more info, including:
-
-- [Complete User Guide](https://docs.basicmemory.com/user-guide/?utm_source=github&utm_medium=referral&utm_campaign=readme)
-- [CLI tools](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme)
-- [Cloud CLI and Sync](https://docs.basicmemory.com/guides/cloud-cli/?utm_source=github&utm_medium=referral&utm_campaign=readme)
-- [Managing multiple Projects](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme#project)
-- [Importing data from OpenAI/Claude Projects](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme#import)
 
 ## Telemetry
 
-Basic Memory collects anonymous, minimal usage events to understand how the CLI-to-cloud conversion funnel performs. This helps us prioritize features and improve the product.
+Minimal, anonymous events to understand the CLI-to-cloud conversion funnel.
 
-**What we collect:**
-- Cloud promo impressions (when the promo banner is shown)
-- Cloud login attempts and outcomes
-- Promo opt-out events
+**What we collect:** cloud promo impressions, cloud login attempts and
+outcomes, promo opt-out events.
 
-**What we do NOT collect:**
-- No file contents, note titles, or knowledge base data
-- No personally identifiable information (PII)
-- No IP address tracking or fingerprinting
-- No per-command or per-tool-call tracking
+**What we don't:** file contents, note titles, knowledge base data, PII, IP
+addresses, per-command or per-tool tracking.
 
-Events are sent to our [Umami Cloud](https://umami.is) instance, an open-source, privacy-focused analytics platform. Events are fire-and-forget on a background thread — analytics never blocks or slows the CLI.
+Events go to our [Umami Cloud](https://umami.is) instance (open-source,
+privacy-focused) on a background thread — never blocks the CLI.
 
-**Opt out** by setting the environment variable:
+Opt out:
 
 ```bash
 export BASIC_MEMORY_NO_PROMOS=1
 ```
 
-This disables both promo messages and all telemetry events.
+This disables promos and all telemetry.
 
 ## Logging
 
-Basic Memory uses [Loguru](https://github.com/Delgan/loguru) for logging. The logging behavior varies by entry point:
+Basic Memory uses [Loguru](https://github.com/Delgan/loguru). Defaults vary
+by entry point:
 
-| Entry Point | Default Behavior | Use Case |
-|-------------|------------------|----------|
-| CLI commands | File only | Prevents log output from interfering with command output |
-| MCP server | File only | Stdout would corrupt the JSON-RPC protocol |
-| API server | File (local) or stdout (cloud) | Docker/cloud deployments use stdout |
+| Entry point | Default | Why |
+|---|---|---|
+| CLI commands | File only | Doesn't interfere with command output |
+| MCP server | File only | Stdout would corrupt JSON-RPC |
+| API server | File (local) or stdout (cloud) | Docker/cloud uses stdout |
 
-**Log file location:** `~/.basic-memory/basic-memory.log` (10MB rotation, 10 days retention)
+Log file: `~/.basic-memory/basic-memory.log` (10MB rotation, 10 days
+retention).
 
-### Environment Variables
+### Environment variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `BASIC_MEMORY_LOG_LEVEL` | `INFO` | Log level: DEBUG, INFO, WARNING, ERROR |
-| `BASIC_MEMORY_CLOUD_MODE` | `false` | When `true`, API logs to stdout with structured context |
-| `BASIC_MEMORY_FORCE_LOCAL` | `false` | When `true`, forces local API routing |
-| `BASIC_MEMORY_FORCE_CLOUD` | `false` | When `true`, forces cloud API routing |
-| `BASIC_MEMORY_EXPLICIT_ROUTING` | `false` | When `true`, marks route selection as explicit (`--local`/`--cloud`) |
+|---|---|---|
+| `BASIC_MEMORY_LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
+| `BASIC_MEMORY_CLOUD_MODE` | `false` | API logs to stdout with structured context |
+| `BASIC_MEMORY_FORCE_LOCAL` | `false` | Force local API routing |
+| `BASIC_MEMORY_FORCE_CLOUD` | `false` | Force cloud API routing |
+| `BASIC_MEMORY_EXPLICIT_ROUTING` | `false` | Mark route selection as explicit |
 | `BASIC_MEMORY_ENV` | `dev` | Set to `test` for test mode (stderr only) |
-| `BASIC_MEMORY_NO_PROMOS` | `false` | When `true`, disables cloud promo messages and telemetry |
-
-### Examples
+| `BASIC_MEMORY_NO_PROMOS` | `false` | Disable cloud promos and telemetry |
+| `BASIC_MEMORY_IMPORT_UPLOAD_MAX_BYTES` | `104857600` | Max uploaded import size |
 
 ```bash
-# Enable debug logging
 BASIC_MEMORY_LOG_LEVEL=DEBUG basic-memory sync
-
-# View logs
 tail -f ~/.basic-memory/basic-memory.log
-
-# Cloud/Docker mode (stdout logging with structured context)
-BASIC_MEMORY_CLOUD_MODE=true uvicorn basic_memory.api.app:app
 ```
 
 ## Development
 
-### Running Tests
+Basic Memory supports SQLite (default, fast, no Docker) and Postgres
+(via testcontainers — Docker required).
 
-Basic Memory supports dual database backends (SQLite and Postgres). By default, tests run against SQLite. Set `BASIC_MEMORY_TEST_POSTGRES=1` to run against Postgres (uses testcontainers - Docker required).
-
-**Quick Start:**
-```bash
-# Run all tests against SQLite (default, fast)
-just test-sqlite
-
-# Run all tests against Postgres (uses testcontainers)
-just test-postgres
-
-# Run both SQLite and Postgres tests
-just test
-```
-
-**Available Test Commands:**
-
-- `just test` - Run all tests against both SQLite and Postgres
-- `just test-sqlite` - Run all tests against SQLite (fast, no Docker needed)
-- `just test-postgres` - Run all tests against Postgres (uses testcontainers)
-- `just test-unit-sqlite` - Run unit tests against SQLite
-- `just test-unit-postgres` - Run unit tests against Postgres
-- `just test-int-sqlite` - Run integration tests against SQLite
-- `just test-int-postgres` - Run integration tests against Postgres
-- `just test-windows` - Run Windows-specific tests (auto-skips on other platforms)
-- `just test-benchmark` - Run performance benchmark tests
-- `just testmon` - Run tests impacted by recent changes (pytest-testmon)
-- `just test-smoke` - Run fast MCP end-to-end smoke test
-- `just fast-check` - Run fix/format/typecheck + impacted tests + smoke test
-- `just doctor` - Run local file <-> DB consistency checks with temp config
-
-**Postgres Testing:**
-
-Postgres tests use [testcontainers](https://testcontainers-python.readthedocs.io/) which automatically spins up a Postgres instance in Docker. No manual database setup required - just have Docker running.
-
-**Testmon Note:** When no files have changed, `just testmon` may collect 0 tests. That's expected and means no impacted tests were detected.
-
-**Test Markers:**
-
-Tests use pytest markers for selective execution:
-- `windows` - Windows-specific database optimizations
-- `benchmark` - Performance tests (excluded from default runs)
-- `smoke` - Fast MCP end-to-end smoke tests
-
-**Other Development Commands:**
 ```bash
 just install          # Install with dev dependencies
-just lint             # Run linting checks
-just typecheck        # Run type checking
-just typecheck-ty     # Run ty type checking (incremental supplement to pyright)
-just format           # Format code with ruff
-just fast-check       # Fast local loop (fix/format/typecheck + testmon + smoke)
-just doctor           # Local consistency check (temp config)
-just check            # Run all quality checks
-just migration "msg"  # Create database migration
+just test-sqlite      # All tests, SQLite
+just test-postgres    # All tests, Postgres (testcontainers)
+just test             # Both backends
+just fast-check       # fix/format/typecheck + impacted tests
+just doctor           # File <-> DB consistency check (temp config)
+just package-check    # Claude Code, skills, Hermes, OpenClaw package checks
+just lint
+just typecheck        # Pyright (primary)
+just typecheck-ty     # ty (supplemental)
+just format
+just check            # All quality checks
+just migration "msg"  # New Alembic migration
 ```
 
-**Type Checking Strategy:**
-- `just typecheck` (Pyright) remains the primary, blocking type checker.
-- `just typecheck-ty` (Astral `ty`) is available as a supplemental checker while rules are adopted incrementally.
-- We recommend running both locally while reducing `ty` diagnostics over time.
+Tests use pytest markers: `windows`, `benchmark`, `smoke`. See
+[justfile](justfile) for the full list.
 
-**Local Consistency Check:**
-```bash
-basic-memory doctor   # Verifies file <-> database sync in a temp project
-```
-
-See the [justfile](justfile) for the complete list of development commands.
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-AGPL-3.0
-
-Contributions are welcome. See the [Contributing](CONTRIBUTING.md) guide for info about setting up the project locally
-and submitting PRs.
+[AGPL-3.0](LICENSE).
 
 ## Star History
 

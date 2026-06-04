@@ -7,11 +7,14 @@ on:
       - edited
       - synchronize
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   main:
     runs-on: ubuntu-latest
     steps:
-      - uses: amannn/action-semantic-pull-request@v5
+      - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -37,5 +40,8 @@ jobs:
             ui
             deps
             installer
+            plugins
+            skills
+            integrations
           # Allow breaking changes (needs "!" after type/scope)
           requireScopeForBreakingChange: true

@@ -1,0 +1,23 @@
+{
+  "name": "basicmachines-co",
+  "owner": {
+    "name": "Basic Machines",
+    "email": "hello@basicmachines.co"
+  },
+  "metadata": {
+    "description": "Official plugins from Basic Machines for knowledge management and AI-assisted development",
+    "version": "0.3.13"
+  },
+  "plugins": [
+    {
+      "name": "basic-memory",
+      "source": "./",
+      "description": "The bridge between Claude's working memory and Basic Memory's durable knowledge graph — session briefings, pre-compaction checkpoints, and capture reflexes",
+      "version": "0.3.13",
+      "author": {
+        "name": "Basic Machines"
+      },
+      "keywords": ["memory", "knowledge", "mcp", "specs", "context"]
+    }
+  ]
+}

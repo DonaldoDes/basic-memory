@@ -26,6 +26,12 @@ See the [README.md](README.md) file for a project overview.
 - Run MCP smoke test: `just test-smoke`
 - Fast local loop: `just fast-check` (default iteration flow)
 - Local consistency check: `just doctor`
+- Run all consolidated agent package checks: `just package-check`
+- Run Claude Code plugin checks: `just package-check-claude-code`
+- Run shared skills checks: `just package-check-skills`
+- Run Hermes plugin checks: `just package-check-hermes`
+- Run OpenClaw plugin checks: `just package-check-openclaw`
+- Run host-native agent harness checks: `just agent-harness-check`
 - Generate HTML coverage: `just coverage`
 - Single test: `pytest tests/path/to/test_file.py::test_function_name`
 - Run benchmarks: `pytest test-int/test_sync_performance_benchmark.py -v -m "benchmark and not slow"`
@@ -50,11 +56,34 @@ See the [README.md](README.md) file for a project overview.
 1) **Code:** make changes.
 2) **Test:** `just fast-check` (lint/format/typecheck + pytest-testmon impacted tests for changed code).
 3) **Verify:** `just doctor` (end-to-end file ↔ DB loop in a temp project).
-4) **Full gate (when needed):** `just test` or `just check` for SQLite + Postgres.
+4) **Package verify:** `just package-check` when changes touch `plugins/`, `skills/`, `integrations/`, package metadata, or release wiring.
+5) **Full gate (when needed):** `just test` or `just check` for SQLite + Postgres.
 
 Run `just test-smoke` when you specifically need the MCP smoke flow.
 
 If testmon is “cold,” the first run may be long. Subsequent runs get much faster.
+
+### Consolidated Agent Package Checks
+
+The monorepo ships several host-native packages alongside the Python core. Use the root justfile as the canonical entry point:
+
+- `just package-check` — validates every copied package and generated bundle path.
+- `just package-check-claude-code` — validates the root and plugin-local Claude marketplace manifests, the SessionStart/PreCompact hooks, the bundled output style, and the seed schemas, then runs `claude plugin validate . --strict`.
+- `just package-check-skills` — validates every top-level `skills/memory-*/SKILL.md` frontmatter block.
+- `just package-check-hermes` — validates `integrations/hermes/plugin.yaml`, the Hermes provider entrypoint, bundled skill, and runs the hermetic unit suite.
+- `just package-check-openclaw` — runs the OpenClaw package install, copies top-level skills into the generated bundle, typechecks, lints, builds `dist/`, runs Bun tests, and performs `npm pack --dry-run`.
+- `just agent-harness-check` — checks the host-specific harnesses without the shared markdown-only skills target.
+
+Package-local justfiles live in `plugins/claude-code/`, `skills/`, `integrations/hermes/`, and `integrations/openclaw/`. Prefer the root targets for PR verification so command names stay stable as package internals evolve.
+
+### PR CI Gate
+
+Before opening or updating a PR, run the checks that mirror the common required CI failures:
+
+- Run `just typecheck` in addition to targeted `ruff` and `pytest` commands when tests were added or changed.
+- Sign commits with `git commit -s` so DCO passes. If a PR branch already has unsigned commits, rewrite the branch with signed-off commits before asking for review.
+- Use a semantic PR title accepted by `.github/workflows/pr-title.yml`: `type(scope): summary`.
+- Use one of the allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`, `plugins`, `skills`, `integrations`.
 
 ### Test Structure
 
@@ -153,6 +182,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture docum
 - `/schemas` - Pydantic models for validation
 - `/services` - Business logic layer
 - `/sync` - File synchronization services + `coordinator.py` for lifecycle management
+- `/plugins/claude-code` - Claude Code plugin marketplace package, hooks, skills, and agent harness
+- `/skills` - Canonical framework-agnostic Basic Memory `SKILL.md` source
+- `/integrations/hermes` - Hermes memory-provider plugin
+- `/integrations/openclaw` - OpenClaw npm/TypeScript plugin
 
 **Composition Roots:**
 Each entrypoint (API, MCP, CLI) has a composition root that:
@@ -243,6 +276,33 @@ async_client.set_client_factory(your_custom_factory)
 ```
 
 See SPEC-16 for full context manager refactor details.
+
+### Release Process
+
+Releases are driven by `just release` / `just beta` — never by a bare `git tag`. The recipes bump version metadata, run pre-flight checks, commit, tag, and push. GitHub Actions then publishes to PyPI and updates the Homebrew formula.
+
+**Stable release:**
+
+```
+just release v0.21.3
+```
+
+The recipe runs `just lint` + `just typecheck`, then updates every release manifest through `scripts/update_versions.py`: `src/basic_memory/__init__.py`, `server.json`, the root Claude marketplace, the Claude Code plugin manifest and local marketplace, the Hermes `plugin.yaml`, and the OpenClaw `package.json`. It commits as `chore: update version to X.Y.Z for vX.Y.Z release`, creates the `vX.Y.Z` tag, and pushes both the commit and the tag to `origin/main`. After the tag lands, the `Release` workflow builds the Python package, publishes to PyPI, creates the GitHub release with auto-generated notes, publishes the OpenClaw npm package, and updates the Homebrew formula. The recipe finishes by printing the post-release tasks the workflow doesn't cover.
+
+**Beta release:** `just beta v0.21.3b1` — same flow with a beta-suffixed tag. PyPI consumers install with `pip install basic-memory --pre`.
+
+**Release dry run:** `just release-dry-run v0.21.4` previews the consolidated version update without writing files.
+
+**Development builds:** every commit to `main` publishes a `0.21.3.dev26+468a22f`-style version to PyPI automatically via `.github/workflows/dev-release.yml`. No human action.
+
+**Do not tag releases by hand.** A bare `git tag vX.Y.Z` skips the in-code version bump. Package metadata is still correct (uv-dynamic-versioning derives it from the git tag) but `basic-memory --version` reports the previous release, which is what happened with v0.21.2 → v0.21.3.
+
+**Post-release tasks** the recipe surfaces but doesn't run:
+- `docs.basicmemory.com` — add notes to `src/pages/latest-releases.mdx`
+- `basicmachines.co` — bump version in `src/components/sections/hero.tsx`
+- MCP Registry — `mcp-publisher publish` from the repo root
+
+See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `changelog.md` alongside it) for the full release + post-release runbook, including the slash commands.
 
 ## BASIC MEMORY PRODUCT USAGE
 
@@ -446,7 +506,7 @@ With GitHub integration, the development workflow includes:
 5. **Code Commits**: ALWAYS sign off commits with `git commit -s`
 6. **Pull Request Titles**: PR titles must follow the semantic format enforced by `.github/workflows/pr-title.yml`: `type(scope): summary`
    - Allowed types: `feat`, `fix`, `chore`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
-   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`
+   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`, `plugins`, `skills`, `integrations`
    - Example: `fix(cli): propagate cloud workspace routing`
 
 This level of integration represents a new paradigm in AI-human collaboration, where the AI assistant becomes a full-fledged team member rather than just a tool for generating code snippets.
