@@ -10,6 +10,12 @@ from basic_memory.schemas.v2.entity import (
     ProjectResolveRequest,
     ProjectResolveResponse,
 )
+from basic_memory.schemas.v2.bulk_edit import (
+    BulkEditItemResult,
+    BulkEditOperation,
+    BulkEditRequest,
+    BulkEditResponse,
+)
 from basic_memory.schemas.v2.graph import (
     GraphEdge,
     GraphNode,
@@ -23,6 +29,10 @@ from basic_memory.schemas.v2.resource import (
 )
 
 __all__ = [
+    "BulkEditItemResult",
+    "BulkEditOperation",
+    "BulkEditRequest",
+    "BulkEditResponse",
     "EntityResolveRequest",
     "EntityResolveResponse",
     "EntityResponseV2",

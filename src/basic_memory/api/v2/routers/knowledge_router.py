@@ -10,7 +10,9 @@ Key improvements:
 - Simplified caching strategies
 """
 
-from fastapi import APIRouter, HTTPException, Response, Path
+from pathlib import Path as FilePath
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Response, Path
 from loguru import logger
 
 import logfire
@@ -31,6 +33,9 @@ from basic_memory.schemas import DeleteEntitiesResponse
 from basic_memory.schemas.base import Entity
 from basic_memory.schemas.request import EditEntityRequest
 from basic_memory.schemas.v2 import (
+    BulkEditItemResult,
+    BulkEditRequest,
+    BulkEditResponse,
     EntityResolveRequest,
     EntityResolveResponse,
     EntityResponseV2,
@@ -42,8 +47,11 @@ from basic_memory.schemas.v2 import (
     DeleteDirectoryRequestV2,
     OrphanEntitiesResponse,
 )
-from basic_memory.services.exceptions import BinaryFileError
+from basic_memory.schemas.v2.bulk_edit import is_path_traversal_identifier
+from basic_memory.services.exceptions import BinaryFileError, EntityNotFoundError
 from basic_memory.schemas.response import DirectoryMoveResult, DirectoryDeleteResult
+from basic_memory.utils import build_permalink_resolution_candidates
+from basic_memory.workspace_context import current_workspace_permalink_context
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge-v2"])
 
@@ -794,3 +802,252 @@ async def delete_directory(
         except Exception as e:
             logger.error(f"Error deleting directory: {e}")
             raise HTTPException(status_code=400, detail=str(e))
+
+
+## Bulk edit endpoint (spec: specs/bulk-edit-notes/spec.md)
+
+
+async def _resolve_bulk_edit_identifier(identifier, entity_repository, permalink_candidates):
+    """Resolve a batch item identifier strictly within the project scope.
+
+    Resolution order: permalink candidates (shared canonical builder, same
+    compatibility behavior as the single-note path) → exact title (ambiguity
+    detected) → file path (with and without .md).
+
+    Deliberately does NOT use LinkResolver: its project-prefix fallback can
+    resolve "other-project/note" into another project, which would violate the
+    single-project invariant (I-6). Every lookup here goes through the
+    project-scoped entity repository only — a candidate string mentioning
+    another project can never match a row outside this project.
+
+    Returns:
+        (entity, None) on success, (None, error_code) otherwise.
+    """
+    for candidate in permalink_candidates:
+        entity = await entity_repository.get_by_permalink(candidate, load_relations=False)
+        if entity:
+            return entity, None
+
+    title_matches = await entity_repository.get_by_title(identifier, load_relations=False)
+    if len(title_matches) > 1:
+        return None, "AMBIGUOUS_IDENTIFIER"
+    if len(title_matches) == 1:
+        return title_matches[0], None
+
+    entity = await entity_repository.get_by_file_path(identifier, load_relations=False)
+    if entity:
+        return entity, None
+    if not identifier.endswith(".md"):
+        entity = await entity_repository.get_by_file_path(f"{identifier}.md", load_relations=False)
+        if entity:
+            return entity, None
+
+    return None, "NOT_FOUND"
+
+
+def _map_bulk_edit_error(error: Exception) -> tuple[str, str]:
+    """Map an edit failure to a per-item error code (spec § Codes d'erreur)."""
+    message = str(error)
+    if isinstance(error, EntityNotFoundError):
+        return "NOT_FOUND", message
+    if "Text to replace not found" in message:
+        return "TEXT_NOT_FOUND", message
+    if "Expected" in message and "occurrences" in message:
+        return "REPLACEMENT_COUNT_MISMATCH", message
+    if "Multiple sections found" in message:
+        return "DUPLICATE_SECTION", message
+    return "EDIT_ERROR", message
+
+
+@router.post("/entities/bulk-edit", response_model=BulkEditResponse)
+async def bulk_edit_entities(
+    data: BulkEditRequest,
+    background_tasks: BackgroundTasks,
+    project_id: ProjectExternalIdPathDep,
+    entity_service: EntityServiceV2ExternalDep,
+    search_service: SearchServiceV2ExternalDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    file_service: FileServiceV2ExternalDep,
+    project_repository: ProjectRepositoryDep,
+    task_scheduler: TaskSchedulerDep,
+    app_config: AppConfigDep,
+) -> BulkEditResponse:
+    """Apply up to 100 edit operations in one request (best-effort per note).
+
+    Execution semantics (spec: specs/bulk-edit-notes/spec.md):
+    - Items run sequentially in request order; an edit on a note already edited
+      in the same batch sees the previous result.
+    - A failed item never interrupts the batch unless stop_on_error=true, in
+      which case remaining items are reported as skipped (no rollback of
+      already-succeeded items).
+    - validate_first=true is a PURE dry-run: items are evaluated against a
+      projected content map and nothing is written, even when all items pass.
+    - FTS indexing of modified notes is deferred to background tasks (C-2) and
+      the vector sync is scheduled ONCE for the whole batch.
+    - A path-traversal identifier fails its own item with error_code SECURITY
+      before any filesystem or repository access (I-1).
+    """
+    with logfire.span(
+        "api.request.knowledge.bulk_edit_entities",
+        entrypoint="api",
+        domain="knowledge",
+        action="bulk_edit_entities",
+    ):
+        logger.info(
+            f"API v2 request: bulk_edit_entities items={len(data.edits)} "
+            f"validate_first={data.validate_first} stop_on_error={data.stop_on_error}"
+        )
+
+        # Permalink candidates share the canonical builder used by the
+        # single-note resolver (legacy project-prefixed forms, workspace forms).
+        owner_project = await project_repository.get_by_id(entity_repository.project_id)
+        project_permalink = owner_project.permalink if owner_project else None
+        workspace_context = current_workspace_permalink_context()
+        workspace_permalink = (
+            workspace_context.workspace_slug
+            if workspace_context and workspace_context.should_prefix_permalinks
+            else None
+        )
+
+        results: list[BulkEditItemResult] = []
+        projected_content: dict[int, str] = {}
+        pending_index: dict[int, tuple] = {}
+        modified_entity_ids: list[int] = []
+        stop_requested = False
+
+        def record_failure(identifier: str, error_code: str, message: str) -> None:
+            nonlocal stop_requested
+            results.append(
+                BulkEditItemResult(
+                    identifier=identifier,
+                    status="failed",
+                    error=message,
+                    error_code=error_code,
+                )
+            )
+            if data.stop_on_error:
+                stop_requested = True
+
+        for edit in data.edits:
+            if stop_requested:
+                results.append(BulkEditItemResult(identifier=edit.identifier, status="skipped"))
+                continue
+
+            # I-1: reject traversal identifiers before ANY repository/file access.
+            if is_path_traversal_identifier(edit.identifier):
+                logger.warning("Bulk edit: path traversal identifier blocked")
+                record_failure(
+                    edit.identifier,
+                    "SECURITY",
+                    "Identifier rejected: paths must stay within project boundaries",
+                )
+                continue
+
+            permalink_candidates = build_permalink_resolution_candidates(
+                edit.identifier,
+                project_permalink,
+                include_project=app_config.permalinks_include_project,
+                workspace_permalink=workspace_permalink,
+            )
+            entity, resolution_error = await _resolve_bulk_edit_identifier(
+                edit.identifier, entity_repository, permalink_candidates
+            )
+            if resolution_error:
+                # I-4: never auto-create — an unresolved identifier is a failure.
+                message = (
+                    f"Entity not found: {edit.identifier}"
+                    if resolution_error == "NOT_FOUND"
+                    else f"Identifier resolves to multiple entities: {edit.identifier}"
+                )
+                record_failure(edit.identifier, resolution_error, message)
+                continue
+
+            if data.validate_first:
+                # Dry-run: replay the pure edit operation on projected content.
+                try:
+                    base_content = projected_content.get(entity.id)
+                    if base_content is None:
+                        base_content, _ = await file_service.read_file(FilePath(entity.file_path))
+                    projected_content[entity.id] = entity_service.apply_edit_operation(
+                        base_content,
+                        edit.operation,
+                        edit.content,
+                        section=edit.section,
+                        find_text=edit.find_text,
+                        expected_replacements=edit.expected_replacements,
+                    )
+                    results.append(
+                        BulkEditItemResult(
+                            identifier=edit.identifier,
+                            status="validated",
+                            permalink=entity.permalink,
+                            file_path=entity.file_path,
+                        )
+                    )
+                except Exception as e:
+                    error_code, message = _map_bulk_edit_error(e)
+                    record_failure(edit.identifier, error_code, message)
+                continue
+
+            try:
+                write_result = await entity_service.edit_entity_with_content(
+                    identifier=entity.permalink or entity.file_path,
+                    operation=edit.operation,
+                    content=edit.content,
+                    section=edit.section,
+                    find_text=edit.find_text,
+                    expected_replacements=edit.expected_replacements,
+                )
+                updated_entity = write_result.entity
+                # C-2: defer FTS indexing to background tasks (last write wins
+                # for notes edited several times in the same batch).
+                pending_index[updated_entity.id] = (updated_entity, write_result.search_content)
+                if updated_entity.id not in modified_entity_ids:
+                    modified_entity_ids.append(updated_entity.id)
+                results.append(
+                    BulkEditItemResult(
+                        identifier=edit.identifier,
+                        status="success",
+                        permalink=updated_entity.permalink,
+                        file_path=updated_entity.file_path,
+                        checksum=updated_entity.checksum,
+                    )
+                )
+            except Exception as e:
+                error_code, message = _map_bulk_edit_error(e)
+                record_failure(edit.identifier, error_code, message)
+
+        for indexed_entity, search_content in pending_index.values():
+            background_tasks.add_task(
+                search_service.index_entity, indexed_entity, content=search_content
+            )
+
+        vector_sync = "disabled"
+        if modified_entity_ids and app_config.semantic_search_enabled:
+            task_scheduler.schedule(
+                "sync_entity_vectors_batch",
+                entity_ids=modified_entity_ids,
+                project_id=project_id,
+            )
+            vector_sync = "scheduled"
+
+        status_counts = {"success": 0, "failed": 0, "skipped": 0, "validated": 0}
+        for item in results:
+            status_counts[item.status] += 1
+
+        logger.info(
+            f"API v2 response: bulk_edit_entities total={len(results)} "
+            f"succeeded={status_counts['success']} failed={status_counts['failed']} "
+            f"skipped={status_counts['skipped']} validated={status_counts['validated']} "
+            f"vector_sync={vector_sync}"
+        )
+
+        return BulkEditResponse(
+            total=len(results),
+            succeeded=status_counts["success"],
+            failed=status_counts["failed"],
+            skipped=status_counts["skipped"],
+            validated=status_counts["validated"],
+            results=results,
+            vector_sync=vector_sync,
+        )

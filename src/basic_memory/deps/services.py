@@ -506,6 +506,9 @@ async def get_task_scheduler(
     async def _sync_entity_vectors(entity_id: int, **_: Any) -> None:
         await search_service.sync_entity_vectors(entity_id)
 
+    async def _sync_entity_vectors_batch(entity_ids: list[int], **_: Any) -> None:
+        await search_service.sync_entity_vectors_batch(entity_ids)
+
     async def _sync_project(force_full: bool = False, **_: Any) -> None:
         await sync_service.sync(
             project_config.home,
@@ -519,6 +522,7 @@ async def get_task_scheduler(
     scheduler = LocalTaskScheduler(
         {
             "sync_entity_vectors": _sync_entity_vectors,
+            "sync_entity_vectors_batch": _sync_entity_vectors_batch,
             "sync_project": _sync_project,
             "reindex_project": _reindex_project,
         },
