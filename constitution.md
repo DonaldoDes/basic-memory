@@ -277,3 +277,91 @@ just beta v0.18.0b1    # Beta release
 9. **API versionnée** : v0 maintenue pour compatibilité. v2 est la version cible. Les deux sont montées dans `app.py`.
 
 10. **Multi-project** : Basic Memory supporte plusieurs projets (mapping nom → path dans `config.json`). Le `project_resolver.py` centralise la résolution du projet courant.
+
+---
+
+## Zones sensibles
+
+Cette section désigne les fichiers et patterns qui déclenchent automatiquement le niveau **Strict** du workflow et le chargement de la skill `adversarial-testing`. Section générée par audit code le 2026-06-05 (HEAD `8ff1613d`) — à réviser quand le code évolue.
+
+Contexte double : ce repo (1) fait tourner le serveur MCP du **vault PKM personnel** (données privées, sous git auto-sync + Obsidian Sync) et (2) alimente des **PRs upstream** (basicmachines-co). Toute régression sur ces zones touche des données réelles ET du code publié.
+
+### Path traversal / résolution filesystem
+
+- **Fichiers** : `src/basic_memory/utils.py` (`validate_project_path`, l.706 — frontière unique projet/filesystem), `src/basic_memory/file_utils.py` (`sanitize_for_directory`, l.494 — rejet `..` post-strip, fix BUG-004 ; whitelist Option B qui raise au lieu de stripper silencieusement, fix BUG-001), `src/basic_memory/services/file_service.py` (`write_file`, l.185-236 — défense last-mile `is_relative_to(base_path)` ; `move_file`, `delete_file`), call sites MCP : `mcp/tools/read_content.py` (l.242-251), `mcp/tools/move_note.py` (l.512-516 et l.728-731), `mcp/tools/write_note.py`.
+- **Risque** : un identifier/path/folder forgé par le LLM (entrée non fiable par construction) qui échappe au project root = lecture/écriture/suppression arbitraire sur le poste de l'utilisateur.
+- **Invariants** :
+  - Tout path issu d'une entrée MCP/API passe par `validate_project_path` AVANT toute I/O.
+  - La défense last-mile de `FileService.write_file` (resolve + `is_relative_to`) ne doit jamais être retirée, même si la validation amont semble suffisante (defense-in-depth, BUG-004).
+  - `sanitize_for_directory` : le check `..` reste APRÈS le strip des caractères réservés (sinon `<>../etc` repasse) et couvre les deux séparateurs (`/` et `\`).
+  - Le comportement Option B (ValueError sur caractère hors whitelist, pas de strip silencieux) est un choix du fork — ne pas le régresser lors des merges upstream.
+
+### Handlers MCP write + knowledge router v2 (surface bulk_edit)
+
+- **Fichiers** : `src/basic_memory/mcp/tools/{write_note,edit_note,delete_note,move_note}.py` ; `src/basic_memory/api/v2/routers/knowledge_router.py` (create/update/edit/delete entity l.365-604, `move_directory` l.687, `delete_directory` l.755 — destructif en masse) ; `src/basic_memory/services/entity_service.py` (`edit_entity` l.1110, `apply_edit_operation` l.1207 — fonction pure).
+- **Risque** : ces handlers reçoivent du contenu et des identifiers générés par un LLM. Un bug = corruption ou suppression en masse de notes du vault. C'est la surface exacte de la feature `bulk_edit_notes` à venir (spec : invariants I-1..I-7).
+- **Invariants** :
+  - Invariants I-1..I-7 de la spec Bulk Edit Notes — notamment I-1 (traversal dans un identifier = item `failed SECURITY`, jamais d'I/O), I-4 (pas d'auto-création en bulk), I-7 (chemin single-note `edit_entity_by_id` / `edit_entity_with_content` / MCP `edit_note` byte-identique).
+  - `apply_edit_operation` reste une fonction **pure** (pas d'I/O) — le dry-run `validate_first` en dépend.
+  - Toute nouvelle opération destructive de masse (pattern `delete_directory`) exige une validation de path par item, pas seulement sur le dossier racine.
+  - `_detect_cross_project_move_attempt` (`mcp/tools/move_note.py:17`) reste actif sur les moves.
+
+### Scheduler de tasks background
+
+- **Fichiers** : `src/basic_memory/deps/services.py` (l.478-527 : `LocalTaskScheduler.schedule` + `get_task_scheduler` — registre fermé : `sync_entity_vectors`, `sync_project`, `reindex_project`).
+- **Risque** : une task non enregistrée droppée silencieusement = travail background perdu (index vectoriel désynchronisé) ; une task mal payloadée tourne détachée du request cycle. `bulk_edit_notes` doit y ajouter `sync_entity_vectors_batch` (édition additive).
+- **Invariants** :
+  - Le fail-fast `ValueError` sur task inconnue est préservé (pas de fallback silencieux).
+  - Le no-op en env test (`BASIC_MEMORY_ENV=test`) est préservé — les tests exercent les codepaths sync directement.
+  - Ajouts au registre = additifs uniquement ; ne jamais modifier le payload des tasks existantes.
+
+### Construction de requêtes SQL/FTS5
+
+- **Fichiers** : `src/basic_memory/repository/sqlite_search_repository.py` (`_prepare_boolean_query` l.118, `_prepare_single_term` l.238 — escaping FTS5 par doublement des `"` ; f-strings sur `text()` l.534-589 qui n'interpolent QUE des noms de placeholders, jamais des valeurs), `postgres_search_repository.py` (équivalent Postgres), `repository/search_repository_base.py`.
+- **Risque** : une query utilisateur atteignant l'opérateur `MATCH` sans escaping = erreur de syntaxe FTS5 (DoS du search) ou sémantique de requête détournée. Une f-string interpolant une **valeur** au lieu d'un placeholder = injection SQL.
+- **Invariants** :
+  - Jamais de valeur issue d'une entrée utilisateur interpolée dans un `text(f"...")` — uniquement des noms de placeholders générés (`:rowid_0`, …), valeurs passées en params.
+  - L'escaping FTS5 (`"` → `""` + quoting des termes) reste systématique dans les `_prepare_*`.
+  - Toute modification de la couche search couvre les **deux** backends (SQLite + Postgres) — cf. Points d'attention §2.
+
+### Isolation projets / workspaces
+
+- **Fichiers** : `src/basic_memory/project_resolver.py` (`ProjectResolver.resolve` / `require_project`), `src/basic_memory/workspace_context.py` (contexte permalink workspace, headers), `src/basic_memory/mcp/project_context.py` (résolution workspace/projet côté MCP, `WorkspaceProjectIndex`).
+- **Risque** : le vault PKM privé est un des projets servis. Un bleed cross-projet (résolution d'identifier qui matche dans un autre projet, permalink workspace-qualified mal routé) expose ou modifie des données hors du périmètre demandé.
+- **Invariants** :
+  - Une opération est **single-project** : le projet résolu (param explicite ou contexte) fait foi, jamais de fallback silencieux vers un autre projet.
+  - Les permalinks workspace-qualified (`workspace/project/...`) ne contournent pas la résolution — validation via `workspace_context.validate_workspace_permalink_context_values`.
+  - Côté bulk : I-6 (identifiers `memory://` et workspace-qualified rejetés au schéma).
+
+### Parsing markdown / frontmatter (entrée non fiable)
+
+- **Fichiers** : `src/basic_memory/file_utils.py` (`parse_frontmatter` l.326 → `yaml.safe_load` l.352), `src/basic_memory/markdown/entity_parser.py` (l.257), `src/basic_memory/mcp/tools/read_note.py` (l.107), `src/basic_memory/api/v2/routers/knowledge_router.py` (l.299, `frontmatter.loads`).
+- **Risque** : les fichiers du vault sont une entrée non fiable (Obsidian Sync multi-postes, imports ChatGPT/Claude, éditions manuelles). Un YAML hostile ou malformé peut crasher le parser ; `yaml.load` non-safe permettrait l'exécution d'objets arbitraires.
+- **Invariants** :
+  - Toujours `yaml.safe_load` (ou `frontmatter` qui l'utilise) — jamais `yaml.load` / `yaml.unsafe_load`.
+  - Un frontmatter malformé fait échouer la note concernée, pas le daemon de sync (skip + log, pas de crash du cycle).
+
+### Credentials cloud / OAuth
+
+- **Fichiers** : `src/basic_memory/cli/auth.py` (`save_tokens` l.182-195 — token file `basic-memory-cloud.json` en clair, `chmod 0o600`), `src/basic_memory/cli/commands/cloud/rclone_config.py` (l.100 — `secret_access_key` S3 écrit dans la config rclone), `src/basic_memory/cli/commands/cloud/core_commands.py` (API keys `bmc_`, l.241-247).
+- **Risque** : tokens OAuth, refresh tokens et clés S3 stockés en clair sur disque ; fuite via logs, messages d'erreur, ou commit accidentel (repo destiné à des PRs upstream publiques).
+- **Invariants** :
+  - Le `chmod 0o600` sur le token file est préservé après toute modification de `save_tokens`.
+  - Jamais de token/secret/API key dans les logs (loguru/logfire) ni dans les messages d'exception.
+  - Aucun credential réel dans le repo, les tests ou les fixtures — uniquement des valeurs factices.
+
+### Daemon sync/watch, reindex et index vectoriel
+
+- **Fichiers** : `src/basic_memory/sync/{watch_service,sync_service,coordinator}.py`, `src/basic_memory/mcp/tools/reindex.py`, `src/basic_memory/indexing/` (fork sémantique : `batch_indexer.py`), `src/basic_memory/repository/sqlite_search_repository.py` (`_ensure_vector_tables` l.418-479 — DROP/recreate des tables vectorielles sur changement de dimensions).
+- **Risque** : le daemon observe et synchronise le vault réel en continu. Un bug dans la détection delete/move peut supprimer des records légitimes ou, pire, propager une suppression vers le filesystem. Le vault est aussi écrit par git auto-sync et Obsidian Sync (concurrence externe).
+- **Invariants** :
+  - **File-first absolu** : la DB est un index dérivé. Le flux sync va filesystem → DB ; la sync ne supprime/modifie JAMAIS un fichier source (seules les opérations explicites delete_note/move_note touchent les fichiers).
+  - Les patterns `.bmignore`/gitignore (`ignore_utils.py`, `watch_service._get_ignore_patterns`) sont respectés sur tout nouveau chemin de scan.
+  - Les opérations destructives sur l'index (DROP tables vectorielles, `reindex_all`) ne touchent que des données reconstructibles — jamais les tables `entity`/`observation`/`relation` sans migration Alembic.
+  - Single-writer sur l'index SQLite : pas de writers concurrents introduits dans le cycle de sync.
+
+### Conséquences du niveau Strict
+
+1. `reviewer-security` est **BLOQUANT** sur ces zones (rework immédiat si FAIL).
+2. Le builder charge `adversarial-testing`, écrit les tests d'adversité AVANT les tests nominaux, et produit le marqueur `[ADVERSARIAL] X/X`.
+3. Les merges upstream (`merge/upstream-*`) qui touchent ces fichiers exigent une re-vérification des invariants marqués « choix du fork » (Option B de `sanitize_for_directory`, BUG-004).
