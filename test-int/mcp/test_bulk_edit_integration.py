@@ -119,21 +119,46 @@ async def test_bulk_edit_schedules_vector_sync_batch_exactly_once(
 
 
 @pytest.mark.asyncio
-async def test_bulk_edit_registered_task_name_is_known_to_scheduler():
-    """The batch task name must be registered: schedule() fails fast otherwise."""
-    from basic_memory.deps.services import LocalTaskScheduler
+async def test_sync_entity_vectors_batch_task_registered_and_maps_to_search_service(tmp_path):
+    """The batch task is registered in get_task_scheduler and maps to
+    SearchService.sync_entity_vectors_batch (an unregistered name raises)."""
+    import asyncio
+    from pathlib import Path
+    from typing import cast
 
-    captured: list[list[int]] = []
+    from basic_memory.config import BasicMemoryConfig, ProjectConfig
 
-    async def handler(entity_ids: list[int], **_: Any) -> None:  # pragma: no cover
-        captured.append(entity_ids)
+    class StubSyncService:
+        async def sync(self, home: Path, name: str, force_full: bool = False) -> None:
+            raise AssertionError("sync_project should not run")  # pragma: no cover
 
-    scheduler = LocalTaskScheduler(
-        {"sync_entity_vectors_batch": handler},
-        test_mode=True,
+    class StubSearchService:
+        def __init__(self) -> None:
+            self.batches: list[list[int]] = []
+
+        async def sync_entity_vectors_batch(self, entity_ids: list[int]) -> None:
+            self.batches.append(entity_ids)
+
+    search_service = StubSearchService()
+    app_config = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": str(tmp_path)},
+        default_project="test-project",
+        semantic_search_enabled=True,
     )
-    # Known task: no-op in test mode but does not raise.
-    scheduler.schedule("sync_entity_vectors_batch", entity_ids=[1, 2], project_id="x")
+    scheduler = await get_task_scheduler(
+        sync_service=cast(Any, StubSyncService()),
+        search_service=cast(Any, search_service),
+        project_config=ProjectConfig(name="test-project", home=tmp_path),
+        app_config=app_config,
+    )
+    # Enable background tasks for this test — uses stubs, no real DB race risk
+    cast(Any, scheduler)._test_mode = False
+    scheduler.schedule("sync_entity_vectors_batch", entity_ids=[1, 2, 3], project_id="x")
+    await asyncio.sleep(0.05)
 
+    assert search_service.batches == [[1, 2, 3]]
+
+    # Fail-fast invariant preserved: unknown tasks are never silently dropped.
     with pytest.raises(ValueError, match="Unknown task name"):
         scheduler.schedule("not-a-registered-task")
