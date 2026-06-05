@@ -15,6 +15,7 @@ from basic_memory.schemas.response import (
     DirectoryMoveResult,
     DirectoryDeleteResult,
 )
+from basic_memory.schemas.v2.bulk_edit import BulkEditResponse
 from basic_memory.schemas.v2.graph import GraphNode, OrphanEntitiesResponse
 
 
@@ -161,6 +162,36 @@ class KnowledgeClient:
                 path_template="/v2/projects/{project_id}/knowledge/entities/{entity_id}",
             )
         return EntityResponse.model_validate(response.json())
+
+    async def bulk_edit_entities(self, bulk_data: dict[str, Any]) -> BulkEditResponse:
+        """Apply a batch of edit operations in a single request (best-effort).
+
+        One HTTP round-trip per batch (C-1: identifiers are resolved server-side
+        in the batch loop, no per-item resolve call).
+
+        Args:
+            bulk_data: BulkEditRequest payload (edits, validate_first, stop_on_error)
+
+        Returns:
+            BulkEditResponse with per-item results in request order
+
+        Raises:
+            ToolError: If the request fails (e.g. 422 schema violation)
+        """
+        with logfire.span(
+            "mcp.client.knowledge.bulk_edit_entities",
+            client_name="knowledge",
+            operation="bulk_edit_entities",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/entities/bulk-edit",
+                json=bulk_data,
+                client_name="knowledge",
+                operation="bulk_edit_entities",
+                path_template="/v2/projects/{project_id}/knowledge/entities/bulk-edit",
+            )
+        return BulkEditResponse.model_validate(response.json())
 
     async def delete_entity(self, entity_id: str) -> DeleteEntitiesResponse:
         """Delete an entity.

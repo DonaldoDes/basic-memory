@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Features
+
+- **US-004**: New `bulk_edit_notes` MCP tool and
+  `POST /v2/projects/{project_id}/knowledge/entities/bulk-edit` endpoint
+  (spec: `specs/bulk-edit-notes/spec.md`)
+  - Apply up to 100 edit operations (same operations as `edit_note`) across
+    notes of one project in a single MCP call
+  - Best-effort per note: per-item success/failure report with error codes;
+    optional `stop_on_error` (remaining items skipped, no rollback)
+  - `validate_first` pure dry-run: every item validated, nothing written
+  - Sequential semantics: an edit targeting a note already edited in the same
+    batch sees the previous result (also in dry-run via projected content)
+  - Vector sync batched once per batch (`sync_entity_vectors_batch` task);
+    FTS indexing deferred to background tasks
+  - Security invariants I-1..I-7: path traversal identifiers fail per-item
+    with `SECURITY`, size caps (1 MiB/item, 10 MiB/batch), single-project
+    scope (`memory://` and `project::note` identifiers rejected), no
+    auto-creation, single-note edit path untouched
+
 ### Bug Fixes
 
 - **BUG-002**: Validate permalink format at write time on the `Entity` schema

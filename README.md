@@ -486,7 +486,8 @@ Basic Memory exposes these tools to any MCP client. Every tool is annotated
 with MCP behavior hints (read-only, destructive, idempotent, open-world) so
 agents can pick the right one without trial-and-error:
 
-- **Content:** `write_note`, `read_note`, `edit_note`, `move_note`,
+- **Content:** `write_note`, `read_note`, `edit_note`, `bulk_edit_notes`
+  (up to 100 edits in one call, per-note report, dry-run), `move_note`,
   `delete_note`, `read_content`, `view_note`
 - **Search & discovery:** `search`, `search_notes`, `recent_activity`,
   `list_directory`

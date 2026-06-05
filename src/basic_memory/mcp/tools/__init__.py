@@ -21,6 +21,7 @@ from basic_memory.mcp.tools.release_notes import release_notes
 from basic_memory.mcp.tools.search import search_notes
 from basic_memory.mcp.tools.canvas import canvas
 from basic_memory.mcp.tools.list_directory import list_directory
+from basic_memory.mcp.tools.bulk_edit import bulk_edit_notes
 from basic_memory.mcp.tools.edit_note import edit_note
 from basic_memory.mcp.tools.move_note import move_note
 from basic_memory.mcp.tools.workspaces import list_workspaces
@@ -41,6 +42,7 @@ from basic_memory.mcp.tools.schema import schema_validate, schema_infer, schema_
 
 __all__ = [
     "build_context",
+    "bulk_edit_notes",
     "canvas",
     "cloud_info",
     "create_memory_project",
