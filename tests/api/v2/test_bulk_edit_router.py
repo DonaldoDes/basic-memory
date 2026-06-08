@@ -188,8 +188,37 @@ def test_map_bulk_edit_error_codes():
         == "DUPLICATE_SECTION"
     )
     code, message = _map_bulk_edit_error(RuntimeError("unexpected failure"))
-    assert code == "EDIT_ERROR"
+    assert code == "UNKNOWN_ERROR"
     assert message == "unexpected failure"
+
+
+def test_map_bulk_edit_error_unclassified_never_leaks_spec_code():
+    """Adversarial: arbitrary internal exceptions must fall back to UNKNOWN_ERROR.
+
+    The mapper classifies on substrings of the message; a hostile or unexpected
+    message must not be coerced into a spec error code (NOT_FOUND, TEXT_NOT_FOUND,
+    REPLACEMENT_COUNT_MISMATCH, DUPLICATE_SECTION) it does not match, and the
+    fallback code must stay UNKNOWN_ERROR (last-resort, stable).
+    """
+    spec_codes = {
+        "NOT_FOUND",
+        "TEXT_NOT_FOUND",
+        "REPLACEMENT_COUNT_MISMATCH",
+        "DUPLICATE_SECTION",
+    }
+    adversarial_errors = [
+        RuntimeError(""),  # empty message
+        RuntimeError("DROP TABLE entity; --"),  # injection-style noise
+        ValueError("Expected something"),  # partial keyword, no "occurrences"
+        KeyError("occurrences"),  # keyword present but wrong exception path
+        OSError("disk full"),  # I/O-class failure unrelated to edit semantics
+    ]
+    for error in adversarial_errors:
+        code, message = _map_bulk_edit_error(error)
+        assert code not in spec_codes
+        assert code == "UNKNOWN_ERROR"
+        # The raw message is surfaced verbatim — no fabricated text injected.
+        assert message == str(error)
 
 
 # --- BULK-02: validate_first pure dry-run ---
