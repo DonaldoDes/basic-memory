@@ -214,6 +214,13 @@ basic-memory/
 - Via `BasicMemoryConfig` (Pydantic Settings) — variables d'environnement préfixées `BASIC_MEMORY_`.
 - Fichier de config local : `~/.basic-memory/config.json` (ou `$BASIC_MEMORY_HOME/.basic-memory/config.json`).
 
+### Git / Versioning
+
+- **Workflow de branche** : toute tâche part d'une **branche feature** créée depuis `main` (format `type/description-courte` — `feat/...`, `fix/...`, `docs/...`). Une fois l'implémentation terminée **ET** le build validé (**tests verts** + **`ruff` clean**), merge `--no-ff` dans `main` local, puis **suppression de la branche locale**.
+- **Commits signés DCO** : `git commit -s` sur **tous** les commits — le fork vise des **PR upstream** potentielles (cf. `CONTRIBUTING.md`).
+- **Push fork systématique** : après le merge dans `main` local et le build validé, `git push fork main` est **systématique et sans confirmation** — c'est la **dernière étape normale** de tout chantier. Justification : éviter que du travail validé reste **local-only** (perte si poste défaillant, désynchronisation entre postes). Remote `fork` = `git@github.com:DonaldoDes/basic-memory.git`.
+- **Exception upstream** : le push vers `upstream`/`origin` (**basicmachines-co**) et l'ouverture de **PR** restent **manuels et explicites** — **jamais automatiques**. Une contribution upstream se décide **au cas par cas** (DCO sign-off déjà en place).
+
 ---
 
 ## Commandes
