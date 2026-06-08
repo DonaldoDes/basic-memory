@@ -156,6 +156,7 @@ Alignés sur les erreurs du chemin single-note (`apply_edit_operation`, `entity_
 | `DUPLICATE_SECTION` | section cible présente plusieurs fois (replace_section / insert_*) | erreur replace_section_content |
 | `AMBIGUOUS_IDENTIFIER` | identifier résolvant 2+ entités | résolution |
 | `SECURITY` | path traversal détecté dans l'identifier (I-1) | nouveau (batch) |
+| `UNKNOWN_ERROR` | code de dernier recours — exception interne non classée (ne matche aucun cas ci-dessus) | fallback `_map_bulk_edit_error` |
 
 Un item `failed` porte toujours `error_code` + `error` (message). Le batch n'est jamais interrompu par une erreur item (hors `stop_on_error=true`).
 

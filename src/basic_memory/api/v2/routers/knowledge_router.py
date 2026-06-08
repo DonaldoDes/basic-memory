@@ -856,7 +856,7 @@ def _map_bulk_edit_error(error: Exception) -> tuple[str, str]:
         return "REPLACEMENT_COUNT_MISMATCH", message
     if "Multiple sections found" in message:
         return "DUPLICATE_SECTION", message
-    return "EDIT_ERROR", message
+    return "UNKNOWN_ERROR", message
 
 
 @router.post("/entities/bulk-edit", response_model=BulkEditResponse)
@@ -912,7 +912,7 @@ async def bulk_edit_entities(
         results: list[BulkEditItemResult] = []
         projected_content: dict[int, str] = {}
         pending_index: dict[int, tuple] = {}
-        modified_entity_ids: list[int] = []
+        modified_entity_ids: set[int] = set()
         stop_requested = False
 
         def record_failure(identifier: str, error_code: str, message: str) -> None:
@@ -1002,8 +1002,7 @@ async def bulk_edit_entities(
                 # C-2: defer FTS indexing to background tasks (last write wins
                 # for notes edited several times in the same batch).
                 pending_index[updated_entity.id] = (updated_entity, write_result.search_content)
-                if updated_entity.id not in modified_entity_ids:
-                    modified_entity_ids.append(updated_entity.id)
+                modified_entity_ids.add(updated_entity.id)
                 results.append(
                     BulkEditItemResult(
                         identifier=edit.identifier,
@@ -1026,7 +1025,7 @@ async def bulk_edit_entities(
         if modified_entity_ids and app_config.semantic_search_enabled:
             task_scheduler.schedule(
                 "sync_entity_vectors_batch",
-                entity_ids=modified_entity_ids,
+                entity_ids=list(modified_entity_ids),
                 project_id=project_id,
             )
             vector_sync = "scheduled"

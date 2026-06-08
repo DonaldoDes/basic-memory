@@ -130,6 +130,9 @@ async def bulk_edit_notes(
     """
     try:
         request = BulkEditRequest(
+            # `edits` arrives as list[dict] off the MCP wire (typed Any), so the
+            # type-checker can't see dict -> BulkEditOperation as safe here;
+            # Pydantic coerces each dict against the BulkEditOperation schema.
             edits=edits,  # type: ignore[arg-type]
             validate_first=validate_first,
             stop_on_error=stop_on_error,
