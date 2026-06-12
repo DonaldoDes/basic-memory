@@ -764,7 +764,7 @@ async def test_list_entities_for_dataview_skips_binary_files(
     binary_entity = await entity_repository.add(
         Entity(
             title="binary.pdf",
-            entity_type="file",
+            note_type="file",
             content_type="application/pdf",
             file_path="binary.pdf",
             checksum="deadbeef",
@@ -810,6 +810,42 @@ async def test_list_entities_for_dataview_skips_binary_files(
     assert file_read_errors == [], (
         f"Expected no File read errors during dataview enrichment, got: {file_read_errors}"
     )
+
+
+@pytest.mark.asyncio
+async def test_list_entities_for_dataview_exposes_note_type(
+    client: AsyncClient,
+    v2_project_url,
+):
+    """Regression: dataview endpoint must read entity.note_type, not entity.entity_type.
+
+    Upstream rename (c4429183, #600) changed the Entity column entity_type -> note_type.
+    The /entities/dataview endpoint still referenced entity.entity_type, raising
+    AttributeError ('Entity' object has no attribute 'entity_type') -> HTTP 500.
+    Caught silently by read_note._enrich_with_dataview's broad except, this left
+    Dataview blocks un-rendered (raw) in read_note / build_context output.
+
+    This test loads a freshly-persisted entity from the DB (no constructor masking
+    of entity_type) and asserts the endpoint returns 200 with the correct `type`.
+    """
+    md_data = {
+        "title": "DataviewTypeNote",
+        "folder": "test",
+        "content": "# A note\n\nBody text.",
+    }
+    md_response = await client.post(f"{v2_project_url}/knowledge/entities", json=md_data)
+    assert md_response.status_code == 200
+
+    # Hit the dataview endpoint - must NOT 500 on entity.entity_type AttributeError
+    response = await client.get(f"{v2_project_url}/knowledge/entities/dataview")
+    assert response.status_code == 200, response.text
+
+    notes = response.json()
+    note = next((n for n in notes if n["title"] == "DataviewTypeNote"), None)
+    assert note is not None, "Created markdown note missing from dataview listing"
+
+    # `type` must be populated from entity.note_type (markdown notes -> "note")
+    assert note["type"] == "note", f"Expected type='note' from note_type, got {note['type']!r}"
 
 
 @pytest.mark.asyncio
