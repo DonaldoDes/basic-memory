@@ -290,7 +290,7 @@ async def list_entities_for_dataview(
                 "folder": str(PathLib(entity.file_path).parent),
             },
             "title": entity.title,
-            "type": entity.entity_type,
+            "type": entity.note_type,
         }
 
         # Add permalink if available

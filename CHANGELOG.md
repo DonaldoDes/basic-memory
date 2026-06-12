@@ -23,6 +23,18 @@
 
 ### Bug Fixes
 
+- **Dataview rendering regression**: `read_note` / `build_context` returned raw,
+  un-executed `dataview` blocks (no "Dataview Query Results" section) whenever
+  `enable_dataview=True`.
+  - Root cause: the upstream rename `entity_type` → `note_type` (#600, pulled in via
+    the 272-commit upstream merge) left a stale `entity.entity_type` reference in the
+    `GET /v2/projects/{project_id}/knowledge/entities/dataview` endpoint. The endpoint
+    raised `AttributeError` (HTTP 500); `read_note._enrich_with_dataview` swallowed it
+    in its broad `except` and returned the note un-enriched.
+  - Fix: read `entity.note_type` in the dataview endpoint.
+  - Distinct from BUG-001 (Done): there the pipeline ran but returned 0 results; here
+    the endpoint crashed before the pipeline executed.
+
 - **BUG-002**: Validate permalink format at write time on the `Entity` schema
   - Rejects the legacy Bear-import numeric-prefix pattern (`3.-foo`, `42-bar`) that broke `memory://` URI resolution
   - Rejects malformed dot patterns (`..`, `.-`, `-.`, `./`, `/.`, trailing `.`)
