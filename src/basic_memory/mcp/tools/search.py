@@ -32,6 +32,7 @@ from basic_memory.schemas.search import (
     SearchRetrievalMode,
 )
 from basic_memory.dataview.integration import create_dataview_integration
+from basic_memory.bases.integration import create_bases_integration
 
 
 def _default_search_type() -> str:
@@ -638,6 +639,7 @@ async def search_notes(
         ),
     ] = None,
     enable_dataview: bool = False,
+    enable_bases: bool = False,
     context: Context | None = None,
 ) -> dict | str:
     """Search across all content in the knowledge base with comprehensive syntax support.
@@ -745,6 +747,7 @@ async def search_notes(
                        for this query. E.g., 0.0 to see all vector results, or 0.8 for high precision.
                        Only applies to vector and hybrid search types.
         enable_dataview: Execute Dataview queries in search results (default: False for performance)
+        enable_bases: Execute Obsidian Bases (```base```) queries in search results (default: False for performance)
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -1035,6 +1038,35 @@ async def search_notes(
                             except Exception as e:  # pragma: no cover
                                 logger.warning(
                                     "Failed to process Dataview for result "
+                                    f"{search_result.permalink}: {e}"
+                                )
+
+                # Enrich with Bases if enabled and results have content.
+                # Independent of the Dataview flag (ADR-003 §4 — flag
+                # independence). Detection is on-the-fly per result content.
+                if enable_bases and result.results:
+                    logger.info(
+                        f"Enriching {len(result.results)} search results with Bases"
+                    )
+                    bases_integration = create_bases_integration()
+
+                    for search_result in result.results:
+                        content = getattr(search_result, "content", None)
+                        if content:
+                            try:
+                                bases_results = bases_integration.process_note(content)
+                                if bases_results:
+                                    if not search_result.metadata:
+                                        search_result.metadata = {}
+                                    search_result.metadata["bases_results"] = (
+                                        bases_results
+                                    )
+                                    search_result.metadata["bases_query_count"] = len(
+                                        bases_results
+                                    )
+                            except Exception as e:  # pragma: no cover
+                                logger.warning(
+                                    "Failed to process Bases for result "
                                     f"{search_result.permalink}: {e}"
                                 )
 

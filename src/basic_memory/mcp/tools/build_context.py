@@ -24,6 +24,8 @@ from basic_memory.schemas.memory import (
     RelationSummary,
 )
 from basic_memory.dataview.integration import create_dataview_integration
+from basic_memory.bases.detector import BasesDetector
+from basic_memory.bases.integration import create_bases_integration
 
 
 def _format_entity_block(result: ContextResult) -> str:
@@ -165,6 +167,7 @@ async def build_context(
     ] = 10,
     output_format: Literal["json", "text"] = "json",
     enable_dataview: bool = True,
+    enable_bases: bool = True,
     context: Context | None = None,
 ) -> dict | str:
     """Get context needed to continue a discussion within a specific project.
@@ -193,6 +196,7 @@ async def build_context(
         output_format: Response format - "json" for structured JSON dict,
             "text" for compact markdown text
         enable_dataview: Execute Dataview queries in context notes (default: True)
+        enable_bases: Execute Obsidian Bases (```base```) queries in context notes (default: True)
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -347,6 +351,49 @@ async def build_context(
                         "No dataview_queries found in metadata, skipping "
                         "Dataview enrichment"
                     )
+
+            # Enrich with Bases (```base```) via on-the-fly detection on the
+            # primary content. Unlike Dataview (which reads dataview_queries
+            # metadata computed at sync), Bases detects blocks directly on the
+            # returned content — no dependency on sync_service (ADR-003 §4).
+            if enable_bases:
+                has_base = any(
+                    cr.primary_result.type == "entity"
+                    and cr.primary_result.content
+                    and BasesDetector.has_base_blocks(cast(str, cr.primary_result.content))
+                    for cr in graph.results
+                )
+                if has_base:
+                    logger.info("Enriching graph context with on-the-fly Bases queries")
+                    knowledge_client = KnowledgeClient(client, active_project.external_id)
+                    notes = await knowledge_client.list_entities_for_dataview()
+                    bases_integration = create_bases_integration(
+                        notes_provider=lambda: notes
+                    )
+                    for cr in graph.results:
+                        primary = cr.primary_result
+                        if (
+                            primary.type == "entity"
+                            and primary.content
+                            and BasesDetector.has_base_blocks(cast(str, primary.content))
+                        ):
+                            try:
+                                results = bases_integration.process_note(
+                                    cast(str, primary.content)
+                                )
+                                section = "\n\n---\n## Bases Query Results\n\n"
+                                appended = section
+                                for r in results:
+                                    if r["status"] == "success" and r.get(
+                                        "result_markdown"
+                                    ):
+                                        appended += r["result_markdown"] + "\n\n"
+                                if len(appended) > len(section):
+                                    primary.content = cast(str, primary.content) + appended
+                            except Exception as e:  # pragma: no cover
+                                logger.warning(
+                                    f"Failed to execute Bases queries: {e}"
+                                )
 
             logger.info(
                 f"MCP tool response: tool=build_context project={active_project.name} "
