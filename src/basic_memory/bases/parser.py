@@ -236,31 +236,52 @@ class BasesParser:
             if key_l not in ("and", "or", "not"):
                 raise BasesParseError(f"Unknown filter conjunction: {key!r}")
 
+            # not: accepts a single leaf/mapping OR a list (negate the AND).
             if key_l == "not":
-                child = cls._walk_filter(value, depth + 1, leaf_count, from_holder)
-                if child is None:
+                if isinstance(value, list):
+                    inner = cls._combine(
+                        value, "AND", depth, leaf_count, from_holder
+                    )
+                else:
+                    inner = cls._walk_filter(
+                        value, depth + 1, leaf_count, from_holder
+                    )
+                if inner is None:
                     return None
-                return BinaryOpNode(operator="=", left=child, right=LiteralNode(value=False))
+                return BinaryOpNode(
+                    operator="=", left=inner, right=LiteralNode(value=False)
+                )
 
             if not isinstance(value, list):
                 raise BasesParseError(f"'{key_l}:' must be a list of leaves")
 
             operator = "AND" if key_l == "and" else "OR"
-            children: list[ExpressionNode] = []
-            for item in value:
-                child = cls._walk_filter(item, depth + 1, leaf_count, from_holder)
-                if child is not None:
-                    children.append(child)
-            if not children:
-                return None
-            combined = children[0]
-            for child in children[1:]:
-                combined = BinaryOpNode(operator=operator, left=combined, right=child)
-            return combined
+            return cls._combine(value, operator, depth, leaf_count, from_holder)
 
         raise BasesParseError(
             f"Filter node must be a string or and/or/not mapping, got {type(node).__name__}"
         )
+
+    @classmethod
+    def _combine(
+        cls,
+        items: list,
+        operator: str,
+        depth: int,
+        leaf_count: list[int],
+        from_holder: dict[str, str],
+    ) -> ExpressionNode | None:
+        children: list[ExpressionNode] = []
+        for item in items:
+            child = cls._walk_filter(item, depth + 1, leaf_count, from_holder)
+            if child is not None:
+                children.append(child)
+        if not children:
+            return None
+        combined = children[0]
+        for child in children[1:]:
+            combined = BinaryOpNode(operator=operator, left=combined, right=child)
+        return combined
 
     @classmethod
     def _compile_leaf(

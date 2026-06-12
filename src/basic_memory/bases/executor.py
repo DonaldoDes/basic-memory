@@ -1,0 +1,149 @@
+"""Bases executor — FROM/WHERE/SORT/LIMIT evaluation against entities.
+
+Adapted from dataview/executor/executor.py. Reuses ExpressionEvaluator (filter
+evaluation), FieldResolver (field resolution) and ResultFormatter (US-004
+rendering) by direct import, guaranteeing byte-identical semantics with
+Dataview on the shared surface.
+
+The executor's ``select`` method produces structured rows; ``render`` (US-004)
+turns them into TABLE/LIST markdown. FROM is a path-prefix match on the entity
+dataset (``file.inFolder`` ≡ FROM) — never a filesystem access.
+"""
+
+from typing import Any
+
+from basic_memory.bases.errors import BasesExecutionError
+from basic_memory.bases.schema import (
+    MAX_RENDERED_ROWS,
+    BasesQuery,
+    BasesSortClause,
+    ViewType,
+)
+from basic_memory.dataview.ast import SortDirection
+from basic_memory.dataview.executor.expression_eval import ExpressionEvaluator
+from basic_memory.dataview.executor.field_resolver import FieldResolver
+from basic_memory.dataview.executor.result_formatter import ResultFormatter
+
+
+class BasesExecutor:
+    """Executes a parsed BasesQuery against a collection of entities."""
+
+    def __init__(self, notes: list[dict[str, Any]]):
+        self.notes = notes
+        self.field_resolver = FieldResolver()
+        self.formatter = ResultFormatter()
+
+    # ------------------------------------------------------------------ select
+    def select(self, query: BasesQuery) -> list[dict[str, Any]]:
+        """Filter + project + sort + limit, returning structured rows.
+
+        Each row always carries ``title``, ``file.link``, ``file.path`` (for
+        link discovery) plus the projected columns (TABLE ``order``) keyed by
+        their alias-or-field-name.
+        """
+        filtered = self._filter_by_from(query.from_source)
+        if query.where is not None:
+            filtered = self._filter_by_where(filtered, query.where)
+
+        rows = self._project(filtered, query)
+
+        if query.view.sort:
+            rows = self._apply_sort(rows, query.view.sort)
+
+        # Hard cap then user LIMIT.
+        rows = rows[:MAX_RENDERED_ROWS]
+        if query.view.limit is not None:
+            rows = rows[: query.view.limit]
+
+        return rows
+
+    def _filter_by_from(self, from_source: str | None) -> list[dict[str, Any]]:
+        if not from_source:
+            return self.notes
+        filtered = []
+        for note in self.notes:
+            path = note.get("path")
+            if path is None:
+                path = note.get("file", {}).get("path", "")
+            # Prefix match on the dataset — never a filesystem lookup.
+            if path.startswith(from_source) or from_source in path:
+                filtered.append(note)
+        return filtered
+
+    def _filter_by_where(
+        self, notes: list[dict[str, Any]], where
+    ) -> list[dict[str, Any]]:
+        filtered = []
+        for note in notes:
+            evaluator = ExpressionEvaluator(note)
+            try:
+                if evaluator.evaluate(where):
+                    filtered.append(note)
+            except Exception:
+                # Degradation: a note that raises during evaluation is skipped,
+                # never crashes the whole block (mirror DataviewExecutor).
+                continue
+        return filtered
+
+    def _project(
+        self, notes: list[dict[str, Any]], query: BasesQuery
+    ) -> list[dict[str, Any]]:
+        order = query.view.order
+        rows: list[dict[str, Any]] = []
+        for note in notes:
+            title = note.get("title", "Untitled")
+            row: dict[str, Any] = {
+                "title": title,
+                "file.link": f"[[{title}]]",
+                "file.path": note.get("file", {}).get("path", note.get("path", "")),
+            }
+            # Project TABLE columns (key by alias when defined).
+            for col in order:
+                alias = query.aliases.get(col, col)
+                try:
+                    row[alias] = FieldResolver.resolve_field(note, col)
+                except Exception:
+                    row[alias] = None
+            rows.append(row)
+        return rows
+
+    def _apply_sort(
+        self, rows: list[dict[str, Any]], sort_clauses: list[BasesSortClause]
+    ) -> list[dict[str, Any]]:
+        for clause in reversed(sort_clauses):
+            field = clause.field
+            reverse = clause.direction == SortDirection.DESC
+
+            def sort_key(row, _field=field):
+                value = row.get(_field)
+                if value is None:
+                    return (1, "")
+                return (0, value)
+
+            rows = sorted(rows, key=sort_key, reverse=reverse)
+        return rows
+
+    # ------------------------------------------------------------------ render
+    def render(self, query: BasesQuery) -> tuple[str, list[dict[str, Any]]]:
+        """Render the query result as markdown + structured rows.
+
+        Returns (markdown, rows). Reuses ResultFormatter for byte-identical
+        output with Dataview.
+        """
+        rows = self.select(query)
+
+        if query.view.view_type == ViewType.TABLE:
+            field_names = [
+                query.aliases.get(col, col) for col in query.view.order
+            ]
+            markdown = self.formatter.format_table(rows, field_names)
+            return markdown, rows
+
+        if query.view.view_type == ViewType.LIST:
+            markdown = self.formatter.format_list(rows)
+            return markdown, rows
+
+        # Should not reach here: unsupported view types are rejected at parse.
+        raise BasesExecutionError(
+            f"Unsupported view type: {query.view.view_type}"
+        )
