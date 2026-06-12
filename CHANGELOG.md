@@ -4,6 +4,33 @@
 
 ### Features
 
+- **M-Bases-P1 (Obsidian Bases executor, Phase 1 — parity-first)**: new
+  `enable_bases` flag on `read_note` / `build_context` / `search_notes` renders
+  ```` ```base ```` fenced blocks agent-side, mirroring `enable_dataview`
+  (spec: `specs/bases-executor/spec.md`, design: ADR-003).
+  - Surface: TABLE/LIST views only; filters `and:`/`or:`/`not:` with leaf
+    expressions (operators `= != < > <= >= AND OR`, functions
+    `contains`/`length`/`lower`/`upper` tolerant to both method and global
+    forms), `file.*` + direct frontmatter fields, `file.inFolder` ≡ FROM
+    (path-prefix match — never a filesystem access), sort/limit
+  - Module `src/basic_memory/bases/` (fork-local, zero core changes outside the
+    3 flag-bearing tools): reuses Dataview `ExpressionEvaluator`,
+    `FieldResolver`, `ResultFormatter` by direct import → renders byte-identical
+    to Dataview on the parity surface
+  - Defaults symmetric to `enable_dataview`: `read_note`=True,
+    `build_context`=True, `search_notes`=False; flags independent (a note with
+    both a `dataview` and a `base` block renders each by its executor)
+  - Out of scope (Phase 2, rejected explicitly → inert block): formula
+    evaluator, lambdas, property chains, GROUP BY, FLATTEN, `.base` embeds,
+    TASK view
+  - Error policy mirrors Dataview: any malformed/out-of-bounds/unsupported block
+    becomes an inert `status:error` envelope (5 error types) — never crashes the
+    MCP handler, never alters the rest of the note
+  - Anti-DoS: YAML loaded via a fork `SafeLoader` forbidding anchors/aliases
+    (billion-laughs), plus 9 chiffrées bounds (32 KB/block, 20 blocks/note,
+    filter depth 10, 50 leaves, 1024-char leaves, AST depth 20, 1000 YAML nodes,
+    10 views, 500 rendered rows)
+
 - **US-004**: New `bulk_edit_notes` MCP tool and
   `POST /v2/projects/{project_id}/knowledge/entities/bulk-edit` endpoint
   (spec: `specs/bulk-edit-notes/spec.md`)
