@@ -20,6 +20,53 @@ from basic_memory.mcp.tools.search import search_notes
 from basic_memory.schemas.memory import memory_url_path
 from basic_memory.utils import validate_project_path
 from basic_memory.dataview.integration import create_dataview_integration
+from basic_memory.bases.integration import create_bases_integration
+
+
+async def _enrich_with_bases(content: str, project_name: str, knowledge_client) -> str:
+    """Enrich note content with executed Bases (```base```) queries.
+
+    Mirror of _enrich_with_dataview: detects ```base``` blocks, fetches the
+    shared entity dataset once, renders each block, and appends a
+    ``## Bases Query Results`` section. Any failure returns the original
+    content unchanged (the note never breaks).
+    """
+    try:
+        notes = await knowledge_client.list_entities_for_dataview()
+        integration = create_bases_integration(notes_provider=lambda: notes)
+        bases_results = integration.process_note(content)
+
+        if not bases_results:
+            return content
+
+        enriched = content + "\n\n---\n\n## Bases Query Results\n\n"
+        enriched += (
+            f"*Found {len(bases_results)} base quer"
+            f"{'y' if len(bases_results) == 1 else 'ies'}*\n\n"
+        )
+
+        for result in bases_results:
+            enriched += f"### Query {result['query_id']} (Line {result['line_number']})\n\n"
+            enriched += f"**Type:** {result['query_type']}  \n"
+            enriched += f"**Status:** {result['status']}  \n"
+            enriched += f"**Execution time:** {result['execution_time_ms']}ms  \n\n"
+
+            if result["status"] == "success":
+                enriched += f"**Results:** {result['result_count']} item(s)\n\n"
+                if result.get("result_markdown"):
+                    enriched += result["result_markdown"] + "\n\n"
+                if result.get("discovered_links"):
+                    enriched += f"**Discovered links:** {len(result['discovered_links'])}\n\n"
+            else:
+                enriched += f"**Error:** {result.get('error', 'Unknown error')}\n\n"
+
+            enriched += "---\n\n"
+
+        return enriched
+
+    except Exception as e:
+        logger.warning(f"Failed to enrich note with Bases results: {e}")
+        return content
 
 
 async def _enrich_with_dataview(content: str, project_name: str, knowledge_client) -> str:
@@ -132,6 +179,7 @@ async def read_note(
     page: int = 1,
     page_size: int = 10,
     enable_dataview: bool = True,
+    enable_bases: bool = True,
     context: Context | None = None,
 ) -> str | dict:
     """Return the raw markdown for a note, or guidance text if no match is found.
@@ -165,6 +213,7 @@ async def read_note(
         page: Page number for paginated results (default: 1)
         page_size: Number of items per page (default: 10)
         enable_dataview: Execute Dataview queries found in the note (default: True)
+        enable_bases: Execute Obsidian Bases (```base```) queries found in the note (default: True)
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -359,6 +408,10 @@ async def read_note(
                         content = await _enrich_with_dataview(
                             content, active_project.name, knowledge_client
                         )
+                    if enable_bases:
+                        content = await _enrich_with_bases(
+                            content, active_project.name, knowledge_client
+                        )
                     return content
             except Exception as e:  # pragma: no cover
                 logger.info(f"Direct lookup failed for '{entity_path}': {e}")
@@ -402,6 +455,10 @@ async def read_note(
                             content = response.text
                             if enable_dataview:
                                 content = await _enrich_with_dataview(
+                                    content, active_project.name, knowledge_client
+                                )
+                            if enable_bases:
+                                content = await _enrich_with_bases(
                                     content, active_project.name, knowledge_client
                                 )
                             return content
