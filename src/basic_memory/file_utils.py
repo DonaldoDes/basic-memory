@@ -340,6 +340,22 @@ _BARE_INLINE_WIKILINK_LINE = re.compile(
 )
 
 
+#: Matches a YAML block-sequence item whose value is a *bare* inline wikilink, e.g.::
+#:
+#:     refs:
+#:     - [[x|y]]
+#:       - [[projects/X|X]]
+#:
+#: Capture groups: (1) the ``- `` item prefix incl. indentation and trailing space,
+#: (2) the unquoted ``[[...]]`` wikilink value (no surrounding quotes).
+#:
+#: BUG-011 (résidu 1): an unquoted block-sequence item ``- [[path|alias]]`` is parsed
+#: by ``yaml.safe_load`` as a nested flow list (``[['path|alias']]``) and re-emitted as
+#: ``- - - path|alias`` — the same silent corruption class as the BUG-010 inline case,
+#: on list-item lines. We quote such items as scalar strings *before* parsing.
+_BARE_BLOCK_SEQ_WIKILINK_LINE = re.compile(r"^(?P<prefix>\s*-\s+)(?P<value>\[\[.*\]\])\s*$")
+
+
 def quote_inline_wikilinks(yaml_text: str) -> str:
     """Single-quote bare inline ``[[wikilink]]`` frontmatter values before YAML parse.
 
@@ -352,7 +368,13 @@ def quote_inline_wikilinks(yaml_text: str) -> str:
           after the inner list, so it is not a single ``[[...]]`` token).
         * Already-quoted values: ``'[[...]]'`` / ``"[[...]]"`` (value does not begin
           with ``[[`` once the quote is consumed by the regex anchor).
-        * Block-sequence items (``- [[x]]``) and prose containing wikilinks.
+        * Prose containing wikilinks (already a scalar string for YAML).
+
+    Also rewritten (BUG-011, résidu 1): bare block-sequence items of the form
+    ``- [[...]]`` (a single wikilink as the *entire* item), which YAML would otherwise
+    parse as a nested flow list and re-emit as ``- - - x|y``. Genuine list items
+    (``- foo``, ``- [a, b]``, ``- [[a, b], [c, d]]``) and already-quoted items
+    (``- '[[x]]'``) are deliberately left untouched.
 
     Args:
         yaml_text: The raw YAML frontmatter block (between the ``---`` fences).
@@ -367,7 +389,11 @@ def quote_inline_wikilinks(yaml_text: str) -> str:
         # Separate the line body from its terminator so the regex anchors ($) match.
         stripped = raw_line.rstrip("\r\n")
         terminator = raw_line[len(stripped) :]
-        match = _BARE_INLINE_WIKILINK_LINE.match(stripped)
+        # Try the inline mapping form (``key: [[..]]``) first, then the block-sequence
+        # item form (``- [[..]]``). Both reuse the same single-wikilink discrimination.
+        match = _BARE_INLINE_WIKILINK_LINE.match(stripped) or _BARE_BLOCK_SEQ_WIKILINK_LINE.match(
+            stripped
+        )
         if match and _is_single_inline_wikilink(match.group("value")):
             # Escape single quotes per YAML single-quoted scalar rules ('' = ').
             escaped = match.group("value").replace("'", "''")
@@ -395,6 +421,11 @@ def _is_single_inline_wikilink(value: str) -> bool:
             depth += 1
         elif ch == "]":
             depth -= 1
+            if depth < 0:
+                # Surplus ``]`` (unbalanced closing bracket): not a well-formed single
+                # wikilink. Defensive guard (BUG-011 résidu 2) so the helper is safe to
+                # reuse without the upstream startswith/endswith gates.
+                return False
         elif ch == "," and depth == 0:
             # A comma outside any inner bracket means multiple flow-list elements.
             return False
