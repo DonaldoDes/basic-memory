@@ -21,6 +21,7 @@ from basic_memory.markdown.schemas import (
     Observation,
     Relation,
 )
+from basic_memory.file_utils import quote_frontmatter_inline_wikilinks
 from basic_memory.utils import parse_tags
 
 
@@ -252,6 +253,13 @@ class EntityParser:
         # PostgreSQL rejects null bytes (0x00) in text columns.
         # Some markdown files (e.g. Claude agent definitions) contain embedded nulls.
         content = content.replace("\x00", "")
+
+        # BUG-010: quote bare inline wikilinks in the frontmatter block so YAML keeps
+        # "[[path|alias]]" as a scalar string instead of parsing it as a flow
+        # list-of-list (which round-trips to a corrupted "- - path|alias").
+        # The vault is untrusted input (manual edits, Obsidian Sync), so this must
+        # run on the file-read path too, not just on write_note's content parse.
+        content = quote_frontmatter_inline_wikilinks(content)
 
         # Parse frontmatter with proper error handling for malformed YAML.
         # We use frontmatter.parse() instead of frontmatter.loads() because
