@@ -15,7 +15,11 @@ come FIRST, then nominal tests.
 
 import pytest
 
-from basic_memory.file_utils import parse_frontmatter
+from basic_memory.file_utils import (
+    ParseError,
+    _is_single_inline_wikilink,
+    parse_frontmatter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +114,6 @@ def test_adv_malformed_bracket_value_raises_controlled_error():
     correct security posture for untrusted frontmatter input. The file-read path
     (entity_parser) catches this and degrades to plain markdown instead of crashing.
     """
-    from basic_memory.file_utils import ParseError
-
     content = "---\nweird: [[unbalanced\n---\n\nbody"
     with pytest.raises(ParseError):
         parse_frontmatter(content)
@@ -149,3 +151,101 @@ def test_nominal_relation_alongside_real_list():
     fm = parse_frontmatter(content)
     assert fm["part_of"] == "[[a|A]]"
     assert fm["tags"] == ["x", "y"]
+
+
+# ---------------------------------------------------------------------------
+# BUG-011 Résidu 1 — [ADVERSARIAL] block-sequence wikilink coverage
+#
+# Root cause: an UNquoted block-sequence item ``- [[x|y]]`` round-trips through
+# ``yaml.safe_load`` as ``[[['x|y']]]`` and re-dumps as ``- - - x|y`` — the same
+# class of silent corruption as BUG-010 inline, but on list-item lines.
+# ---------------------------------------------------------------------------
+
+
+def test_adv_block_sequence_bare_wikilink_not_parsed_as_nested_list():
+    """ADV: the exact BUG-011 trigger — bare block-seq wikilink item stays a string."""
+    content = "---\nrefs:\n- [[projects/Mon Projet|Mon Projet]]\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["refs"] == ["[[projects/Mon Projet|Mon Projet]]"]
+    # Each item must be a plain string, never a nested list (the corruption signature).
+    for item in fm["refs"]:
+        assert isinstance(item, str)
+
+
+def test_adv_block_sequence_multiple_bare_wikilink_items():
+    """ADV: several bare block-seq wikilink items each preserved as strings."""
+    content = "---\nrefs:\n- [[a|A]]\n- [[b|B]]\n- [[Some Note]]\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["refs"] == ["[[a|A]]", "[[b|B]]", "[[Some Note]]"]
+
+
+def test_adv_block_sequence_indented_bare_wikilink():
+    """ADV: indented block-seq items (2-space indent) quoted correctly."""
+    content = "---\nrefs:\n  - [[a|A]]\n  - [[b|B]]\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["refs"] == ["[[a|A]]", "[[b|B]]"]
+
+
+def test_adv_block_sequence_wikilink_with_colon_inside():
+    """ADV: block-seq wikilink containing a colon preserved as string."""
+    content = "---\nrefs:\n- [[meeting: 2026-06-12 standup|standup]]\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["refs"] == ["[[meeting: 2026-06-12 standup|standup]]"]
+
+
+def test_adv_block_sequence_already_quoted_items_untouched():
+    """ADV (non-regression): already-quoted block-seq items survive unchanged."""
+    content = "---\nrefs:\n- '[[A]]'\n- '[[B]]'\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["refs"] == ["[[A]]", "[[B]]"]
+
+
+# ---------------------------------------------------------------------------
+# BUG-011 Résidu 1 — [ADVERSARIAL] no over-quoting of genuine list items (AC-3)
+# ---------------------------------------------------------------------------
+
+
+def test_adv_block_sequence_plain_string_items_not_quoted():
+    """ADV: ordinary block-seq string items (no wikilink) stay plain strings."""
+    content = "---\ntags:\n- foo\n- bar\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["tags"] == ["foo", "bar"]
+
+
+def test_adv_block_sequence_genuine_nested_flow_list_item_preserved():
+    """ADV: a real nested flow-list item ``- [a, b]`` must stay a list, not a string."""
+    content = "---\nmatrix:\n- [a, b]\n- [c, d]\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["matrix"] == [["a", "b"], ["c", "d"]]
+
+
+def test_adv_block_sequence_genuine_nested_wikilink_list_item_preserved():
+    """ADV: ``- [[a, b], [c, d]]`` is a genuine nested list, not a single wikilink."""
+    content = "---\nmatrix:\n- [[a, b], [c, d]]\n---\n\nbody"
+    fm = parse_frontmatter(content)
+    assert fm["matrix"] == [[["a", "b"], ["c", "d"]]]
+
+
+# ---------------------------------------------------------------------------
+# BUG-011 Résidu 2 — [ADVERSARIAL] depth < 0 guard in _is_single_inline_wikilink
+# ---------------------------------------------------------------------------
+
+
+def test_adv_is_single_inline_wikilink_unbalanced_closing_brackets_false():
+    """ADV: surplus ``]`` (depth would go negative) must return False, not True.
+
+    Defensive guard (BUG-011 résidu 2): if the helper is reused without the upstream
+    ``startswith('[[')``/``endswith(']]')`` gates, an orphan ``]`` must not yield a
+    false positive. ``[[x]]]`` strips to inner ``[x]]`` which drives depth below 0.
+    """
+    assert _is_single_inline_wikilink("[[x]]]") is False
+
+
+def test_adv_is_single_inline_wikilink_nominal_still_true():
+    """ADV (non-regression): a well-formed single wikilink still returns True."""
+    assert _is_single_inline_wikilink("[[a|b]]") is True
+
+
+def test_adv_is_single_inline_wikilink_genuine_list_false():
+    """ADV (non-regression): a genuine multi-element flow list returns False."""
+    assert _is_single_inline_wikilink("[[a, b], [c, d]]") is False
