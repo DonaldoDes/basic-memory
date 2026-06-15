@@ -323,6 +323,110 @@ def has_frontmatter(content: str) -> bool:
     return "---" in content[3:]
 
 
+#: Matches a YAML mapping line whose value is a *bare* inline wikilink, e.g.::
+#:
+#:     part_of: [[projects/Mon Projet|Mon Projet]]
+#:       primary: [[X|X]]
+#:
+#: Capture groups: (1) the ``key:`` prefix incl. indentation and trailing space,
+#: (2) the unquoted ``[[...]]`` wikilink value (no surrounding quotes).
+#:
+#: BUG-010: ``yaml.safe_load`` parses an unquoted ``[[path|alias]]`` value as a YAML
+#: flow list-of-list (``[['path|alias']]``), which is then re-emitted in block style
+#: ``- - path|alias`` on the next write — silently corrupting the relation. We quote
+#: such values as scalar strings *before* parsing so YAML keeps them as plain strings.
+_BARE_INLINE_WIKILINK_LINE = re.compile(
+    r"^(?P<prefix>\s*[^\s:#][^:]*:\s+)(?P<value>\[\[.*\]\])\s*$"
+)
+
+
+def quote_inline_wikilinks(yaml_text: str) -> str:
+    """Single-quote bare inline ``[[wikilink]]`` frontmatter values before YAML parse.
+
+    Only lines of the form ``key: [[...]]`` (a single wikilink as the *entire* value,
+    not already quoted) are rewritten. This is the BUG-010 fix.
+
+    Deliberately NOT touched (non-regression):
+        * Genuine flow lists: ``tags: [a, b]`` (value does not start with ``[[``).
+        * Genuine nested lists: ``m: [[a, b], [c, d]]`` (value has a top-level comma
+          after the inner list, so it is not a single ``[[...]]`` token).
+        * Already-quoted values: ``'[[...]]'`` / ``"[[...]]"`` (value does not begin
+          with ``[[`` once the quote is consumed by the regex anchor).
+        * Block-sequence items (``- [[x]]``) and prose containing wikilinks.
+
+    Args:
+        yaml_text: The raw YAML frontmatter block (between the ``---`` fences).
+
+    Returns:
+        The YAML text with bare inline wikilink values single-quoted.
+    """
+    # keepends=True preserves each line's terminator (and any trailing newline of the
+    # block), so the reconstructed YAML is byte-identical except for the quoted values.
+    out_lines: list[str] = []
+    for raw_line in yaml_text.splitlines(keepends=True):
+        # Separate the line body from its terminator so the regex anchors ($) match.
+        stripped = raw_line.rstrip("\r\n")
+        terminator = raw_line[len(stripped) :]
+        match = _BARE_INLINE_WIKILINK_LINE.match(stripped)
+        if match and _is_single_inline_wikilink(match.group("value")):
+            # Escape single quotes per YAML single-quoted scalar rules ('' = ').
+            escaped = match.group("value").replace("'", "''")
+            out_lines.append(f"{match.group('prefix')}'{escaped}'{terminator}")
+        else:
+            out_lines.append(raw_line)
+    return "".join(out_lines)
+
+
+def _is_single_inline_wikilink(value: str) -> bool:
+    """Return True if ``value`` is exactly one ``[[...]]`` token (not a multi-elem list).
+
+    ``[[a|b]]``           -> True  (single wikilink)
+    ``[[a, b], [c, d]]``  -> False (genuine nested flow list)
+    ``[[a], [b]]``        -> False (two flow-list elements)
+    """
+    if not (value.startswith("[[") and value.endswith("]]")):
+        return False
+    # Strip the outer flow-list brackets and scan the inner content for a top-level
+    # comma that would indicate multiple elements (a real list, not a wikilink).
+    inner = value[1:-1]  # drop one layer: "[a|b]" for a wikilink, "[a, b], [c, d]" for a list
+    depth = 0
+    for ch in inner:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            # A comma outside any inner bracket means multiple flow-list elements.
+            return False
+    return True
+
+
+def quote_frontmatter_inline_wikilinks(content: str) -> str:
+    """Apply :func:`quote_inline_wikilinks` to the leading ``---`` frontmatter block only.
+
+    The markdown body is left byte-identical. If ``content`` has no frontmatter, it is
+    returned unchanged. Used by the file-read parse path (untrusted vault input) so the
+    BUG-010 fix also protects manually-edited / Obsidian-synced notes, not just
+    ``write_note`` content.
+
+    Args:
+        content: Full markdown content (frontmatter + body), BOM already stripped.
+
+    Returns:
+        Content with bare inline wikilinks in the frontmatter block single-quoted.
+    """
+    if not content.startswith("---"):
+        return content
+
+    # Split into [pre-empty, frontmatter, body]; pre-empty is "" since content starts "---".
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return content
+
+    fixed_block = quote_inline_wikilinks(parts[1])
+    return f"---{fixed_block}---{parts[2]}"
+
+
 def parse_frontmatter(content: str) -> Dict[str, Any]:
     """
     Parse YAML frontmatter from content.
@@ -349,7 +453,9 @@ def parse_frontmatter(content: str) -> Dict[str, Any]:
 
         # Parse YAML
         try:
-            frontmatter = yaml.safe_load(parts[1])
+            # BUG-010: quote bare inline wikilinks so YAML keeps them as scalar strings
+            # instead of parsing "[[x|y]]" as a flow list-of-list.
+            frontmatter = yaml.safe_load(quote_inline_wikilinks(parts[1]))
             # Handle empty frontmatter (None from yaml.safe_load)
             if frontmatter is None:
                 return {}
@@ -572,8 +678,7 @@ def sanitize_for_directory(directory: str) -> str:
     for i, c in enumerate(sanitized):
         if not (c.isalnum() or c in allowed_punct):
             raise ValueError(
-                f"Invalid character {c!r} (U+{ord(c):04X}) at position {i} "
-                f"in folder {directory!r}"
+                f"Invalid character {c!r} (U+{ord(c):04X}) at position {i} in folder {directory!r}"
             )
 
     # compress multiple, repeated spaces (e.g. " & " → "  and  " → " and ")
