@@ -235,17 +235,21 @@ class TestMalformedYaml:
 # BASES-04 — constructs outside Phase 1 surface rejected explicitly
 # ---------------------------------------------------------------------------
 class TestUnsupportedConstructs:
-    def test_formulas_rejected(self):
-        with pytest.raises(BasesUnsupportedError):
-            BasesParser.parse(
-                """
+    def test_formulas_accepted(self):
+        # Contract change (US-004): ``formulas:`` is no longer rejected in
+        # Phase 1; it is now compiled to BasesQuery.formulas (Phase 2 calculated
+        # columns). Hostile formulas are still rejected by the closed-grammar
+        # formula parser (see test_calculated_columns_adversarial.py).
+        query = BasesParser.parse(
+            """
 formulas:
   total: count(rows)
 views:
   - type: table
-    order: [file.name]
+    order: [file.name, formula.total]
 """
-            )
+        )
+        assert "total" in query.formulas
 
     def test_summaries_rejected(self):
         with pytest.raises(BasesUnsupportedError):
@@ -307,15 +311,19 @@ views:
 """
             )
 
-    def test_formula_field_in_order_rejected(self):
-        with pytest.raises(BasesUnsupportedError):
-            BasesParser.parse(
-                """
+    def test_formula_field_in_order_accepted(self):
+        # Contract change (US-004): ``formula.*`` columns in ``order`` are now
+        # accepted and resolved at projection time against BasesQuery.formulas.
+        query = BasesParser.parse(
+            """
+formulas:
+  total: count(rows)
 views:
   - type: table
     order: [formula.total]
 """
-            )
+        )
+        assert "formula.total" in query.view.order
 
     def test_group_by_rejected(self):
         with pytest.raises(BasesUnsupportedError):
@@ -349,6 +357,4 @@ class TestParseBounds:
     def test_leaf_expression_too_long(self):
         long_value = "x" * 1100
         with pytest.raises(BasesLimitError):
-            BasesParser.parse(
-                f'filters: status == "{long_value}"\nviews:\n  - type: list\n'
-            )
+            BasesParser.parse(f'filters: status == "{long_value}"\nviews:\n  - type: list\n')

@@ -13,6 +13,7 @@ dataset (``file.inFolder`` ≡ FROM) — never a filesystem access.
 from typing import Any
 
 from basic_memory.bases.errors import BasesExecutionError
+from basic_memory.bases.formula_eval import safe_evaluate_formula
 from basic_memory.bases.schema import (
     MAX_RENDERED_ROWS,
     BasesQuery,
@@ -23,6 +24,10 @@ from basic_memory.dataview.ast import SortDirection
 from basic_memory.dataview.executor.expression_eval import ExpressionEvaluator
 from basic_memory.dataview.executor.field_resolver import FieldResolver
 from basic_memory.dataview.executor.result_formatter import ResultFormatter
+
+# Prefix marking a calculated column in ``order`` (``formula.<name>``). The
+# suffix is the key into ``BasesQuery.formulas``.
+_FORMULA_PREFIX = "formula."
 
 
 class BasesExecutor:
@@ -70,9 +75,7 @@ class BasesExecutor:
                 filtered.append(note)
         return filtered
 
-    def _filter_by_where(
-        self, notes: list[dict[str, Any]], where
-    ) -> list[dict[str, Any]]:
+    def _filter_by_where(self, notes: list[dict[str, Any]], where) -> list[dict[str, Any]]:
         filtered = []
         for note in notes:
             evaluator = ExpressionEvaluator(note)
@@ -85,9 +88,7 @@ class BasesExecutor:
                 continue
         return filtered
 
-    def _project(
-        self, notes: list[dict[str, Any]], query: BasesQuery
-    ) -> list[dict[str, Any]]:
+    def _project(self, notes: list[dict[str, Any]], query: BasesQuery) -> list[dict[str, Any]]:
         order = query.view.order
         rows: list[dict[str, Any]] = []
         for note in notes:
@@ -99,13 +100,46 @@ class BasesExecutor:
             }
             # Project TABLE columns (key by alias when defined).
             for col in order:
-                alias = query.aliases.get(col, col)
+                alias = self._column_key(query, col)
+                if col.startswith(_FORMULA_PREFIX):
+                    # Calculated column: evaluate the formula AST in the sandbox
+                    # against the (nested-shape) note, so field references like
+                    # ``file.folder`` / frontmatter resolve via FieldResolver.
+                    # safe_evaluate_formula NEVER raises: a per-row evaluation
+                    # error degrades the cell to None, the block is not crashed
+                    # (ADR-004 §2.(e); extends executor.py static-column None
+                    # degradation to formulas).
+                    formula = query.formulas.get(col[len(_FORMULA_PREFIX) :])
+                    if formula is None:
+                        # Column references a formula not declared in formulas:.
+                        row[alias] = None
+                        continue
+                    value, _err = safe_evaluate_formula(formula.ast, note)
+                    row[alias] = value
+                    continue
+                # Static column (Phase 1 path, unchanged).
                 try:
                     row[alias] = FieldResolver.resolve_field(note, col)
                 except Exception:
                     row[alias] = None
             rows.append(row)
         return rows
+
+    @staticmethod
+    def _column_key(query: BasesQuery, col: str) -> str:
+        """Return the row/header key for a projected column.
+
+        Alias wins when the user declared one in ``properties:`` (keyed by the
+        raw column token, e.g. ``formula.Origin``). Otherwise a calculated
+        column keys by its formula name (the suffix after ``formula.``); a
+        static column keys by the field name itself. Used by both ``_project``
+        (row keys) and ``render`` (header names) so they never drift.
+        """
+        if col in query.aliases:
+            return query.aliases[col]
+        if col.startswith(_FORMULA_PREFIX):
+            return col[len(_FORMULA_PREFIX) :]
+        return col
 
     def _apply_sort(
         self, rows: list[dict[str, Any]], sort_clauses: list[BasesSortClause]
@@ -133,9 +167,7 @@ class BasesExecutor:
         rows = self.select(query)
 
         if query.view.view_type == ViewType.TABLE:
-            field_names = [
-                query.aliases.get(col, col) for col in query.view.order
-            ]
+            field_names = [self._column_key(query, col) for col in query.view.order]
             markdown = self.formatter.format_table(rows, field_names)
             return markdown, rows
 
@@ -144,6 +176,4 @@ class BasesExecutor:
             return markdown, rows
 
         # Should not reach here: unsupported view types are rejected at parse.
-        raise BasesExecutionError(
-            f"Unsupported view type: {query.view.view_type}"
-        )
+        raise BasesExecutionError(f"Unsupported view type: {query.view.view_type}")

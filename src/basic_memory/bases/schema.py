@@ -8,6 +8,7 @@ leaves (WHERE) are compiled to the existing Dataview AST nodes
 from dataclasses import dataclass, field
 from enum import Enum
 
+from basic_memory.bases.formula_ast import FormulaNode
 from basic_memory.dataview.ast import ExpressionNode, SortDirection
 
 # ---------------------------------------------------------------------------
@@ -30,6 +31,12 @@ MAX_RENDERED_ROWS = 500
 # PROVISOIRE — à recalibrer lors de US-003/US-005 (ADR-004 §2.(d))
 # ---------------------------------------------------------------------------
 MAX_FORMULA_LENGTH = 1_024
+
+# Maximum number of calculated formulas declared in a single base block
+# (ADR-004 §2.(d) — table "Nombre de formules par bloc" = 20, FIGÉE / dérivée
+# de l'inspection US-001). Crossing it makes the block inert (error_type
+# "limit"): a block over the bound is refused at parse time, never executed.
+MAX_FORMULAS_PER_BLOCK = 20
 
 # ---------------------------------------------------------------------------
 # Phase 2 formula *evaluation* bounds (ADR-004 §2.(d)) — anti-DoS for the
@@ -70,6 +77,7 @@ __all__ = [
     "MAX_LEAF_EXPR_CHARS",
     "MAX_AST_DEPTH",
     "MAX_FORMULA_LENGTH",
+    "MAX_FORMULAS_PER_BLOCK",
     "MAX_FORMULA_RECURSION",
     "MAX_FORMULA_ITERATIONS",
     "FORMULA_BUDGET_MS",
@@ -79,6 +87,8 @@ __all__ = [
     "MAX_RENDERED_ROWS",
     "ViewType",
     "BasesSortClause",
+    "BasesFormula",
+    "BasesGroupBy",
     "BasesView",
     "BasesQuery",
 ]
@@ -104,6 +114,33 @@ class BasesSortClause:
 
 
 @dataclass
+class BasesFormula:
+    """A compiled calculated column (Phase 2, ADR-004 §4, §6).
+
+    Attributes:
+        name: the column name (the key under ``formulas:``).
+        ast: the formula AST compiled by ``formula_parser`` — never an
+            evaluated-at-runtime string. The executor walks this AST in the
+            sandbox (``formula_eval``), never ``eval``/``exec``.
+    """
+
+    name: str
+    ast: FormulaNode
+
+
+@dataclass
+class BasesGroupBy:
+    """A GROUP BY clause (Phase 2, ADR-004 §4, NC-4).
+
+    In Phase 2 v1 the group key is a *simple property* (frontmatter or
+    ``file.*``) — never a formula expression. Declared here so the schema is
+    complete; the executor wiring lands in US-005.
+    """
+
+    field: str
+
+
+@dataclass
 class BasesView:
     """A rendered view (only views[0] is rendered in Phase 1)."""
 
@@ -112,6 +149,9 @@ class BasesView:
     order: list[str] = field(default_factory=list)
     sort: list[BasesSortClause] = field(default_factory=list)
     limit: int | None = None
+    # Phase 2 (ADR-004 §4) — declared here, wired in US-005 (GROUP BY/FLATTEN).
+    group_by: BasesGroupBy | None = None
+    flatten: str | None = None
 
 
 @dataclass
@@ -123,9 +163,13 @@ class BasesQuery:
         from_source: path prefix derived from ``file.inFolder(...)`` (≡ FROM).
         where: filter expression compiled to Dataview AST nodes, or None.
         aliases: column display-name overrides (≡ "as Alias" in DQL).
+        formulas: calculated columns (``formula.<name>``) keyed by name.
     """
 
     view: BasesView
     from_source: str | None = None
     where: ExpressionNode | None = None
     aliases: dict[str, str] = field(default_factory=dict)
+    # Phase 2 (ADR-004 §4) — calculated columns keyed by name; each value is a
+    # BasesFormula whose ``ast`` is evaluated in the sandbox during projection.
+    formulas: dict[str, "BasesFormula"] = field(default_factory=dict)

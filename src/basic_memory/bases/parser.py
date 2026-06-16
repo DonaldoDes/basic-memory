@@ -18,12 +18,15 @@ from basic_memory.bases.errors import (
     BasesParseError,
     BasesUnsupportedError,
 )
+from basic_memory.bases.formula_parser import parse_formula
 from basic_memory.bases.leaf_parser import parse_leaf
 from basic_memory.bases.schema import (
     MAX_FILTER_DEPTH,
     MAX_FILTER_LEAVES,
+    MAX_FORMULAS_PER_BLOCK,
     MAX_VIEWS,
     MAX_YAML_NODES,
+    BasesFormula,
     BasesQuery,
     BasesSortClause,
     BasesView,
@@ -37,8 +40,10 @@ from basic_memory.dataview.ast import (
     SortDirection,
 )
 
-# Top-level keys that signal a Phase 2 / unsupported construct.
-_UNSUPPORTED_TOP_KEYS = {"formulas", "summaries"}
+# Top-level keys that signal an unsupported construct. ``formulas:`` is now
+# accepted (US-004, Phase 2 calculated columns); ``summaries:`` (aggregation)
+# remains out of scope until US-005.
+_UNSUPPORTED_TOP_KEYS = {"summaries"}
 
 # Keys recognized at the view level. Anything implying aggregation/grouping is
 # rejected.
@@ -64,9 +69,9 @@ class BasesParser:
 
         for key in _UNSUPPORTED_TOP_KEYS:
             if key in data:
-                raise BasesUnsupportedError(
-                    f"'{key}:' is outside the Phase 1 surface (Phase 2)"
-                )
+                raise BasesUnsupportedError(f"'{key}:' is outside the Phase 1 surface (Phase 2)")
+
+        formulas = cls._parse_formulas(data.get("formulas"))
 
         view = cls._parse_view(data)
 
@@ -85,7 +90,47 @@ class BasesParser:
             from_source=from_source,
             where=where,
             aliases=aliases,
+            formulas=formulas,
         )
+
+    # --------------------------------------------------------------- formulas
+    @classmethod
+    def _parse_formulas(cls, formulas: Any) -> dict[str, BasesFormula]:
+        """Compile the ``formulas:`` mapping into ``{name: BasesFormula}``.
+
+        Each value is a formula expression string from untrusted note content;
+        it is compiled by ``parse_formula`` (the closed-grammar parser, US-002),
+        which is the first line of defense — any hostile construct (function
+        outside the whitelist, forbidden property chain, dunder, over-long
+        expression) is rejected there, making the block inert. The formula AST
+        is stored, never an evaluated-at-runtime string.
+
+        Raises:
+            BasesParseError: ``formulas:`` is not a mapping of name -> string.
+            BasesLimitError: more than ``MAX_FORMULAS_PER_BLOCK`` formulas, or a
+                single expression over ``MAX_FORMULA_LENGTH`` (block inert).
+            BasesUnsupportedError: a formula uses a construct outside the closed
+                grammar (block inert).
+        """
+        if formulas is None:
+            return {}
+        if not isinstance(formulas, dict):
+            raise BasesParseError("'formulas:' must be a mapping of name -> expression")
+        if len(formulas) > MAX_FORMULAS_PER_BLOCK:
+            raise BasesLimitError(
+                f"Base block declares more than {MAX_FORMULAS_PER_BLOCK} formulas"
+            )
+        compiled: dict[str, BasesFormula] = {}
+        for name, expr in formulas.items():
+            if not isinstance(name, str):
+                raise BasesParseError("Formula names must be strings")
+            if not isinstance(expr, str):
+                raise BasesParseError(f"Formula '{name}' must be a string expression")
+            # parse_formula raises BasesLimitError / BasesParseError /
+            # BasesUnsupportedError on any hostile or malformed input — the
+            # block goes inert, the expression is never evaluated.
+            compiled[name] = BasesFormula(name=name, ast=parse_formula(expr))
+        return compiled
 
     # ------------------------------------------------------------------ views
     @classmethod
@@ -143,10 +188,8 @@ class BasesParser:
         for col in order:
             if not isinstance(col, str):
                 raise BasesParseError("'order' entries must be strings")
-            if col.startswith("formula.") or col.startswith("formulas."):
-                raise BasesUnsupportedError(
-                    "formula.* columns are outside the Phase 1 surface (Phase 2)"
-                )
+            # ``formula.<name>`` columns are accepted (US-004); they are
+            # resolved at projection time against ``BasesQuery.formulas``.
             cols.append(col)
         return cols
 
@@ -165,15 +208,11 @@ class BasesParser:
                 raise BasesParseError("Sort 'property' must be a string")
             direction_raw = str(entry.get("direction", "ASC")).upper()
             if direction_raw not in ("ASC", "DESC"):
-                raise BasesParseError(
-                    f"Sort direction must be ASC or DESC, got {direction_raw!r}"
-                )
+                raise BasesParseError(f"Sort direction must be ASC or DESC, got {direction_raw!r}")
             clauses.append(
                 BasesSortClause(
                     field=prop,
-                    direction=SortDirection.ASC
-                    if direction_raw == "ASC"
-                    else SortDirection.DESC,
+                    direction=SortDirection.ASC if direction_raw == "ASC" else SortDirection.DESC,
                 )
             )
         return clauses
@@ -192,9 +231,7 @@ class BasesParser:
 
     # ---------------------------------------------------------------- filters
     @classmethod
-    def _parse_filters(
-        cls, filters: Any
-    ) -> tuple[str | None, ExpressionNode | None]:
+    def _parse_filters(cls, filters: Any) -> tuple[str | None, ExpressionNode | None]:
         """Walk the filters tree, returning (from_source, where_expression).
 
         ``file.inFolder("x")`` leaves are extracted as the FROM source and
@@ -218,9 +255,7 @@ class BasesParser:
         from_holder: dict[str, str],
     ) -> ExpressionNode | None:
         if depth > MAX_FILTER_DEPTH:
-            raise BasesLimitError(
-                f"Filter tree exceeds depth {MAX_FILTER_DEPTH}"
-            )
+            raise BasesLimitError(f"Filter tree exceeds depth {MAX_FILTER_DEPTH}")
 
         # Leaf: a string expression.
         if isinstance(node, str):
@@ -228,9 +263,7 @@ class BasesParser:
 
         if isinstance(node, dict):
             if len(node) != 1:
-                raise BasesParseError(
-                    "Filter conjunction must have exactly one of and/or/not"
-                )
+                raise BasesParseError("Filter conjunction must have exactly one of and/or/not")
             key, value = next(iter(node.items()))
             key_l = str(key).lower()
             if key_l not in ("and", "or", "not"):
@@ -239,18 +272,12 @@ class BasesParser:
             # not: accepts a single leaf/mapping OR a list (negate the AND).
             if key_l == "not":
                 if isinstance(value, list):
-                    inner = cls._combine(
-                        value, "AND", depth, leaf_count, from_holder
-                    )
+                    inner = cls._combine(value, "AND", depth, leaf_count, from_holder)
                 else:
-                    inner = cls._walk_filter(
-                        value, depth + 1, leaf_count, from_holder
-                    )
+                    inner = cls._walk_filter(value, depth + 1, leaf_count, from_holder)
                 if inner is None:
                     return None
-                return BinaryOpNode(
-                    operator="=", left=inner, right=LiteralNode(value=False)
-                )
+                return BinaryOpNode(operator="=", left=inner, right=LiteralNode(value=False))
 
             if not isinstance(value, list):
                 raise BasesParseError(f"'{key_l}:' must be a list of leaves")
@@ -292,9 +319,7 @@ class BasesParser:
     ) -> ExpressionNode | None:
         leaf_count[0] += 1
         if leaf_count[0] > MAX_FILTER_LEAVES:
-            raise BasesLimitError(
-                f"Filter tree exceeds {MAX_FILTER_LEAVES} leaves"
-            )
+            raise BasesLimitError(f"Filter tree exceeds {MAX_FILTER_LEAVES} leaves")
 
         # Extract file.inFolder("...") as the FROM source BEFORE leaf parsing
         # (inFolder is not a WHERE function — it maps to FROM, a path prefix).
@@ -311,7 +336,7 @@ class BasesParser:
         import re
 
         m = re.fullmatch(
-            r'\s*' + re.escape(_INFOLDER) + r'\(\s*(["\'])(.*?)\1\s*\)\s*',
+            r"\s*" + re.escape(_INFOLDER) + r'\(\s*(["\'])(.*?)\1\s*\)\s*',
             leaf,
         )
         if m:
@@ -323,9 +348,7 @@ class BasesParser:
     def _check_yaml_node_count(cls, data: Any) -> None:
         count = cls._count_nodes(data)
         if count > MAX_YAML_NODES:
-            raise BasesLimitError(
-                f"YAML structure exceeds {MAX_YAML_NODES} nodes"
-            )
+            raise BasesLimitError(f"YAML structure exceeds {MAX_YAML_NODES} nodes")
 
     @classmethod
     def _count_nodes(cls, obj: Any) -> int:
