@@ -31,6 +31,36 @@ MAX_RENDERED_ROWS = 500
 # ---------------------------------------------------------------------------
 MAX_FORMULA_LENGTH = 1_024
 
+# ---------------------------------------------------------------------------
+# Phase 2 formula *evaluation* bounds (ADR-004 §2.(d)) — anti-DoS for the
+# sandboxed tree-walk interpreter (formula_eval.py, US-003). These bound the
+# evaluation itself (not parsing): how deep the tree-walk may recurse, how many
+# total node evaluations a block may perform, and the wall-clock budget per
+# block. Crossing any of them makes the block inert with error_type "limit".
+#
+# PROVISOIRE — à recalibrer sur baseline réelle US-003/US-005 (ADR-004 §2.(d)
+# marks these three values as provisional; MAX_FORMULA_LENGTH above is figée).
+# ---------------------------------------------------------------------------
+MAX_FORMULA_RECURSION = 20  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
+MAX_FORMULA_ITERATIONS = 100_000  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
+FORMULA_BUDGET_MS = 1_000  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
+
+# Upper bound on the *result size* of any single amplifying operation
+# (str/list repetition `*`, str/list concatenation `+`). The projected size is
+# computed BEFORE allocation; crossing it raises BasesLimitError (block inert).
+# This closes the memory-allocation bomb class: the time/iteration/recursion
+# bounds above do NOT cap how large a single allocation may be, so a payload
+# like  s * 10**6  (1 KiB content × 1e6) would allocate ~1 GiB in one node and
+# OOM the MCP host before any other bound fires.
+#
+# Unit: characters for strings, elements for lists. 100_000 is chosen as a
+# generous ceiling for any legitimate display formula (a rendered cell far
+# below this stays usable) while keeping a single result allocation in the
+# ~100 KB / 100k-element range — orders of magnitude below an OOM. NOT derived
+# from a measured baseline.
+# PROVISOIRE — recalibrer (ADR-004 §2.(d))
+MAX_FORMULA_RESULT_SIZE = 100_000  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
+
 # Re-export for executor convenience.
 __all__ = [
     "MAX_BLOCK_BYTES",
@@ -40,6 +70,10 @@ __all__ = [
     "MAX_LEAF_EXPR_CHARS",
     "MAX_AST_DEPTH",
     "MAX_FORMULA_LENGTH",
+    "MAX_FORMULA_RECURSION",
+    "MAX_FORMULA_ITERATIONS",
+    "FORMULA_BUDGET_MS",
+    "MAX_FORMULA_RESULT_SIZE",
     "MAX_YAML_NODES",
     "MAX_VIEWS",
     "MAX_RENDERED_ROWS",
