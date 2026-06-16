@@ -224,10 +224,43 @@ class TestAdversarial:
             parse_formula('value.asFile().path.system("rm -rf /")')
 
     def test_depth_explosion_rejected_not_evaluated(self):
-        """A depth-explosion payload triggers a bound, never a stack overflow / eval."""
+        """A depth-explosion payload triggers the depth bound (type: limit).
+
+        Hardened (P1 rework): the DoS bound MUST produce BasesLimitError —
+        never BasesUnsupportedError, never RecursionError. The depth is bounded
+        DURING descent, before the Python call stack is exhausted (ADR-004
+        §2.(d)).
+        """
         expr = "(" * 200 + "1" + ")" * 200
-        with pytest.raises((BasesLimitError, BasesUnsupportedError)):
+        with pytest.raises(BasesLimitError):
             parse_formula(expr)
+
+    def test_nested_call_recursion_bounded_not_stack_overflow(self):
+        """Nested whitelisted calls past the depth bound → BasesLimitError.
+
+        Proof payload (P1): 100 nested ``lower(...)`` calls, length ~703, BELOW
+        MAX_FORMULA_LENGTH. The recursive descent through _parse_call_args /
+        _parse_formula must hit the parse-time depth guard and raise
+        BasesLimitError — NOT RecursionError (uncaught → error_type unexpected),
+        NOT BasesUnsupportedError. Regression test for the DoS recursion defect.
+        """
+        depth = 100
+        payload = "lower(" * depth + '"x"' + ")" * depth
+        assert len(payload) < MAX_FORMULA_LENGTH
+        with pytest.raises(BasesLimitError):
+            parse_formula(payload)
+
+    def test_long_property_chain_bounded(self):
+        """A property/field chain past the depth bound → BasesLimitError.
+
+        A long chain (≥100 links) must be rejected with the limit type, not
+        build an arbitrarily deep tree nor blow the recursive depth checker.
+        """
+        depth = 100
+        payload = "value" + ".path" * depth
+        assert len(payload) < MAX_FORMULA_LENGTH
+        with pytest.raises(BasesLimitError):
+            parse_formula(payload)
 
     def test_length_explosion_rejected(self):
         expr = "1" + (" + 1" * 5000)

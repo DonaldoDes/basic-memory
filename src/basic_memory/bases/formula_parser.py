@@ -35,6 +35,8 @@ Grammar (closed):
 """
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from basic_memory.bases.errors import (
     BasesLimitError,
@@ -145,6 +147,12 @@ class _Tokenizer:
             pos = m.end()
         self.i = 0
         self.paren_depth = 0
+        # Recursive-descent depth, bounded DURING parsing across ALL recursive
+        # voices (binops, calls, property chains, parentheses, lambdas) so a
+        # hostile payload can never exhaust the Python call stack before the
+        # bound fires (ADR-004 §2.(d); P1 DoS rework). _check_depth on the built
+        # tree remains as a coherence net, but detection happens here first.
+        self.descent_depth = 0
 
     def peek(self) -> str | None:
         return self.tokens[self.i] if self.i < len(self.tokens) else None
@@ -167,6 +175,26 @@ class _Tokenizer:
 
     def eof(self) -> bool:
         return self.i >= len(self.tokens)
+
+    @contextmanager
+    def descend(self) -> "Iterator[None]":
+        """Bound one level of recursive descent.
+
+        Increments the descent counter on entry and raises BasesLimitError the
+        moment it crosses MAX_AST_DEPTH — BEFORE recursing further — so no
+        recursive voice (binops, calls, property chains, parentheses, lambdas)
+        can blow the Python stack. Decremented on exit so sibling subtrees are
+        measured by their own depth, not the cumulative node count.
+        """
+        self.descent_depth += 1
+        if self.descent_depth > MAX_AST_DEPTH:
+            raise BasesLimitError(
+                f"Formula recursion exceeds depth {MAX_AST_DEPTH}"
+            )
+        try:
+            yield
+        finally:
+            self.descent_depth -= 1
 
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -229,11 +257,15 @@ def _check_depth(node: FormulaNode, depth: int) -> None:
 # Grammar
 # ---------------------------------------------------------------------------
 def _parse_formula(tz: _Tokenizer) -> FormulaNode:
-    # Lambda forms: "x => body"  or  "(x, y) => body"
-    lam = _try_parse_lambda(tz)
-    if lam is not None:
-        return lam
-    return _parse_or(tz)
+    # Bound the descent here: this is the single re-entry point used by call
+    # arguments (_parse_call_args -> _parse_formula). A guard here caps nested
+    # call recursion (lower(lower(... ))) before the stack is exhausted.
+    with tz.descend():
+        # Lambda forms: "x => body"  or  "(x, y) => body"
+        lam = _try_parse_lambda(tz)
+        if lam is not None:
+            return lam
+        return _parse_or(tz)
 
 
 def _try_parse_lambda(tz: _Tokenizer) -> FormulaNode | None:
@@ -333,7 +365,17 @@ def _parse_multiplicative(tz: _Tokenizer) -> FormulaNode:
 def _parse_postfix(tz: _Tokenizer) -> FormulaNode:
     """primary ( "." member call? )*  — property/method chains, whitelisted."""
     node = _parse_primary(tz)
+    # The chain loop is iterative, but each link nests an FPropChain one level
+    # deeper. Bound the cumulative chain depth DURING parsing so a long
+    # property/method chain (value.path.path...) is rejected with the limit type
+    # instead of building an arbitrarily deep tree (P1 DoS rework).
+    chain_depth = 0
     while tz.peek() == ".":
+        chain_depth += 1
+        if chain_depth > MAX_AST_DEPTH:
+            raise BasesLimitError(
+                f"Formula property chain exceeds depth {MAX_AST_DEPTH}"
+            )
         tz.next()  # "."
         member = tz.peek()
         if member is None or not _IDENT_RE.fullmatch(member):
@@ -358,13 +400,17 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
         raise BasesParseError("Expected operand, found end of formula")
 
     if tok == "(":
+        # Parenthesised sub-expression re-enters _parse_or directly (bypassing
+        # _parse_formula), so it carries its own descent guard. paren_depth is
+        # kept as a redundant, parenthesis-specific net.
         tz.paren_depth += 1
         if tz.paren_depth > MAX_AST_DEPTH:
             raise BasesLimitError(
                 f"Formula parenthesis nesting exceeds depth {MAX_AST_DEPTH}"
             )
         tz.next()
-        node = _parse_or(tz)
+        with tz.descend():
+            node = _parse_or(tz)
         if tz.next() != ")":
             raise BasesParseError("Unbalanced parentheses in formula")
         tz.paren_depth -= 1

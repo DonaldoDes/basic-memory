@@ -27,6 +27,7 @@ MAX_RENDERED_ROWS = 500
 # Phase 2 formula bounds (ADR-004 §2.(d)) — anti-DoS for formula parsing.
 # MAX_AST_DEPTH (20) above is reused as the formula AST depth bound (ADR-004
 # fixes formula AST depth = 20, identical to the Phase 1 value).
+# PROVISOIRE — à recalibrer lors de US-003/US-005 (ADR-004 §2.(d))
 # ---------------------------------------------------------------------------
 MAX_FORMULA_LENGTH = 1_024
 
