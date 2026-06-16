@@ -151,6 +151,69 @@ class FormulaEvaluator:
         if elapsed_ms > FORMULA_BUDGET_MS:
             raise BasesLimitError(f"Formula evaluation exceeds {FORMULA_BUDGET_MS}ms budget")
 
+    # ------------------------------------------- centralized size guard (d)
+    @staticmethod
+    def _guard_result_size(value: Any) -> Any:
+        """Refuse any sequence value whose length exceeds the size bound.
+
+        Pillar (d), allocation-bomb class — the CENTRALIZED net. The pre-
+        allocation projections (:meth:`_guard_amplifying_result`,
+        :meth:`_project_function_size`) stop the *known* amplifiers before they
+        allocate. This post-value guard is the catch-all that closes the WHOLE
+        class: every sequence (str/list/bytes/tuple) produced by *any* node —
+        operator, function call, or property-chain member, including future
+        whitelist entries — is checked here. A value over the bound raises
+        ``BasesLimitError`` (type "limit") so the block goes inert.
+
+        Non-sequence values (int/float/bool/None/objects) are returned
+        unchanged: they are intrinsically size-bounded and cannot OOM.
+        """
+        if isinstance(value, (str, bytes, list, tuple)) and len(value) > MAX_FORMULA_RESULT_SIZE:
+            raise BasesLimitError(
+                f"Formula result size {len(value)} exceeds {MAX_FORMULA_RESULT_SIZE}"
+            )
+        return value
+
+    # ------------------------------------ pre-allocation projection (funcs)
+    @staticmethod
+    def _project_function_size(fn_name: str, args: list[Any]) -> None:
+        """Project the result size of an amplifying FUNCTION BEFORE it runs.
+
+        Pillar (d): the centralized post-value guard above arrives *after* the
+        giant value has been materialised, so for functions that can amplify an
+        operand we project the size and refuse first — the huge value is never
+        built. Today the only amplifying whitelist function is ``replace``; any
+        future amplifying function MUST be added here (see the coverage
+        enumeration in the build attestation).
+
+        ``replace(s, old, new)`` grows when ``len(new) > len(old)``. Projected
+        result length = ``len(s) + count(old) * (len(new) - len(old))`` where
+        ``count(old)`` is the number of non-overlapping occurrences. We use the
+        exact projection (``s.count(old)``) — counting scans the existing string
+        but allocates nothing new; the amplified result is the only large
+        allocation and it is what we are preventing.
+        """
+        if fn_name != "replace":
+            return
+        s = _to_str(_arg(args, 0))
+        old = _to_str(_arg(args, 1))
+        new = _to_str(_arg(args, 2))
+        delta = len(new) - len(old)
+        if delta <= 0:
+            # Shrinking or same-size replacement cannot amplify.
+            return
+        if old == "":
+            # Python inserts ``new`` between every char and at both ends:
+            # projected = len(s) + (len(s) + 1) * len(new).
+            projected = len(s) + (len(s) + 1) * len(new)
+        else:
+            occurrences = s.count(old)
+            projected = len(s) + occurrences * delta
+        if projected > MAX_FORMULA_RESULT_SIZE:
+            raise BasesLimitError(
+                f"Formula result size {projected} exceeds {MAX_FORMULA_RESULT_SIZE} (replace)"
+            )
+
     # ----------------------------------------------- result-size guard (d)
     @staticmethod
     def _guard_amplifying_result(op: str, left: Any, right: Any) -> None:
@@ -170,8 +233,10 @@ class FormulaEvaluator:
             # str/list repetition: one operand is the sequence, the other the
             # (possibly attacker-controlled) repeat count.
             seq, count = (left, right) if isinstance(left, (str, list)) else (right, left)
-            if isinstance(seq, (str, list)) and isinstance(count, int) and not isinstance(
-                count, bool
+            if (
+                isinstance(seq, (str, list))
+                and isinstance(count, int)
+                and not isinstance(count, bool)
             ):
                 # Projected length = len(seq) * count, computed WITHOUT building
                 # the result. Negative/zero counts produce an empty sequence.
@@ -261,11 +326,11 @@ class FormulaEvaluator:
         self._guard_amplifying_result(op, left, right)
         try:
             if op == "+":
-                return left + right
+                return self._guard_result_size(left + right)
             if op == "-":
                 return left - right
             if op == "*":
-                return left * right
+                return self._guard_result_size(left * right)
             if op == "/":
                 if right == 0:
                     raise BasesExecutionError("Division by zero in formula")
@@ -298,12 +363,20 @@ class FormulaEvaluator:
                 f"Function '{node.fn}' is outside the closed formula whitelist"
             )
         args = [self.eval(a) for a in node.args]
+        # Project amplifying functions (e.g. replace) BEFORE they allocate
+        # (pillar (d)). Raises BasesLimitError on excess; the giant value is
+        # never built.
+        self._project_function_size(node.fn, args)
         try:
-            return fn(args)
+            result = fn(args)
         except BasesError:
             raise
         except Exception as exc:  # noqa: BLE001 — typed degradation
             raise BasesExecutionError(f"Function '{node.fn}' failed during evaluation") from exc
+        # Centralized net (pillar (d)): any sequence produced by ANY function —
+        # including future whitelist entries not individually projected — is
+        # size-bounded here.
+        return self._guard_result_size(result)
 
     # ----------------------------------------------------------- FPropChain
     def _eval_propchain(self, node: FPropChain) -> Any:
@@ -317,13 +390,16 @@ class FormulaEvaluator:
         receiver = self.eval(node.receiver)
         args = [self.eval(a) for a in node.args]
         try:
-            return member(receiver, args)
+            result = member(receiver, args)
         except BasesError:
             raise
         except Exception as exc:  # noqa: BLE001 — typed degradation
             raise BasesExecutionError(
                 f"Property-chain member '{node.member}' failed during evaluation"
             ) from exc
+        # Centralized net (pillar (d)): a member returning a sequence (path /
+        # name / basename) is size-bounded here.
+        return self._guard_result_size(result)
 
     # -------------------------------------------------------------- FLambda
     def _eval_lambda(self, node: FLambda) -> Callable[..., Any]:

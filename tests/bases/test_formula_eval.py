@@ -512,3 +512,146 @@ def test_nominal_small_str_add_still_works(amp_row):
 def test_nominal_small_list_concat_still_works(amp_row):
     node = FBinOp("+", FLiteral([1, 2]), FLiteral([3, 4]))
     assert evaluate_formula(node, amp_row) == [1, 2, 3, 4]
+
+
+# --------------------------------------------------------------------------- #
+# ADVERSARIAL — allocation-bomb via WHITELISTED FUNCTIONS (P0, 2nd rework).
+#
+# The first fix only bounded the *operators* (* / +). The same allocation-bomb
+# class stayed open through a whitelist FUNCTION: replace(field_200k, 'y',
+# 'Q'*400) projects to ~80 MiB in one node, and a doubling chain
+# replace(replace(..., 'y', 'yy') ...) compounds geometrically. This block
+# closes the WHOLE class:
+#   - amplifying functions (replace) projected BEFORE allocation,
+#   - a centralized post-value guard on every sequence produced by call /
+#     propchain / binop (the net that also catches future functions).
+# --------------------------------------------------------------------------- #
+from basic_memory.bases.schema import MAX_FORMULA_RESULT_SIZE  # noqa: E402
+
+
+@pytest.fixture
+def big_row() -> dict:
+    """A row whose string content is large (200k chars from note content)."""
+    return {
+        "s": "y" * 200_000,  # 200 KiB string, full of the 'y' substring
+        "small": "abyc",
+    }
+
+
+def test_adv_replace_amplification_is_limit(big_row):
+    # replace(s, 'y', 'Q'*400): each of the 200k 'y' becomes 400 chars ->
+    # projected ~80M chars. Must be refused as "limit" BEFORE allocation.
+    node = FCall(
+        "replace",
+        [FField("s"), FLiteral("y"), FBinOp("*", FLiteral("Q"), FLiteral(400))],
+    )
+    value, err = safe_evaluate_formula(node, big_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_replace_amplification_raises_limit_typed(big_row):
+    node = FCall(
+        "replace",
+        [FField("s"), FLiteral("y"), FLiteral("Q" * 400)],
+    )
+    with pytest.raises(BasesLimitError):
+        evaluate_formula(node, big_row)
+
+
+def test_adv_replace_doubling_chain_is_limit():
+    # Doubling chain: replace(x, 'y', 'yy') doubles the count of 'y' each level.
+    # Starting from a modest seed, a depth of ~15 explodes well past the bound.
+    # Must be refused as "limit" — never materialise the compounding result.
+    seed = "y" * 2_000
+    node: FormulaNode = FField("s")
+    for _ in range(15):
+        node = FCall("replace", [node, FLiteral("y"), FLiteral("yy")])
+    value, err = safe_evaluate_formula(node, {"s": seed})
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_replace_checked_before_allocation_runs(big_row):
+    # Ironclad proof the projection runs BEFORE the real str.replace: feed a
+    # receiver whose .replace explodes if ever invoked on an amplifying call.
+    class TripwireStr(str):
+        def replace(self, old, new, *args):  # pragma: no cover - must never run
+            raise AssertionError("real str.replace executed before size guard")
+
+    tripwire_row = {"s": TripwireStr("y" * 200_000)}
+    node = FCall("replace", [FField("s"), FLiteral("y"), FLiteral("Q" * 400)])
+    value, err = safe_evaluate_formula(node, tripwire_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_replace_amplification_does_not_allocate(big_row):
+    # Behavioural proxy: a real ~80 MiB allocation would be measurably slow; the
+    # projected-size guard keeps wall-clock tiny.
+    import time as _t
+
+    node = FCall("replace", [FField("s"), FLiteral("y"), FLiteral("Q" * 400)])
+    start = _t.monotonic()
+    value, err = safe_evaluate_formula(node, big_row)
+    elapsed_ms = (_t.monotonic() - start) * 1000.0
+    assert value is None
+    assert err == "limit"
+    assert elapsed_ms < 100.0
+
+
+@pytest.mark.parametrize(
+    "fn_name,args_builder",
+    [
+        # Every whitelist function that PRODUCES a sequence (str/list) is fed an
+        # oversize input; the centralized post-value guard must reject it as
+        # "limit". This is the generic net that closes the whole class, not just
+        # replace. Functions are driven through the AST so the guard path runs.
+        ("lower", lambda: [FField("big")]),
+        ("upper", lambda: [FField("big")]),
+        ("string", lambda: [FField("big")]),
+        ("dateformat", lambda: [FField("big")]),
+        ("date", lambda: [FField("big")]),
+        ("link", lambda: [FField("big")]),
+        ("default", lambda: [FField("big"), FLiteral("x")]),
+        ("if", lambda: [FLiteral(True), FField("big"), FLiteral("x")]),
+        ("min", lambda: [FField("big")]),
+        ("max", lambda: [FField("big")]),
+    ],
+)
+def test_adv_whitelist_function_returning_oversize_sequence_is_limit(fn_name, args_builder):
+    # A row field already over the bound (simulating an upstream large value):
+    # any function that returns it (or a derived sequence) as its result must be
+    # caught by the centralized post-value guard.
+    oversize = "z" * (MAX_FORMULA_RESULT_SIZE + 10)
+    node = FCall(fn_name, args_builder())
+    value, err = safe_evaluate_formula(node, {"big": oversize})
+    assert value is None, f"{fn_name} returned an oversize sequence instead of limit"
+    assert err == "limit", f"{fn_name} did not raise limit on oversize result"
+
+
+def test_adv_propchain_returning_oversize_sequence_is_limit():
+    # path/name/basename return substrings of the receiver; .path of an oversize
+    # value is itself oversize and must be caught by the post-value guard.
+    oversize = "z" * (MAX_FORMULA_RESULT_SIZE + 10)
+    node = FPropChain(FField("big"), "path", [])
+    value, err = safe_evaluate_formula(node, {"big": oversize})
+    assert value is None
+    assert err == "limit"
+
+
+def test_nominal_replace_small_still_works(big_row):
+    # Guard against over-blocking: a small, safe replace must still work.
+    node = FCall("replace", [FLiteral("ababab"), FLiteral("a"), FLiteral("X")])
+    assert evaluate_formula(node, big_row) == "XbXbXb"
+
+
+def test_nominal_replace_shrinking_still_works(big_row):
+    # replace that shrinks (new shorter than old) must never be blocked.
+    node = FCall("replace", [FField("s"), FLiteral("y"), FLiteral("")])
+    assert evaluate_formula(node, big_row) == ""
+
+
+def test_nominal_function_returning_in_bound_sequence_works():
+    node = FCall("upper", [FLiteral("hello")])
+    assert evaluate_formula(node, {}) == "HELLO"
