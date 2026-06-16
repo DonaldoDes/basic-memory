@@ -44,6 +44,7 @@ How that invariant is guaranteed (the 6 pillars of ADR-004 §2):
 """
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 from basic_memory.bases.errors import (
@@ -65,6 +66,7 @@ from basic_memory.bases.schema import (
     FORMULA_BUDGET_MS,
     MAX_FORMULA_ITERATIONS,
     MAX_FORMULA_RECURSION,
+    MAX_FORMULA_RESULT_SIZE,
 )
 from basic_memory.dataview.executor.field_resolver import FieldResolver
 
@@ -149,12 +151,59 @@ class FormulaEvaluator:
         if elapsed_ms > FORMULA_BUDGET_MS:
             raise BasesLimitError(f"Formula evaluation exceeds {FORMULA_BUDGET_MS}ms budget")
 
+    # ----------------------------------------------- result-size guard (d)
+    @staticmethod
+    def _guard_amplifying_result(op: str, left: Any, right: Any) -> None:
+        """Refuse an amplifying op whose *result* would exceed the size bound.
+
+        Pillar (d), allocation-bomb class: the iteration/recursion/time bounds
+        do NOT cap how large a *single* allocation may be. ``s * 10**6`` (1 KiB
+        content × 1e6) allocates ~1 GiB in one node and OOMs the host before any
+        other bound fires. So for the only two ops that can amplify an operand
+        (``*`` repetition, ``+`` concatenation of str/list), compute the
+        PROJECTED result size and raise BasesLimitError BEFORE the operation —
+        the giant value is never materialised.
+
+        Numeric ``*``/``+`` (int/float) does not amplify size and is ignored.
+        """
+        if op == "*":
+            # str/list repetition: one operand is the sequence, the other the
+            # (possibly attacker-controlled) repeat count.
+            seq, count = (left, right) if isinstance(left, (str, list)) else (right, left)
+            if isinstance(seq, (str, list)) and isinstance(count, int) and not isinstance(
+                count, bool
+            ):
+                # Projected length = len(seq) * count, computed WITHOUT building
+                # the result. Negative/zero counts produce an empty sequence.
+                if count > 0:
+                    projected = len(seq) * count
+                    if projected > MAX_FORMULA_RESULT_SIZE:
+                        raise BasesLimitError(
+                            f"Formula result size {projected} exceeds "
+                            f"{MAX_FORMULA_RESULT_SIZE} (repetition)"
+                        )
+        elif op == "+":
+            # str+str / list+list concatenation: projected size = sum of lengths.
+            if (isinstance(left, str) and isinstance(right, str)) or (
+                isinstance(left, list) and isinstance(right, list)
+            ):
+                projected = len(left) + len(right)
+                if projected > MAX_FORMULA_RESULT_SIZE:
+                    raise BasesLimitError(
+                        f"Formula result size {projected} exceeds "
+                        f"{MAX_FORMULA_RESULT_SIZE} (concatenation)"
+                    )
+
     # ------------------------------------------------------------- dispatch
     def eval(self, node: FormulaNode) -> Any:
+        # eval = evaluate AST node, PAS le builtin Python `eval`.
         """Evaluate a node. Explicit per-type dispatch, depth/iter/time bounded."""
         self._tick()
         self._depth += 1
-        if self._depth > MAX_FORMULA_RECURSION:
+        # Use >= so the guard fires exactly when the counter reaches the bound:
+        # depths 1..(MAX-1) are allowed, the MAX-th level is refused, and the
+        # message is accurate (no off-by-one between message and reached depth).
+        if self._depth >= MAX_FORMULA_RECURSION:
             raise BasesLimitError(
                 f"Formula evaluation exceeds recursion depth {MAX_FORMULA_RECURSION}"
             )
@@ -207,6 +256,9 @@ class FormulaEvaluator:
 
         left = self.eval(node.left)
         right = self.eval(node.right)
+        # Bound the PROJECTED result size of amplifying ops BEFORE allocating
+        # (pillar (d) — allocation-bomb class). Raises BasesLimitError on excess.
+        self._guard_amplifying_result(op, left, right)
         try:
             if op == "+":
                 return left + right
@@ -274,7 +326,7 @@ class FormulaEvaluator:
             ) from exc
 
     # -------------------------------------------------------------- FLambda
-    def _eval_lambda(self, node: FLambda):
+    def _eval_lambda(self, node: FLambda) -> Callable[..., Any]:
         """Compile a lambda into a Python callable over a CLOSED environment.
 
         The returned callable, when invoked with positional args, binds them to
@@ -323,7 +375,9 @@ _FUNCTIONS = {
     "replace": lambda a: _to_str(_arg(a, 0)).replace(_to_str(_arg(a, 1)), _to_str(_arg(a, 2))),
     "string": lambda a: _to_str(_arg(a, 0)),
     # --- Numeric ---
-    "round": lambda a: round(_arg(a, 0), int(_arg(a, 1, 0))),
+    # ndigits is capped to a sane range: a huge ndigits cannot drive an
+    # unbounded internal allocation (allocation-bomb class, ADR-004 §2.(d)).
+    "round": lambda a: round(_arg(a, 0), max(-323, min(323, int(_arg(a, 1, 0))))),
     "number": lambda a: float(_arg(a, 0)),
     "min": lambda a: min(a) if a else None,
     "max": lambda a: max(a) if a else None,

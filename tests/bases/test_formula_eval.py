@@ -240,16 +240,12 @@ def test_recursion_bound_raises_limit(row):
 def test_iteration_bound_raises_limit(row):
     from basic_memory.bases.schema import MAX_FORMULA_ITERATIONS
 
-    # A wide expression: many sibling additions, shallow depth, but huge node
-    # count must trip the iteration budget (not the recursion bound).
-    node: FormulaNode = FLiteral(0)
-    # Build left-leaning chain wide enough; recursion bound would fire first for
-    # a chain, so use a bounded-depth balanced tree via repeated small trees.
+    # Prime the evaluator at the iteration budget so the next eval trips the
+    # bound (not the recursion bound).
     evaluator = FormulaEvaluator(row)
     evaluator._iterations = MAX_FORMULA_ITERATIONS  # already at the budget
     with pytest.raises(BasesLimitError):
         evaluator.eval(FBinOp("+", FLiteral(1), FLiteral(1)))
-    assert node is not None
 
 
 def test_time_budget_raises_limit(row, monkeypatch):
@@ -367,3 +363,152 @@ def test_adv_asfile_path_tampered_field_stays_in_dataset(row, monkeypatch):
     # The virtual file echoes its string argument; it never opens anything.
     assert result == "/etc/passwd"
     assert opened == []
+
+
+# --------------------------------------------------------------------------- #
+# ADVERSARIAL — memory-allocation bombs (P0): result-size amplification must be
+# bounded BEFORE allocation. Every amplifying op (str/list ×/+) must raise
+# BasesLimitError without ever materialising the giant result.
+#
+# The tests assert size is checked *before* allocation by tripping the bound
+# with projected sizes that, if actually allocated, would consume gigabytes —
+# yet the tests run in milliseconds and never OOM. To make "no allocation
+# happened" deterministic, a tripwire monkeypatches the amplifying builtin
+# (str.__mul__ / list.__mul__ / str.__add__ / list.__add__ paths) is not
+# directly patchable, so we instead bound by projected size and verify the
+# raised error is a "limit" type (never a successful huge value).
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def amp_row() -> dict:
+    """A row whose content is attacker-controlled and moderately large."""
+    return {
+        "s": "A" * 1024,  # 1 KiB string from note content
+        "lst": list(range(100)),  # 100-element list from note content
+    }
+
+
+def _bytes_blob(n: int) -> str:
+    return "A" * n
+
+
+def test_adv_str_mul_int_amplification_is_limit(amp_row):
+    # row["s"] (1 KiB) * 10**6  -> projected 1 GiB. Must be refused as "limit"
+    # BEFORE allocating anything.
+    node = FBinOp("*", FField("s"), FLiteral(10**6))
+    value, err = safe_evaluate_formula(node, amp_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_str_mul_int_raises_limit_typed(amp_row):
+    node = FBinOp("*", FField("s"), FLiteral(10**6))
+    with pytest.raises(BasesLimitError):
+        evaluate_formula(node, amp_row)
+
+
+def test_adv_int_mul_str_amplification_is_limit(amp_row):
+    # Reversed operand order: literal int * content string.
+    node = FBinOp("*", FLiteral(10**6), FField("s"))
+    value, err = safe_evaluate_formula(node, amp_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_list_mul_int_amplification_is_limit(amp_row):
+    # row["lst"] (100 elems) * 10**6 -> projected 100M elements. Refused.
+    node = FBinOp("*", FField("lst"), FLiteral(10**6))
+    value, err = safe_evaluate_formula(node, amp_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_int_mul_list_amplification_is_limit(amp_row):
+    node = FBinOp("*", FLiteral(10**6), FField("lst"))
+    value, err = safe_evaluate_formula(node, amp_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_str_add_str_cumulative_is_limit(amp_row):
+    # Two large content strings concatenated. Build operands whose cumulative
+    # length exceeds the bound; refused BEFORE allocation.
+    big = FLiteral(_bytes_blob(80_000))
+    node = FBinOp("+", FField("s"), FBinOp("+", big, FLiteral(_bytes_blob(80_000))))
+    value, err = safe_evaluate_formula(node, amp_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_list_add_list_cumulative_is_limit(amp_row):
+    # Two large content lists concatenated -> cumulative cardinality bound.
+    big = FLiteral(list(range(80_000)))
+    node = FBinOp("+", big, FLiteral(list(range(80_000))))
+    value, err = safe_evaluate_formula(node, amp_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_adv_round_huge_ndigits_is_capped_or_limit(amp_row):
+    # round(x, ndigits) with an enormous ndigits can allocate a huge Decimal/
+    # string internally. The argument must be capped (or refused as limit),
+    # never allowed to drive an unbounded allocation.
+    node = FCall("round", [FLiteral(1.5), FLiteral(10**9)])
+    value, err = safe_evaluate_formula(node, amp_row)
+    # Either capped to a sane result, or refused as limit — never an OOM.
+    assert err in (None, "limit")
+    if err is None:
+        assert value == 1.5
+
+
+def test_amplification_bound_does_not_actually_allocate(amp_row, monkeypatch):
+    # Tripwire: the projected-size check must run BEFORE the real multiplication.
+    # We make the real multiplication observably catastrophic by capping the
+    # process via the projected-size guard. Here we assert wall-clock stays tiny
+    # and the result is a limit error (a real 1 GiB allocation would be slow and
+    # memory-heavy). This is a behavioural proxy for "checked before allocation".
+    import time as _t
+
+    node = FBinOp("*", FField("s"), FLiteral(10**6))
+    start = _t.monotonic()
+    value, err = safe_evaluate_formula(node, amp_row)
+    elapsed_ms = (_t.monotonic() - start) * 1000.0
+
+    assert value is None
+    assert err == "limit"
+    # If allocation had happened (1 GiB), this would be far slower; bounding
+    # before allocation keeps it well under the time budget.
+    assert elapsed_ms < 100.0
+
+
+def test_amplification_size_checked_before_multiplication_runs(amp_row):
+    # Ironclad proof that the projected-size guard runs BEFORE the real
+    # multiplication: feed a sequence whose __mul__ blows up if ever invoked.
+    # The guard must reject on projected len(seq)*count and the explosive
+    # __mul__ must NEVER be reached.
+    class TripwireStr(str):
+        def __mul__(self, other):  # pragma: no cover - must never run
+            raise AssertionError("real multiplication executed before size guard")
+
+        __rmul__ = __mul__
+
+    tripwire_row = {"s": TripwireStr("A" * 1024)}
+    node = FBinOp("*", FField("s"), FLiteral(10**6))
+    value, err = safe_evaluate_formula(node, tripwire_row)
+    assert value is None
+    assert err == "limit"
+
+
+def test_nominal_small_str_mul_still_works(amp_row):
+    # Guard against over-blocking: a small, safe multiplication must still work.
+    node = FBinOp("*", FLiteral("ab"), FLiteral(3))
+    assert evaluate_formula(node, amp_row) == "ababab"
+
+
+def test_nominal_small_str_add_still_works(amp_row):
+    node = FBinOp("+", FLiteral("foo"), FLiteral("bar"))
+    assert evaluate_formula(node, amp_row) == "foobar"
+
+
+def test_nominal_small_list_concat_still_works(amp_row):
+    node = FBinOp("+", FLiteral([1, 2]), FLiteral([3, 4]))
+    assert evaluate_formula(node, amp_row) == [1, 2, 3, 4]
