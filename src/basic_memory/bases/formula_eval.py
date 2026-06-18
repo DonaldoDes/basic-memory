@@ -61,6 +61,7 @@ from basic_memory.bases.formula_ast import (
     FLiteral,
     FormulaNode,
     FPropChain,
+    FThis,
 )
 from basic_memory.bases.schema import (
     FORMULA_BUDGET_MS,
@@ -80,12 +81,32 @@ class _VirtualFile:
     It carries only the string handed to ``asFile(...)`` (typically the row's
     ``file.path``). ``path``/``name``/``basename`` are computed by pure string
     operations — no ``open``, no ``os`` call, no I/O of any kind.
+
+    US-b (ADR-005 §Axe 2): when this object stands for the *row's own file*
+    (``file`` in a formula), it also carries the row's outlinks (``_outlinks``)
+    and any extra identity strings (``_identities`` — path + permalink). These
+    feed ``hasLink``: a pure membership test of the host identity against the
+    row's already-resolved outlinks. NEVER the filesystem, never a graph
+    recompute — the outlinks are read straight from the dataset row.
     """
 
-    __slots__ = ("_value",)
+    __slots__ = ("_value", "_outlinks", "_identities")
 
-    def __init__(self, value: Any):
+    def __init__(
+        self,
+        value: Any,
+        outlinks: list | None = None,
+        identities: list | None = None,
+    ):
         self._value = "" if value is None else str(value)
+        # Outlinks are a plain list of strings already present in the row — they
+        # are read, never computed. Defensive copy of a bounded list.
+        self._outlinks: list[str] = [str(x) for x in outlinks] if outlinks else []
+        # The set of strings that identify THIS file (for hasLink membership on
+        # the *target* side: a row may reference the host by path or permalink).
+        self._identities: list[str] = (
+            [str(x) for x in identities if x] if identities else [self._value]
+        )
 
     @property
     def path(self) -> str:
@@ -103,6 +124,40 @@ class _VirtualFile:
         if "." in leaf:
             return leaf.rsplit(".", 1)[0]
         return leaf
+
+    def has_link_to(self, target: "_VirtualFile") -> bool:
+        """True iff this row's outlinks reference the *target* file identity.
+
+        Pure membership test over the row's already-resolved outlinks against
+        the target's identity strings (path + permalink). No filesystem, no
+        global graph traversal, no recompute (ADR-005 §Axe 2 invariant). A row
+        with no outlinks (key absent) cannot match — it is simply empty.
+        """
+        if not isinstance(target, _VirtualFile):
+            return False
+        targets = set(target._identities)
+        return any(link in targets for link in self._outlinks)
+
+
+class _HostRef:
+    """The resolved value of ``this`` — a closed handle to the host note.
+
+    It exposes EXACTLY ONE member: ``file`` (the host's :class:`_VirtualFile`
+    identity). Any other member (``content``, ``frontmatter``, ...) is refused
+    by the closed member table — ``this`` is NOT a handle to reload the host
+    from disk nor to reference an arbitrary note (ADR-005 §Axe 2 invariant).
+    Constructed only from injected host metadata strings, never from the OS.
+    """
+
+    __slots__ = ("file",)
+
+    def __init__(self, host: dict[str, Any]):
+        path = host.get("path") or host.get("permalink") or ""
+        permalink = host.get("permalink")
+        # The host file's identity strings: both its path and permalink so a row
+        # that links by either form matches in hasLink.
+        identities = [v for v in (path, permalink) if v]
+        self.file = _VirtualFile(path, identities=identities or [path])
 
 
 # --------------------------------------------------------------------------- #
@@ -132,8 +187,14 @@ class FormulaEvaluator:
     is no dynamic dispatch, no ``eval``/``exec``, no ``getattr`` on content.
     """
 
-    def __init__(self, row: dict[str, Any]):
+    def __init__(self, row: dict[str, Any], host: dict[str, Any] | None = None):
         self.row = row
+        # US-b (ADR-005 §Axe 2): the host-note identity backing ``this``. A plain
+        # dict ({"path": ..., "permalink": ..., "title": ...}) injected from the
+        # caller via note_metadata. ``None`` when no host is wired → ``this``
+        # resolves to None and the block goes inert. NEVER note content, never a
+        # filesystem handle — only the identity strings.
+        self._host = host
         # Closed local environment for lambda params (pillar (b)). Empty at the
         # top level; populated only with bound parameters during a lambda call.
         self._env: dict[str, Any] = {}
@@ -286,10 +347,24 @@ class FormulaEvaluator:
                 return self._eval_propchain(node)
             if isinstance(node, FLambda):
                 return self._eval_lambda(node)
+            if isinstance(node, FThis):
+                return self._eval_this(node)
             # Unknown node type — never a dynamic fallback.
             raise BasesUnsupportedError(f"Unsupported formula node type: {type(node).__name__}")
         finally:
             self._depth -= 1
+
+    # ---------------------------------------------------------------- FThis
+    def _eval_this(self, node: FThis) -> Any:
+        """Resolve ``this`` to the host wrapper, or ``None`` with no host.
+
+        US-b (ADR-005 §Axe 2): bounded to the injected host identity. With no
+        host wired, ``this`` is ``None`` (the block goes inert downstream) —
+        never the current row, never an arbitrary note.
+        """
+        if not self._host:
+            return None
+        return _HostRef(self._host)
 
     # --------------------------------------------------------------- FField
     def _eval_field(self, node: FField) -> Any:
@@ -302,6 +377,11 @@ class FormulaEvaluator:
         name = node.name
         if name in self._env:
             return self._env[name]
+        # US-b: the bare ``file`` reference (receiver of ``file.hasLink(...)``)
+        # resolves to a _VirtualFile of the row carrying the row's outlinks — read
+        # straight from the dataset row, never the OS, never a graph recompute.
+        if name == "file":
+            return self._row_file()
         # Executor-projected rows carry file.* as a flat top-level key
         # (e.g. row["file.path"]); honour it first so asFile().path reads the
         # dataset value directly (US-003 spec). Then fall back to FieldResolver
@@ -309,6 +389,24 @@ class FormulaEvaluator:
         if name in self.row:
             return self.row[name]
         return FieldResolver.resolve_field(self.row, name)
+
+    def _row_file(self) -> "_VirtualFile":
+        """Build the row's own file object, carrying its dataset outlinks.
+
+        Reads ``file.path``/``file.outlinks`` (nested or flat shape) from the
+        row only. The outlinks are whatever the dataset provider already placed
+        on the row — this method NEVER opens a file nor recomputes links.
+        """
+        file_obj = self.row.get("file")
+        if isinstance(file_obj, dict):
+            path = file_obj.get("path", "")
+            outlinks = file_obj.get("outlinks") or []
+        else:
+            path = self.row.get("file.path") or self.row.get("path") or ""
+            outlinks = self.row.get("file.outlinks") or self.row.get("outlinks") or []
+        permalink = self.row.get("permalink")
+        identities = [v for v in (path, permalink) if v]
+        return _VirtualFile(path, outlinks=outlinks, identities=identities or [path])
 
     # --------------------------------------------------------------- FBinOp
     def _eval_binop(self, node: FBinOp) -> Any:
@@ -526,6 +624,33 @@ def _member_contains(receiver: Any, args: list[Any]) -> bool:
     return _to_str(_arg(args, 0)) in base
 
 
+def _member_file(receiver: Any, args: list[Any]) -> Any:
+    """``this.file`` — the host file identity (US-b / ADR-005 §Axe 2).
+
+    Only a ``_HostRef`` (the resolved ``this``) exposes ``.file``. Applied to
+    anything else (e.g. a None when no host is wired, or a content value) it
+    returns None — never ``getattr`` on the receiver, never a filesystem read.
+    """
+    if isinstance(receiver, _HostRef):
+        return receiver.file
+    return None
+
+
+def _member_haslink(receiver: Any, args: list[Any]) -> bool:
+    """``file.hasLink(target)`` — boolean, bounded to the row outlinks (US-b).
+
+    Pure membership test of the target identity against the row's
+    already-resolved outlinks (carried on the row's :class:`_VirtualFile`). No
+    filesystem access, no global graph traversal, no recompute (ADR-005 §Axe 2
+    invariant). A ``None`` target (e.g. ``this.file`` with no host wired) never
+    matches.
+    """
+    target = _arg(args, 0)
+    if not isinstance(receiver, _VirtualFile):
+        return False
+    return receiver.has_link_to(target)
+
+
 _MEMBERS = {
     "asFile": _member_asfile,
     "path": _member_path,
@@ -534,39 +659,51 @@ _MEMBERS = {
     "startsWith": _member_startswith,
     "endsWith": _member_endswith,
     "contains": _member_contains,
+    # US-b (ADR-005 §Axe 2): self-reference member + backlinks-as-boolean.
+    "file": _member_file,
+    "hasLink": _member_haslink,
 }
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def evaluate_formula(node: FormulaNode, row: dict[str, Any]) -> Any:
+def evaluate_formula(
+    node: FormulaNode, row: dict[str, Any], host: dict[str, Any] | None = None
+) -> Any:
     """Evaluate a formula AST against a dataset row (raises typed BasesError).
 
     Use this when the caller wants to handle the typed error explicitly. For the
     inert-block contract that never raises, use :func:`safe_evaluate_formula`.
+
+    ``host`` (US-b / ADR-005 §Axe 2): the host-note identity backing ``this``.
+    ``None`` when no host is wired → ``this`` resolves to ``None``.
 
     Raises:
         BasesUnsupportedError: unknown node, function or property-chain member.
         BasesLimitError: a recursion/iteration/time bound was exceeded.
         BasesExecutionError: an operation failed during evaluation.
     """
-    return FormulaEvaluator(row).eval(node)
+    return FormulaEvaluator(row, host=host).eval(node)
 
 
-def safe_evaluate_formula(node: FormulaNode, row: dict[str, Any]) -> tuple[Any, str | None]:
+def safe_evaluate_formula(
+    node: FormulaNode, row: dict[str, Any], host: dict[str, Any] | None = None
+) -> tuple[Any, str | None]:
     """Evaluate a formula, mapping any failure to ``(None, error_type)``.
 
     Pillar (e): this is the inert-block boundary. It NEVER raises — any
     exception (typed BasesError or unexpected) is converted to an ``error_type``
     so the MCP handler renders an inert block and never crashes.
 
+    ``host`` (US-b / ADR-005 §Axe 2): the host-note identity backing ``this``.
+
     Returns:
         ``(value, None)`` on success, ``(None, error_type)`` on failure, where
         ``error_type`` ∈ {parse, unsupported, limit, execution, unexpected}.
     """
     try:
-        return FormulaEvaluator(row).eval(node), None
+        return FormulaEvaluator(row, host=host).eval(node), None
     except Exception as exc:  # noqa: BLE001 — inert-block boundary, never crash
         return None, error_type_for(exc)
 

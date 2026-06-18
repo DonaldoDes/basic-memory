@@ -282,12 +282,27 @@ async def list_entities_for_dataview(
 
     notes = []
     for entity in all_entities:
+        # Outlinks for Bases file.hasLink(this.file) (US-b / ADR-005 §Axe 2).
+        # Sourced from the already eager-loaded outgoing relations (find_all
+        # loads Entity.outgoing_relations) — no extra query, no filesystem, no
+        # graph recompute. Each link is identified by the target permalink when
+        # resolved, else its raw to_name; both forms let hasLink match a host
+        # referenced by permalink or by name. Always a list (empty if none).
+        outlinks: list[str] = []
+        for rel in getattr(entity, "outgoing_relations", None) or []:
+            target_entity = getattr(rel, "to_entity", None)
+            if target_entity is not None and target_entity.permalink:
+                outlinks.append(target_entity.permalink)
+            if rel.to_name:
+                outlinks.append(rel.to_name)
+
         # Convert entity to note format expected by Dataview
         note = {
             "file": {
                 "path": entity.file_path,
                 "name": PathLib(entity.file_path).name,
                 "folder": str(PathLib(entity.file_path).parent),
+                "outlinks": outlinks,
             },
             "title": entity.title,
             "type": entity.note_type,

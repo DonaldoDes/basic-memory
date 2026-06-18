@@ -80,6 +80,21 @@ class FLambda(FormulaNode):
 
 
 @dataclass
+class FThis(FormulaNode):
+    """The self-reference ``this`` — the host note containing the base block.
+
+    Carries NO data of its own: it resolves at eval time to a closed host
+    wrapper that exposes ONLY ``this.file`` (the host's path/permalink identity),
+    bounded to the injected host metadata (ADR-005 §Axe 2, invariant: ``this`` is
+    bounded to the dataset + the host note, never a handle to reload the host
+    from disk nor to reference an arbitrary note). With no host injected, ``this``
+    resolves to ``None`` and the block goes inert downstream.
+    """
+
+    pass
+
+
+@dataclass
 class FBinOp(FormulaNode):
     """A binary operation.
 
@@ -100,4 +115,5 @@ __all__ = [
     "FPropChain",
     "FLambda",
     "FBinOp",
+    "FThis",
 ]

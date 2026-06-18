@@ -31,6 +31,28 @@
     filter depth 10, 50 leaves, 1024-char leaves, AST depth 20, 1000 YAML nodes,
     10 views, 500 rendered rows)
 
+- **M-Bases-P3 / US-b (Bases self-reference `this` + `file.hasLink`)**: the
+  Bases executor now resolves `this` (the host note containing the `base` block)
+  and the boolean filter `file.hasLink(this.file)`, reaching Obsidian parity for
+  the backlinks-panel pattern (design: ADR-005 §Axe 2).
+  - Host-note identity is wired end to end: `read_note` / `build_context` /
+    `search_notes` pass the note's own identity (path/permalink/title) to
+    `BasesIntegration.process_note(content, note_metadata=...)` → executor →
+    formula sandbox, exposing `this.file`.
+  - `file.hasLink(target)` is a boolean: true iff the candidate row has an
+    outlink to the target. Bounded to the dataset — it reads the row's outlinks
+    (now exposed on `file.outlinks` by the dataview dataset, sourced from the
+    already eager-loaded outgoing relations) — never a filesystem access, never
+    a global link-graph recompute.
+  - `this` is bounded to the dataset + the injected host identity: it exposes
+    only `this.file` (no `this.content`/`this.frontmatter`), cannot reference an
+    arbitrary note, and resolves to `None` when no host is wired (block inert).
+  - `file.backlinks` (the list form) is deliberately deferred out of v1 →
+    refused as unsupported (inert block).
+  - Continuity of the closed Phase 2 sandbox: no new unsandboxed evaluation
+    path, no `eval`/`exec`/`getattr` on note content. Blocks without `this`
+    render identically (transparent wiring seam).
+
 - **US-004**: New `bulk_edit_notes` MCP tool and
   `POST /v2/projects/{project_id}/knowledge/entities/bulk-edit` endpoint
   (spec: `specs/bulk-edit-notes/spec.md`)

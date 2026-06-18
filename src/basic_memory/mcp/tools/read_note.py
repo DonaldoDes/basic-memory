@@ -23,18 +23,50 @@ from basic_memory.dataview.integration import create_dataview_integration
 from basic_memory.bases.integration import create_bases_integration
 
 
-async def _enrich_with_bases(content: str, project_name: str, knowledge_client) -> str:
+def _host_identity_from_content(content: str, fallback_permalink: str | None) -> dict:
+    """Derive the host-note identity (US-b / ADR-005 §Axe 2) from the note.
+
+    Returns ``{"permalink": ..., "path": ..., "title": ...}`` read from the
+    note's own frontmatter (the host of any ``base`` block is the note itself).
+    A ``fallback_permalink`` (the resolved identifier) backstops a missing
+    frontmatter permalink. Pure parse of the content already in hand — no
+    filesystem access, no extra fetch.
+    """
+    permalink = fallback_permalink
+    path = None
+    title = None
+    try:
+        import frontmatter
+
+        post = frontmatter.loads(content)
+        meta = post.metadata or {}
+        permalink = meta.get("permalink") or fallback_permalink
+        path = meta.get("file_path") or meta.get("path")
+        title = meta.get("title")
+    except Exception:  # pragma: no cover - frontmatter parse is best-effort
+        pass
+    return {"permalink": permalink, "path": path, "title": title}
+
+
+async def _enrich_with_bases(
+    content: str, project_name: str, knowledge_client, note_metadata: dict | None = None
+) -> str:
     """Enrich note content with executed Bases (```base```) queries.
 
     Mirror of _enrich_with_dataview: detects ```base``` blocks, fetches the
     shared entity dataset once, renders each block, and appends a
     ``## Bases Query Results`` section. Any failure returns the original
     content unchanged (the note never breaks).
+
+    ``note_metadata`` (US-b / ADR-005 §Axe 2) is the host-note identity threaded
+    to ``process_note`` so ``this`` / ``file.hasLink(this.file)`` resolve. When
+    omitted it is derived from the note's own frontmatter.
     """
     try:
+        host_metadata = note_metadata or _host_identity_from_content(content, None)
         notes = await knowledge_client.list_entities_for_dataview()
         integration = create_bases_integration(notes_provider=lambda: notes)
-        bases_results = integration.process_note(content)
+        bases_results = integration.process_note(content, note_metadata=host_metadata)
 
         if not bases_results:
             return content
@@ -410,7 +442,10 @@ async def read_note(
                         )
                     if enable_bases:
                         content = await _enrich_with_bases(
-                            content, active_project.name, knowledge_client
+                            content,
+                            active_project.name,
+                            knowledge_client,
+                            note_metadata=_host_identity_from_content(content, entity_id),
                         )
                     return content
             except Exception as e:  # pragma: no cover
@@ -459,7 +494,12 @@ async def read_note(
                                 )
                             if enable_bases:
                                 content = await _enrich_with_bases(
-                                    content, active_project.name, knowledge_client
+                                    content,
+                                    active_project.name,
+                                    knowledge_client,
+                                    note_metadata=_host_identity_from_content(
+                                        content, entity_id
+                                    ),
                                 )
                             return content
                     except Exception as e:  # pragma: no cover

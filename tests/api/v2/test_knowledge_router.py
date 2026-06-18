@@ -849,6 +849,54 @@ async def test_list_entities_for_dataview_exposes_note_type(
 
 
 @pytest.mark.asyncio
+async def test_list_entities_for_dataview_exposes_outlinks(
+    client: AsyncClient,
+    v2_project_url,
+):
+    """US-b (ADR-005 §Axe 2): the dataview dataset must carry each note's outlinks.
+
+    file.hasLink(this.file) reads the row's outlinks (no filesystem, no graph
+    recompute). The endpoint must expose them on file.outlinks, sourced from the
+    already eager-loaded outgoing relations — so the executor can answer
+    backlinks-as-boolean without any extra I/O.
+    """
+    # Target note.
+    target = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={"title": "OutlinkTarget", "folder": "test", "content": "# Target\n\nBody."},
+    )
+    assert target.status_code == 200
+
+    # Source note linking to the target via a wikilink relation.
+    source = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "OutlinkSource",
+            "folder": "test",
+            "content": "# Source\n\n- relates_to [[OutlinkTarget]]\n",
+        },
+    )
+    assert source.status_code == 200
+
+    response = await client.get(f"{v2_project_url}/knowledge/entities/dataview")
+    assert response.status_code == 200, response.text
+    notes = response.json()
+
+    src_note = next((n for n in notes if n["title"] == "OutlinkSource"), None)
+    assert src_note is not None
+    # The file sub-dict must carry an outlinks list (possibly referencing the
+    # target by name/permalink). It is always present (empty list if none).
+    outlinks = src_note["file"].get("outlinks")
+    assert isinstance(outlinks, list)
+    assert any("OutlinkTarget" in str(link) for link in outlinks), outlinks
+
+    # A note with no outgoing links exposes an empty list, never a missing key.
+    tgt_note = next((n for n in notes if n["title"] == "OutlinkTarget"), None)
+    assert tgt_note is not None
+    assert isinstance(tgt_note["file"].get("outlinks"), list)
+
+
+@pytest.mark.asyncio
 async def test_entity_response_v2_has_api_version(
     client: AsyncClient, v2_project_url, entity_repository
 ):

@@ -41,7 +41,13 @@ class BasesIntegration:
     def process_note(
         self, note_content: str, note_metadata: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
-        """Process a note and execute all ```base``` blocks found in it."""
+        """Process a note and execute all ```base``` blocks found in it.
+
+        ``note_metadata`` (US-b / ADR-005 §Axe 2) is the host-note identity
+        (``{"path": ..., "permalink": ..., "title": ...}``) threaded end to end so
+        ``this`` / ``file.hasLink(this.file)`` resolve to the host. ``None``
+        leaves the seam inert — blocks without ``this`` render identically.
+        """
         blocks = self.detector.detect_blocks(note_content)
         if not blocks:
             return []
@@ -54,26 +60,29 @@ class BasesIntegration:
                 query_id=f"base-{idx}",
                 block_body=block.body,
                 line_number=block.start_line + 1,
+                note_metadata=note_metadata,
             )
             results.append(result)
         return results
 
     def _execute_block(
-        self, query_id: str, block_body: str, line_number: int
+        self,
+        query_id: str,
+        block_body: str,
+        line_number: int,
+        note_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         start_time = time.time()
 
         try:
             # Size bound first (anti-DoS): an oversized block is inert (limit).
             if len(block_body.encode("utf-8")) > MAX_BLOCK_BYTES:
-                raise BasesLimitError(
-                    f"Base block exceeds {MAX_BLOCK_BYTES} bytes"
-                )
+                raise BasesLimitError(f"Base block exceeds {MAX_BLOCK_BYTES} bytes")
 
             query = BasesParser.parse(block_body)
             notes = self._get_notes_for_query()
 
-            executor = BasesExecutor(notes)
+            executor = BasesExecutor(notes, host=note_metadata)
             result_markdown, rows = executor.render(query)
 
             execution_time_ms = int((time.time() - start_time) * 1000)
@@ -91,17 +100,13 @@ class BasesIntegration:
             }
 
         except BasesParseError as e:
-            return self._error_envelope(
-                query_id, block_body, line_number, e, "parse", start_time
-            )
+            return self._error_envelope(query_id, block_body, line_number, e, "parse", start_time)
         except BasesUnsupportedError as e:
             return self._error_envelope(
                 query_id, block_body, line_number, e, "unsupported", start_time
             )
         except BasesLimitError as e:
-            return self._error_envelope(
-                query_id, block_body, line_number, e, "limit", start_time
-            )
+            return self._error_envelope(query_id, block_body, line_number, e, "limit", start_time)
         except BasesExecutionError as e:
             return self._error_envelope(
                 query_id, block_body, line_number, e, "execution", start_time
@@ -158,9 +163,7 @@ class BasesIntegration:
     def _format_block_source(self, block_body: str) -> str:
         return f"```base\n{block_body}\n```"
 
-    def _extract_discovered_links(
-        self, rows: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _extract_discovered_links(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Extract note references from rendered rows for graph traversal."""
         links = []
         for row in rows:
@@ -182,11 +185,17 @@ class BasesIntegration:
         return links
 
     def execute_raw_block(
-        self, block_body: str, query_id: str = "base-1"
+        self,
+        block_body: str,
+        query_id: str = "base-1",
+        note_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Public API: execute a raw base block body (used by build_context)."""
         return self._execute_block(
-            query_id=query_id, block_body=block_body, line_number=0
+            query_id=query_id,
+            block_body=block_body,
+            line_number=0,
+            note_metadata=note_metadata,
         )
 
 

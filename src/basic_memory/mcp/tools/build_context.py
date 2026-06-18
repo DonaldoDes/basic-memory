@@ -378,8 +378,18 @@ async def build_context(
                             and BasesDetector.has_base_blocks(cast(str, primary.content))
                         ):
                             try:
+                                # US-b (ADR-005 §Axe 2): thread the host-note
+                                # identity (the primary result IS the host of its
+                                # own base blocks) so this / file.hasLink(this.file)
+                                # resolve. Identity = path/permalink/title only.
+                                host_metadata = {
+                                    "permalink": getattr(primary, "permalink", None),
+                                    "path": getattr(primary, "file_path", None),
+                                    "title": getattr(primary, "title", None),
+                                }
                                 results = bases_integration.process_note(
-                                    cast(str, primary.content)
+                                    cast(str, primary.content),
+                                    note_metadata=host_metadata,
                                 )
                                 section = "\n\n---\n## Bases Query Results\n\n"
                                 appended = section

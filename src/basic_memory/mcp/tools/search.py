@@ -1054,7 +1054,18 @@ async def search_notes(
                         content = getattr(search_result, "content", None)
                         if content:
                             try:
-                                bases_results = bases_integration.process_note(content)
+                                # US-b (ADR-005 §Axe 2): the search result IS the
+                                # host of its own base blocks — thread its identity
+                                # (path/permalink/title only) so this /
+                                # file.hasLink(this.file) resolve.
+                                host_metadata = {
+                                    "permalink": getattr(search_result, "permalink", None),
+                                    "path": getattr(search_result, "file_path", None),
+                                    "title": getattr(search_result, "title", None),
+                                }
+                                bases_results = bases_integration.process_note(
+                                    content, note_metadata=host_metadata
+                                )
                                 if bases_results:
                                     if not search_result.metadata:
                                         search_result.metadata = {}
