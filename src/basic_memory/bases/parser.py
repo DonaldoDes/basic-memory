@@ -177,7 +177,17 @@ class BasesParser:
         group_by = cls._parse_group_by(raw)
         flatten = cls._parse_flatten(raw.get("flatten"))
         summaries, summary_predicates = cls._parse_summaries(raw.get("summaries"), group_by)
-        agg_formulas = cls._parse_agg_formulas(raw.get("aggFormulas"), group_by)
+        agg_formulas, agg_predicates = cls._parse_agg_formulas(raw.get("aggFormulas"), group_by)
+        # A conditional aggregate (``count(predicate)`` / ``sum(predicate)``)
+        # written under ``aggFormulas:`` is semantically a per-group-row
+        # aggregate, NOT a post-aggregation cross-summary formula. Route it to
+        # the SAME predicate path as ``summaries:`` so the COMPLETE predicate
+        # (``or``/``and``/``not``) is evaluated per group row in the sandbox —
+        # never applied to a single evaluated boolean (the ``count(a or b)`` ==
+        # 1 bug). ``summaries:`` wins on a name collision (it is the canonical
+        # declaration site for conditional aggregates).
+        for name, spec in agg_predicates.items():
+            summary_predicates.setdefault(name, spec)
         aggregate_only = cls._parse_aggregate_flag(raw.get("aggregate"))
 
         return BasesView(
@@ -210,21 +220,36 @@ class BasesParser:
     @classmethod
     def _parse_agg_formulas(
         cls, agg_formulas: Any, group_by: BasesGroupBy | None
-    ) -> dict[str, "FormulaNode"]:
-        """Parse ``aggFormulas:`` — post-aggregation cross-summary formulas (US-d).
+    ) -> tuple[dict[str, "FormulaNode"], dict[str, tuple[str, "FormulaNode"]]]:
+        """Parse ``aggFormulas:`` into post-aggregation formulas + predicates (US-d).
 
-        Each value is a formula expression referencing summary names (e.g.
-        ``round(Done / Total * 100)``). It is compiled by ``parse_formula`` (the
-        closed-grammar parser) — any hostile construct (eval/exec/dunder/function
-        outside the whitelist) is REFUSED there (block inert). ``parse_formula``
-        also enforces ``MAX_FORMULA_LENGTH`` and ``MAX_AST_DEPTH`` (BP3-D-07: a
-        depth bomb is inert at parse). The AST is stored, never a runtime string.
+        Returns ``(formulas, predicates)``:
+          * ``formulas``: ``{name: FormulaNode}`` — TRUE post-aggregation
+            cross-summary formulas referencing summary names (e.g.
+            ``round(Done / Total * 100)``). Compiled by ``parse_formula`` (the
+            closed-grammar parser) — any hostile construct (eval/exec/dunder/
+            function outside the whitelist) is REFUSED there (block inert).
+            ``parse_formula`` also enforces ``MAX_FORMULA_LENGTH`` and
+            ``MAX_AST_DEPTH`` (BP3-D-07). The AST is stored, never a string.
+          * ``predicates``: ``{name: (fn_name, predicate_ast)}`` — the CONDITIONAL
+            aggregate form ``count(predicate)`` / ``sum(predicate)`` mistakenly
+            (but legitimately) written under ``aggFormulas`` instead of
+            ``summaries``. These are NOT post-aggregation arithmetic: ``count(a
+            or b)`` must count the group rows where the COMPLETE predicate holds,
+            so it is routed to the same per-row sandbox path as ``summaries``
+            predicates (fixes the ``count(a or b) == 1`` left-operand-only bug).
+
+        Disambiguation reuses the exact ``summaries`` logic: a bare aggregate
+        call ``fn(arg)`` whose ``arg`` is NOT a simple field (it contains an
+        operator/literal/call) and whose ``fn`` is ``count``/``sum`` is a
+        conditional aggregate. Anything else (arithmetic, nested formulas,
+        aggregates over a simple field) stays a post-aggregation formula.
 
         ``aggFormulas`` only make sense with a ``groupBy`` (they combine the
         group's summaries); standalone is unsupported.
         """
         if agg_formulas is None:
-            return {}
+            return {}, {}
         if group_by is None:
             raise BasesUnsupportedError(
                 "'aggFormulas:' requires a 'groupBy:' — post-aggregation formulas "
@@ -237,15 +262,51 @@ class BasesParser:
                 f"Base block declares more than {MAX_FORMULAS_PER_BLOCK} aggFormulas"
             )
         compiled: dict[str, "FormulaNode"] = {}
+        predicates: dict[str, tuple[str, "FormulaNode"]] = {}
         for name, expr in agg_formulas.items():
             if not isinstance(name, str):
                 raise BasesParseError("aggFormula names must be strings")
             if not isinstance(expr, str):
                 raise BasesParseError(f"aggFormula '{name}' must be a string expression")
-            # parse_formula raises BasesLimitError / BasesParseError /
-            # BasesUnsupportedError on any hostile or malformed input (inert).
+            cond = cls._try_conditional_aggregate(name, expr)
+            if cond is not None:
+                # count(predicate) / sum(predicate): same per-row sandbox path
+                # as summaries — the AST is compiled by parse_formula (closed
+                # grammar, hostile input refused, block inert).
+                predicates[name] = cond
+                continue
+            # True post-aggregation formula. parse_formula raises
+            # BasesLimitError / BasesParseError / BasesUnsupportedError on any
+            # hostile or malformed input (inert).
             compiled[name] = parse_formula(expr)
-        return compiled
+        return compiled, predicates
+
+    @classmethod
+    def _try_conditional_aggregate(
+        cls, name: str, expr: str
+    ) -> tuple[str, "FormulaNode"] | None:
+        """Return ``(fn_name, predicate_ast)`` iff ``expr`` is ``count``/``sum``
+        over a predicate; else ``None`` (the expression is a post-agg formula).
+
+        Pure syntactic disambiguation reusing ``_split_aggregate_call`` and
+        ``_is_simple_field`` — no evaluation here. A non-``fn(arg)`` shape, a
+        simple-field argument, or a function other than ``count``/``sum`` is NOT
+        a conditional aggregate. The predicate is compiled by ``parse_formula``
+        (closed grammar — hostile input refused, block inert), identical to the
+        ``summaries`` predicate path.
+        """
+        import re
+
+        m = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*", expr, re.DOTALL)
+        if m is None:
+            return None
+        fn_name = m.group(1)
+        arg = m.group(2).strip()
+        if fn_name not in ("count", "sum"):
+            return None
+        if cls._is_simple_field(arg):
+            return None
+        return (fn_name, parse_formula(arg))
 
     @classmethod
     def _parse_group_by(cls, raw: dict[str, Any]) -> BasesGroupBy | None:
