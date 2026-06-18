@@ -44,10 +44,17 @@ from basic_memory.bases.integration import create_bases_integration
 # ===========================================================================
 @dataclass
 class _Rel:
-    """A stand-in for an outgoing relation, like Entity.outgoing_relations."""
+    """A stand-in for an outgoing relation, like Entity.outgoing_relations.
+
+    ``relation_type`` mirrors ``Relation.relation_type`` in the real model
+    (``part_of`` / ``member_of`` / ``attendee`` / …). It defaults to ``links_to``
+    so pre-US-1 fixtures (which only exercised the union ``file.outlinks`` via
+    ``hasLink``) keep working unchanged. US-1 groups the dataset by this field.
+    """
 
     to_name: str
     to_permalink: str | None = None
+    relation_type: str = "links_to"
 
 
 @dataclass
@@ -74,17 +81,30 @@ def build_dataview_dataset(entities: list[_Entity]) -> list[dict]:
     """
     from pathlib import PurePosixPath
 
+    # Cap mirrors knowledge_router._MAX_RELATION_LINKS_PER_TYPE (US-1, ADR-006
+    # §Bornes anti-DoS) so the fixture is faithful to the provider's bound.
+    max_links_per_type = 500
+
     notes: list[dict] = []
     for entity in entities:
         # Outlinks for Bases file.hasLink(this.file): target permalink (when
         # resolved) AND raw to_name. Both forms let hasLink match a host
-        # referenced by permalink OR by name/title.
+        # referenced by permalink OR by name/title. ``by_type`` (US-1) groups the
+        # SAME relations by relation_type into list-of-links keys — byte-for-byte
+        # mirror of knowledge_router.list_entities_for_dataview.
         outlinks: list[str] = []
+        by_type: dict[str, list[str]] = {}
         for rel in entity.outgoing_relations:
+            rel_links: list[str] = []
             if rel.to_permalink:
-                outlinks.append(rel.to_permalink)
+                rel_links.append(rel.to_permalink)
             if rel.to_name:
-                outlinks.append(rel.to_name)
+                rel_links.append(rel.to_name)
+            outlinks.extend(rel_links)
+            if rel.relation_type and rel_links:
+                bucket = by_type.setdefault(rel.relation_type, [])
+                if len(bucket) < max_links_per_type:
+                    bucket.extend(rel_links[: max_links_per_type - len(bucket)])
 
         note: dict = {
             "file": {
@@ -101,6 +121,17 @@ def build_dataview_dataset(entities: list[_Entity]) -> list[dict]:
         for key, value in entity.metadata.items():
             if key not in note:
                 note[key] = value
+        # Per-type relation keys applied LAST: body relation canonical on a
+        # collision (NC-2), union of non-redundant frontmatter links.
+        for rel_type, rel_links in by_type.items():
+            merged = list(rel_links)
+            existing = note.get(rel_type)
+            if existing is not None and not isinstance(existing, dict):
+                extras = existing if isinstance(existing, list) else [existing]
+                for extra in extras:
+                    if isinstance(extra, str) and extra not in merged:
+                        merged.append(extra)
+            note[rel_type] = merged
         notes.append(note)
     return notes
 

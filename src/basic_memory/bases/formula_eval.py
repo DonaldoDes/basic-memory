@@ -667,8 +667,34 @@ def _member_endswith(receiver: Any, args: list[Any]) -> bool:
 
 
 def _member_contains(receiver: Any, args: list[Any]) -> bool:
+    """``receiver.contains(arg)`` — membership on a list, substring on a string.
+
+    US-1 / ADR-006 §Gap #1 (NC-1): when the receiver is a LIST-OF-LINKS (a body
+    relation exposed by the provider, e.g. ``part_of`` / ``member_of``), this is
+    an identity-aware MEMBERSHIP test — the tested element (a ``_VirtualFile``
+    host identity from ``this.file``, or a bare link string) matches iff one of
+    its identity strings is an exact element of the list. NEVER a substring of
+    the stringified list (which would false-match a permalink prefix). Pure set
+    membership over already-resolved dataset strings — no FS, no getattr, no
+    graph recompute (ADR-006 §Invariants).
+
+    For a STRING receiver the substring semantics is UNCHANGED (non-regression:
+    ``title.contains("foo")`` stays a substring test).
+    """
+    arg = _arg(args, 0)
+    # List-of-links receiver → identity-aware membership.
+    if isinstance(receiver, (list, tuple)):
+        # The set of strings that identify the element being tested.
+        if isinstance(arg, _VirtualFile):
+            needles = set(arg._identities)
+        else:
+            needles = {_to_str(arg)}
+        # Each list element is a link string already in the dataset. Membership
+        # is exact-string equality between an element and one of the needles.
+        return any(_to_str(elem) in needles for elem in receiver)
+    # String (or _VirtualFile path) receiver → substring, unchanged.
     base = receiver.path if isinstance(receiver, _VirtualFile) else _to_str(receiver)
-    return _to_str(_arg(args, 0)) in base
+    return _to_str(arg) in base
 
 
 def _member_file(receiver: Any, args: list[Any]) -> Any:
