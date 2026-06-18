@@ -55,6 +55,15 @@ from basic_memory.workspace_context import current_workspace_permalink_context
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge-v2"])
 
+# Anti-DoS bound (US-1 / ADR-006 §"Bornes anti-DoS", NC-4) — PROVISOIRE.
+# Caps the exposed cardinality of any single relation-type list-of-links key in
+# the Bases dataset so a note with a pathological number of relations of one
+# type cannot blow up the per-row dataset. Inherited from the P2/P3 render cap
+# (MAX_RENDERED_ROWS = 500); to be recalibrated on a measured baseline of real
+# relation cardinality (per the ADR). The union ``file.outlinks`` is naturally
+# bounded by the same source set of relations.
+_MAX_RELATION_LINKS_PER_TYPE = 500
+
 
 def _schedule_vector_sync_if_enabled(
     *,
@@ -288,13 +297,43 @@ async def list_entities_for_dataview(
         # graph recompute. Each link is identified by the target permalink when
         # resolved, else its raw to_name; both forms let hasLink match a host
         # referenced by permalink or by name. Always a list (empty if none).
+        # ``outlinks`` is the UNION of every outgoing relation (all types) —
+        # consumed by ``file.hasLink(this.file)`` (US-b / ADR-005 §Axe 2). It is
+        # UNCHANGED by US-1 (the per-type keys below are additive).
+        #
+        # ``by_type`` (US-1 / ADR-006 §Gap #1, Option A) groups the SAME
+        # already-resolved outgoing relations by ``relation_type`` (``part_of`` /
+        # ``member_of`` / ``attendee`` / …) so a body relation becomes a named
+        # list-of-links property requestable as ``part_of.contains(this.file)``.
+        # Each link carries the SAME identities as the union (target permalink
+        # when resolved AND raw ``to_name``/title) so a membership test against a
+        # ``_HostRef`` matches whichever form it linked by — consistent identity
+        # across ``file.outlinks`` and the per-type keys. No filesystem, no graph
+        # recompute: the relations are read straight from the eager-loaded
+        # ``outgoing_relations`` of the dataset row (ADR-006 §Invariants).
         outlinks: list[str] = []
+        by_type: dict[str, list[str]] = {}
         for rel in getattr(entity, "outgoing_relations", None) or []:
             target_entity = getattr(rel, "to_entity", None)
+            rel_links: list[str] = []
             if target_entity is not None and target_entity.permalink:
-                outlinks.append(target_entity.permalink)
+                rel_links.append(target_entity.permalink)
             if rel.to_name:
-                outlinks.append(rel.to_name)
+                rel_links.append(rel.to_name)
+            outlinks.extend(rel_links)
+            rel_type = getattr(rel, "relation_type", None)
+            if rel_type and rel_links:
+                # Anti-DoS bound (ADR-006 §"Bornes anti-DoS" / NC-4) — provisoire,
+                # héritée P2/P3 (MAX_RENDERED_ROWS = 500). The exposed cardinality
+                # of any single relation-type key is capped: a row with an
+                # absurd number of relations of one type cannot blow up the
+                # dataset. Excess links beyond the cap are dropped (the union
+                # ``outlinks`` is likewise naturally bounded by the same source).
+                bucket = by_type.setdefault(rel_type, [])
+                if len(bucket) < _MAX_RELATION_LINKS_PER_TYPE:
+                    bucket.extend(
+                        rel_links[: _MAX_RELATION_LINKS_PER_TYPE - len(bucket)]
+                    )
 
         # Convert entity to note format expected by Dataview
         note = {
@@ -334,6 +373,24 @@ async def list_entities_for_dataview(
             )
         except Exception as ex:
             logger.debug(f"Could not load frontmatter for {entity.permalink}: {ex}")
+
+        # US-1 / ADR-006 §Gap #1 (NC-2): expose each relation TYPE as a
+        # list-of-links key, applied LAST so the BODY relation is canonical on a
+        # collision with a homonym frontmatter key (the body relation is the
+        # basic-memory knowledge-graph source of truth). When the frontmatter
+        # value carries link(s) NOT already in the body relation, they are merged
+        # (union) so no non-redundant frontmatter link is silently lost; the body
+        # relation remains the authoritative head of the list. A frontmatter
+        # scalar homonym (a plain string) is overridden outright.
+        for rel_type, rel_links in by_type.items():
+            merged = list(rel_links)
+            existing = note.get(rel_type)
+            if existing is not None and not isinstance(existing, (dict,)):
+                extras = existing if isinstance(existing, list) else [existing]
+                for extra in extras:
+                    if isinstance(extra, str) and extra not in merged:
+                        merged.append(extra)
+            note[rel_type] = merged
 
         notes.append(note)
 

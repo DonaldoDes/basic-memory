@@ -4,6 +4,34 @@
 
 ### Features
 
+- **M-Bases-P4 / US-1 (body relations as requestable list-of-links properties)**:
+  basic-memory body relations (`part_of`, `member_of`, `attendee`, …) are now
+  queryable from a `base` block. The Dataview/Bases provider
+  (`knowledge_router.list_entities_for_dataview`) groups each note's
+  `outgoing_relations` by `relation_type` and exposes each type as a named
+  list-of-links key on the note dict; a filter such as
+  `part_of.contains(this.file)` renders an Area's children and
+  `member_of.contains(this.file)` an org-relation's members (design: ADR-006
+  §Gap #1, Option A).
+  - `contains` on a **list-of-links** receiver is now an identity-aware
+    **membership** test (the tested element against the host's `_HostRef`
+    identity set — permalink + `to_name`/title), **not** a substring of the
+    stringified list (NC-1): a permalink that is a prefix/superstring of a host
+    identity no longer false-matches. `contains` on a **string** is unchanged
+    (`title.contains("foo")` stays a substring test).
+  - `file.outlinks` (the union of all relations, consumed by `hasLink`) is
+    **unchanged** — the per-type keys are purely additive.
+  - On a collision between a frontmatter key and a homonym body relation, the
+    **body relation is canonical** (NC-2); non-redundant frontmatter links are
+    merged (union), a scalar homonym is overridden.
+  - No relation is promoted to frontmatter at sync — exposure is read-time only,
+    the vault is not mutated (continuity ADR-003/004/005).
+  - Exposed relation-type cardinality is bounded
+    (`_MAX_RELATION_LINKS_PER_TYPE = 500`, provisional — ADR-006 NC-4).
+  - Continuity of the closed Phase 2 sandbox: no new `eval`/`exec`/`getattr`/
+    `__import__` on note content; relations are read from the already-resolved
+    dataset, never the filesystem.
+
 - **M-Bases-P1 (Obsidian Bases executor, Phase 1 — parity-first)**: new
   `enable_bases` flag on `read_note` / `build_context` / `search_notes` renders
   ```` ```base ```` fenced blocks agent-side, mirroring `enable_dataview`
