@@ -72,6 +72,31 @@
 
 ### Bug Fixes
 
+- **M-Bases-P3 / live-path render fixes (Activity + Progression blocks)**: the
+  Phase 3 capabilities passed their *unit* tests but failed on the real
+  `read_note(enable_bases=True)` / `BasesIntegration.process_note` path because
+  the unit datasets were synthetic. Two engine fixes (design: ADR-005):
+  - `file.hasLink(this.file)` resolved to 0 for any backlink authored by the
+    host's **title**. The provider populates a row's outlinks from its outgoing
+    relations as the target permalink *and* the raw `to_name` (frequently a
+    `[[Title]]` wikilink), but the host identity was built from path+permalink
+    only. The host's **title** is now part of its identity, so a row linking by
+    title matches — unblocking the ~169 Activity blocks. Identity stays a
+    bounded set of dataset strings (no filesystem, no link-graph recompute).
+  - Conditional aggregate predicates (`count(status == "Done" or status ==
+    "Completed")`) raised `Trailing tokens 'or'`. The formula grammar only knew
+    the symbol operators `||`/`&&`/`!`; the word operators `or`/`and`/`not`
+    (used by Obsidian and the ~23 Progression blocks) are now first-class,
+    normalising to the existing closed binops with correct precedence
+    (`not` > `and` > `or`). They are reserved keywords (a bare `or` in operand
+    position is a syntax error). No new AST node, no new evaluation path — the
+    closed Phase 2 sandbox is unchanged (no `eval`/`exec`/`getattr`).
+  - A block without `file.inFolder` (`FROM ""`/global scan) already evaluated
+    over the whole dataset; an integration test now pins this on the live path.
+  - New integration + adversarial suites exercise the real provider-shaped
+    dataset through `process_note` (`tests/bases/test_live_path_integration.py`,
+    `tests/bases/test_live_path_adversarial.py`).
+
 - **Dataview rendering regression**: `read_note` / `build_context` returned raw,
   un-executed `dataview` blocks (no "Dataview Query Results" section) whenever
   `enable_dataview=True`.
