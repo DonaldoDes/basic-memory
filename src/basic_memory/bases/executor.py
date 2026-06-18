@@ -40,6 +40,10 @@ from basic_memory.dataview.executor.result_formatter import ResultFormatter
 # suffix is the key into ``BasesQuery.formulas``.
 _FORMULA_PREFIX = "formula."
 
+# Private row key carrying the source entity for sort-field resolution. Never a
+# rendered column (the formatter only emits the declared ``order`` columns).
+_SORT_SOURCE_KEY = "__sort_source__"
+
 
 class BasesExecutor:
     """Executes a parsed BasesQuery against a collection of entities."""
@@ -72,13 +76,22 @@ class BasesExecutor:
         rows = self._project(entities, query)
 
         if query.view.sort:
-            rows = self._apply_sort(rows, query.view.sort)
+            rows = self._apply_sort(rows, query.view.sort, query)
 
         # Hard cap then user LIMIT.
         rows = rows[:MAX_RENDERED_ROWS]
         if query.view.limit is not None:
             rows = rows[: query.view.limit]
 
+        return self._strip_internal_keys(rows)
+
+    @staticmethod
+    def _strip_internal_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop the private sort back-reference before rows cross the public
+        boundary (returned to the integration as ``results``). Sorting is done;
+        the source-entity carrier must never leak into the MCP output."""
+        for row in rows:
+            row.pop(_SORT_SOURCE_KEY, None)
         return rows
 
     def _pipeline_rows(self, query: BasesQuery) -> list[dict[str, Any]]:
@@ -165,6 +178,12 @@ class BasesExecutor:
                 "title": title,
                 "file.link": f"[[{title}]]",
                 "file.path": note.get("file", {}).get("path", note.get("path", "")),
+                # Private back-reference to the source entity so ``_apply_sort``
+                # can resolve a sort field that was NOT projected into ``order``
+                # (the displayName-aliased / off-order column sort bug). The key
+                # is dunder-prefixed; the formatter only renders the declared
+                # ``order`` columns, so this never leaks into the output.
+                _SORT_SOURCE_KEY: note,
             }
             # Project TABLE columns (key by alias when defined).
             for col in order:
@@ -210,20 +229,62 @@ class BasesExecutor:
         return col
 
     def _apply_sort(
-        self, rows: list[dict[str, Any]], sort_clauses: list[BasesSortClause]
+        self,
+        rows: list[dict[str, Any]],
+        sort_clauses: list[BasesSortClause],
+        query: BasesQuery | None = None,
     ) -> list[dict[str, Any]]:
+        """Stable multi-key sort, resolving the sort field through ALL the keys
+        a projected row may use for it.
+
+        The bug this guards: after projection a column is keyed by its
+        displayName ALIAS (``Date``), not the raw field (``date``), so a naive
+        ``row.get(clause.field)`` resolved ``None`` for every row and the stable
+        sort silently kept discovery order. The sort field is now resolved, in
+        order: (1) the raw field key, (2) the alias declared for it in
+        ``properties:`` (via ``_column_key``), (3) the underlying entity through
+        ``FieldResolver`` (so a field NOT in ``order`` still sorts). ``ASC``/
+        ``DESC`` both honoured via ``reverse``; a missing value sorts last.
+        """
         for clause in reversed(sort_clauses):
             field = clause.field
+            alias = self._column_key(query, field) if query is not None else field
             reverse = clause.direction == SortDirection.DESC
 
-            def sort_key(row, _field=field):
-                value = row.get(_field)
+            def sort_key(row, _field=field, _alias=alias):
+                value = self._resolve_sort_value(row, _field, _alias)
                 if value is None:
                     return (1, "")
                 return (0, value)
 
             rows = sorted(rows, key=sort_key, reverse=reverse)
         return rows
+
+    @staticmethod
+    def _resolve_sort_value(row: dict[str, Any], field: str, alias: str) -> Any:
+        """Resolve a row's value for a sort field across raw key, alias, entity.
+
+        Tried in order so the column sorts whether it was projected under its
+        raw name, under a displayName alias, or not projected at all:
+          1. the raw field key on the projected row,
+          2. the alias key (the displayName the column was projected under),
+          3. the source entity (``__sort_source__``) via ``FieldResolver`` —
+             covers a sort on a column absent from ``order``.
+        Returns ``None`` when none resolve (the row sorts last).
+        """
+        if field in row and row[field] is not None:
+            return row[field]
+        if alias != field and alias in row and row[alias] is not None:
+            return row[alias]
+        source = row.get(_SORT_SOURCE_KEY)
+        if isinstance(source, dict):
+            if field in source and source[field] is not None:
+                return source[field]
+            try:
+                return FieldResolver.resolve_field(source, field)
+            except Exception:
+                return None
+        return None
 
     # ------------------------------------------------------------------ render
     def render(self, query: BasesQuery) -> tuple[str, list[dict[str, Any]]]:
@@ -277,7 +338,7 @@ class BasesExecutor:
             # Project (and sort) the entities of this group for display.
             grp_rows = self._project(grp.rows, query)
             if query.view.sort:
-                grp_rows = self._apply_sort(grp_rows, query.view.sort)
+                grp_rows = self._apply_sort(grp_rows, query.view.sort, query)
             sections.append(self._render_group_section(query, grp, grp_rows))
             all_rows.extend(grp_rows)
 
@@ -425,7 +486,7 @@ class BasesExecutor:
             rows.append(row)
 
         if query.view.sort:
-            rows = self._apply_sort(rows, query.view.sort)
+            rows = self._apply_sort(rows, query.view.sort, query)
 
         # Header columns = the declared order (group field + summary names).
         if query.view.view_type == ViewType.TABLE:
