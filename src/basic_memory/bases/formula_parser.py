@@ -77,9 +77,10 @@ ALLOWED_FUNCTIONS = frozenset(
         "number",
         "min",
         "max",
-        # Date
+        # Date / duration (US-2 / ADR-006 §Gap #4)
         "dateformat",
         "date",
+        "dur",
         # Logic / default
         "default",
         "if",
@@ -497,6 +498,16 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
     if (tok.startswith('"') and tok.endswith('"')) or (tok.startswith("'") and tok.endswith("'")):
         tz.next()
         return FLiteral(value=_unquote(tok))
+
+    # Unary minus folded into a negative numeric literal. The tokenizer emits a
+    # bare ``-`` operator before a number in operand position (e.g. the count of
+    # ``dur(-2, "days")``); fold ``- <number>`` into a single negative FLiteral
+    # so a negative argument parses. Only a number may follow (``-x`` on a field
+    # is out of the closed grammar — refused as a trailing token downstream).
+    if tok == "-" and tz.peek2() is not None and _NUMBER_RE.fullmatch(tz.peek2() or ""):
+        tz.next()  # consume "-"
+        num = tz.expect_next()
+        return FLiteral(value=-(float(num) if "." in num else int(num)))
 
     # number literal
     if _NUMBER_RE.fullmatch(tok):

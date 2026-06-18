@@ -610,8 +610,11 @@ def test_adv_replace_amplification_does_not_allocate(big_row):
         ("lower", lambda: [FField("big")]),
         ("upper", lambda: [FField("big")]),
         ("string", lambda: [FField("big")]),
-        ("dateformat", lambda: [FField("big")]),
-        ("date", lambda: [FField("big")]),
+        # NOTE: ``date``/``dateformat`` are NO LONGER string passthroughs (US-2 /
+        # ADR-006 §Gap #4) — they parse a real date and return a bounded value or
+        # raise (inert). Their oversize-input degradation is covered separately in
+        # ``test_adv_date_oversize_garbage_is_inert`` below; they are not part of
+        # the "function that returns its oversize input as a sequence" class.
         ("link", lambda: [FField("big")]),
         ("default", lambda: [FField("big"), FLiteral("x")]),
         ("if", lambda: [FLiteral(True), FField("big"), FLiteral("x")]),
@@ -628,6 +631,25 @@ def test_adv_whitelist_function_returning_oversize_sequence_is_limit(fn_name, ar
     value, err = safe_evaluate_formula(node, {"big": oversize})
     assert value is None, f"{fn_name} returned an oversize sequence instead of limit"
     assert err == "limit", f"{fn_name} did not raise limit on oversize result"
+
+
+def test_adv_date_oversize_garbage_is_inert():
+    """date()/dateformat() fed an oversize non-date string degrade to inert.
+
+    Post US-2 (ADR-006 §Gap #4) ``date``/``dateformat`` parse a real date instead
+    of passing a string through. An oversize garbage value cannot parse → the
+    block goes inert (value None, typed error), never a crash and never an
+    oversize allocation propagated downstream.
+    """
+    oversize = "z" * (MAX_FORMULA_RESULT_SIZE + 10)
+    value, err = safe_evaluate_formula(FCall("date", [FField("big")]), {"big": oversize})
+    assert value is None
+    assert err in {"execution", "limit", "unexpected"}
+    value, err = safe_evaluate_formula(
+        FCall("dateformat", [FField("big"), FLiteral("yyyy-MM-dd")]), {"big": oversize}
+    )
+    assert value is None
+    assert err in {"execution", "limit", "unexpected"}
 
 
 def test_adv_propchain_returning_oversize_sequence_is_limit():

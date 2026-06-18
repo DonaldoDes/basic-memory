@@ -10,6 +10,7 @@ turns them into TABLE/LIST markdown. FROM is a path-prefix match on the entity
 dataset (``file.inFolder`` ≡ FROM) — never a filesystem access.
 """
 
+from datetime import datetime
 from typing import Any
 
 from basic_memory.bases.aggregate import (
@@ -55,6 +56,13 @@ class BasesExecutor:
         # no host is wired (block without ``this`` is non-regressed; a ``this``
         # block with no host degrades each leaf to falsy → empty result).
         self.host = host
+        # US-2 (ADR-006 §Gap #4): the reference instant for ``today``/``now`` in
+        # date formulas. Threaded from the host metadata when present (tests inject
+        # a fixed clock for determinism); ``None`` → the sandbox falls back to the
+        # real wall clock at evaluation time. Captured ONCE so every row of the
+        # block sees the same ``today``.
+        now_val = host.get("now") if isinstance(host, dict) else None
+        self._now: datetime | None = now_val if isinstance(now_val, datetime) else None
         self.field_resolver = FieldResolver()
         self.formatter = ResultFormatter()
 
@@ -151,7 +159,9 @@ class BasesExecutor:
         """
         # Leaf: delegate to the sandbox (host threaded for ``this``/``hasLink``).
         if isinstance(node, FormulaLeafNode):
-            value, _err = safe_evaluate_formula(node.formula, note, host=self.host)
+            value, _err = safe_evaluate_formula(
+                node.formula, note, host=self.host, now=self._now
+            )
             return bool(value)
 
         # Combination node: AND / OR (and the `= False` shape used by `not`).
@@ -201,7 +211,9 @@ class BasesExecutor:
                         # Column references a formula not declared in formulas:.
                         row[alias] = None
                         continue
-                    value, _err = safe_evaluate_formula(formula.ast, note, host=self.host)
+                    value, _err = safe_evaluate_formula(
+                        formula.ast, note, host=self.host, now=self._now
+                    )
                     row[alias] = value
                     continue
                 # Static column (Phase 1 path, unchanged).
@@ -403,7 +415,9 @@ class BasesExecutor:
             for name, (fn_name, predicate_ast) in predicates.items():
                 matches = 0
                 for row in grp.rows:
-                    value, _err = safe_evaluate_formula(predicate_ast, row, host=self.host)
+                    value, _err = safe_evaluate_formula(
+                        predicate_ast, row, host=self.host, now=self._now
+                    )
                     if value:
                         matches += 1
                 # count == sum(1 per truthy) for a predicate aggregate.
@@ -425,7 +439,7 @@ class BasesExecutor:
             summary_snapshot = dict(grp.summary)
             for name, formula_ast in agg_formulas.items():
                 value, _err = safe_evaluate_formula(
-                    formula_ast, summary_snapshot, host=self.host
+                    formula_ast, summary_snapshot, host=self.host, now=self._now
                 )
                 grp.summary[name] = value
         return aggregated

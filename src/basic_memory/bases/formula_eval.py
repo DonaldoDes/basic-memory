@@ -43,6 +43,7 @@ How that invariant is guaranteed (the 6 pillars of ADR-004 §2):
 (f) **YAML SafeLoader unchanged.** Out of scope here (Phase 1, ``yaml_loader``).
 """
 
+import datetime as _dt
 import time
 from collections.abc import Callable
 from typing import Any
@@ -66,6 +67,7 @@ from basic_memory.bases.formula_ast import (
 )
 from basic_memory.bases.schema import (
     FORMULA_BUDGET_MS,
+    MAX_DURATION_DAYS,
     MAX_FORMULA_ITERATIONS,
     MAX_FORMULA_RECURSION,
     MAX_FORMULA_RESULT_SIZE,
@@ -196,7 +198,12 @@ class FormulaEvaluator:
     is no dynamic dispatch, no ``eval``/``exec``, no ``getattr`` on content.
     """
 
-    def __init__(self, row: dict[str, Any], host: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        row: dict[str, Any],
+        host: dict[str, Any] | None = None,
+        now: _dt.datetime | None = None,
+    ):
         self.row = row
         # US-b (ADR-005 §Axe 2): the host-note identity backing ``this``. A plain
         # dict ({"path": ..., "permalink": ..., "title": ...}) injected from the
@@ -204,6 +211,12 @@ class FormulaEvaluator:
         # resolves to None and the block goes inert. NEVER note content, never a
         # filesystem handle — only the identity strings.
         self._host = host
+        # US-2 (ADR-006 §Gap #4): the reference instant backing the ``today`` /
+        # ``now`` keywords. INJECTED by the caller (tests pass a fixed clock for
+        # determinism; production passes the real wall clock). Captured ONCE here
+        # so every ``today``/``now`` within a single evaluation is consistent.
+        # ``None`` → fall back to the real clock at field-resolution time.
+        self._now = now
         # Closed local environment for lambda params (pillar (b)). Empty at the
         # top level; populated only with bound parameters during a lambda call.
         self._env: dict[str, Any] = {}
@@ -424,6 +437,15 @@ class FormulaEvaluator:
         name = node.name
         if name in self._env:
             return self._env[name]
+        # US-2 (ADR-006 §Gap #4): the date keywords ``today`` / ``now`` resolve to
+        # the INJECTED reference clock (deterministic in tests), NOT a row field
+        # and NOT the OS clock read inline. A row field of the same name takes
+        # precedence (checked above via env, below via row) so a note that
+        # genuinely carries a ``today`` field is never shadowed. ``today`` is the
+        # date at midnight; ``now`` the full datetime.
+        if name in ("today", "now") and name not in self.row:
+            ref = self._now if self._now is not None else _dt.datetime.now().astimezone()
+            return ref.date() if name == "today" else ref
         # US-b: the bare ``file`` reference (receiver of ``file.hasLink(...)``)
         # resolves to a _VirtualFile of the row carrying the row's outlinks — read
         # straight from the dataset row, never the OS, never a graph recompute.
@@ -466,6 +488,14 @@ class FormulaEvaluator:
 
         left = self.eval(node.left)
         right = self.eval(node.right)
+        # US-2 (ADR-006 §Gap #4): when ONE operand is a real date/datetime and the
+        # other is an ISO string (the ``file.mtime``/``file.ctime`` provider form),
+        # coerce the string to a date so ``file.mtime > date(today) - dur("7 days")``
+        # compares dates, not str-vs-date (which TypeErrors → inert). Coercion only
+        # fires for comparison/arithmetic ops and only when the OTHER side is
+        # already a date — it never turns two strings into dates (non-regression:
+        # ``title == "foo"`` stays a string compare).
+        left, right = self._coerce_date_operands(op, left, right)
         # Bound the PROJECTED result size of amplifying ops BEFORE allocating
         # (pillar (d) — allocation-bomb class). Raises BasesLimitError on excess.
         self._guard_amplifying_result(op, left, right)
@@ -498,6 +528,47 @@ class FormulaEvaluator:
             raise BasesExecutionError(f"Operator '{op}' failed on operands") from exc
         # Operator outside the whitelist — explicit refusal.
         raise BasesUnsupportedError(f"Unsupported binary operator: {op!r}")
+
+    # ----------------------------------------------- date coercion (US-2)
+    _DATE_OPS = frozenset({"-", "+", "<", ">", "<=", ">=", "==", "!="})
+
+    @classmethod
+    def _coerce_date_operands(cls, op: str, left: Any, right: Any) -> tuple[Any, Any]:
+        """Coerce a string operand to a date when the other side is a date.
+
+        Fires ONLY for date-relevant ops and ONLY when exactly one side is a real
+        ``date``/``datetime`` and the other is an ISO string — turning a provider
+        ``file.mtime`` string into a comparable date. When the string is not a
+        valid date it is left unchanged (the op then degrades to None via the
+        binop's typed-exception handler). To avoid the Python ``date`` vs
+        ``datetime`` TypeError, a ``datetime`` is narrowed to its ``.date()`` when
+        compared/combined with a plain ``date``. Two non-dates pass through
+        untouched (non-regression: ordinary string/number ops unchanged).
+        """
+        if op not in cls._DATE_OPS:
+            return left, right
+        left_is_date = isinstance(left, (_dt.date, _dt.datetime))
+        right_is_date = isinstance(right, (_dt.date, _dt.datetime))
+        # Coerce the bare string side to a date when the other is a date.
+        if left_is_date and isinstance(right, str):
+            coerced = _coerce_to_date(right)
+            if coerced is not None:
+                right, right_is_date = coerced, True
+        elif right_is_date and isinstance(left, str):
+            coerced = _coerce_to_date(left)
+            if coerced is not None:
+                left, left_is_date = coerced, True
+        # Normalise date vs datetime mismatch to plain dates (only when both are
+        # date-like; never touches a timedelta on the RHS of date ± dur).
+        if left_is_date and right_is_date:
+            l_is_dt = isinstance(left, _dt.datetime)
+            r_is_dt = isinstance(right, _dt.datetime)
+            if l_is_dt != r_is_dt:
+                if l_is_dt:
+                    left = left.date()
+                if r_is_dt:
+                    right = right.date()
+        return left, right
 
     # ---------------------------------------------------------------- FCall
     def _eval_call(self, node: FCall) -> Any:
@@ -585,6 +656,154 @@ def _arg(args: list[Any], i: int, default: Any = None) -> Any:
     return args[i] if i < len(args) else default
 
 
+# --------------------------------------------------------------------------- #
+# Date / duration sandbox helpers (US-2 / ADR-006 §Gap #4).
+#
+# These are pure, closed objects audited like every other whitelist entry: they
+# build/parse stdlib ``datetime`` values from already-evaluated arguments and
+# never touch the OS clock directly (the clock is the INJECTED ``now``, resolved
+# through the ``today``/``now`` field keywords — see ``_eval_field``). No eval,
+# no exec, no getattr; ``dateformat`` maps a closed set of Luxon/Dataview tokens
+# to ``strftime`` directives. Anti-DoS: a duration whose magnitude exceeds
+# ``MAX_DURATION_DAYS`` is refused (BasesLimitError → inert block) so a
+# pathological ``dur(1e12, "days")`` allocates nothing and never overflows.
+# --------------------------------------------------------------------------- #
+
+# Unit → (timedelta kwarg, days-per-unit) for the duration magnitude bound.
+_DUR_UNITS = {
+    "day": ("days", 1.0),
+    "days": ("days", 1.0),
+    "week": ("weeks", 7.0),
+    "weeks": ("weeks", 7.0),
+    "hour": ("hours", 1.0 / 24.0),
+    "hours": ("hours", 1.0 / 24.0),
+    "minute": ("minutes", 1.0 / 1440.0),
+    "minutes": ("minutes", 1.0 / 1440.0),
+    "second": ("seconds", 1.0 / 86400.0),
+    "seconds": ("seconds", 1.0 / 86400.0),
+}
+
+# Closed Luxon/Dataview → strftime token map for dateformat. Ordered longest
+# first so multi-char tokens are matched before their single-char prefixes.
+_DATEFORMAT_TOKENS = [
+    ("yyyy", "%Y"),
+    ("MM", "%m"),
+    ("dd", "%d"),
+    ("HH", "%H"),
+    ("mm", "%M"),
+    ("ss", "%S"),
+]
+
+
+def _make_dur(args: list[Any]) -> _dt.timedelta:
+    """Build a ``timedelta`` from ``dur("7 days")`` or ``dur(7, "days")``.
+
+    Both Dataview-faithful forms are accepted. The magnitude is bounded
+    (``MAX_DURATION_DAYS``): a huge or hugely-negative count raises
+    BasesLimitError so the block goes inert — the timedelta is never built.
+    An unknown unit or unparseable spec raises BasesExecutionError (inert).
+    """
+    a0 = _arg(args, 0)
+    a1 = _arg(args, 1)
+    if a1 is not None:
+        # Two-arg form: dur(<number>, "<unit>").
+        try:
+            count = float(a0)
+        except (TypeError, ValueError) as exc:
+            raise BasesExecutionError(f"dur() count is not numeric: {a0!r}") from exc
+        unit = _to_str(a1).strip().lower()
+    else:
+        # One-arg string form: dur("7 days").
+        spec = _to_str(a0).strip()
+        parts = spec.split()
+        if len(parts) != 2:
+            raise BasesExecutionError(f"dur() spec must be '<n> <unit>': {spec!r}")
+        try:
+            count = float(parts[0])
+        except ValueError as exc:
+            raise BasesExecutionError(f"dur() count is not numeric: {parts[0]!r}") from exc
+        unit = parts[1].lower()
+    if unit not in _DUR_UNITS:
+        raise BasesExecutionError(f"dur() unknown unit: {unit!r}")
+    kwarg, days_per_unit = _DUR_UNITS[unit]
+    # Bound the magnitude BEFORE constructing the timedelta (anti-DoS).
+    if abs(count * days_per_unit) > MAX_DURATION_DAYS:
+        raise BasesLimitError(
+            f"Duration magnitude exceeds {MAX_DURATION_DAYS} days bound"
+        )
+    return _dt.timedelta(**{kwarg: count})
+
+
+def _coerce_to_date(value: Any) -> _dt.date | _dt.datetime | None:
+    """Coerce an already-evaluated value into a date/datetime, or None.
+
+    Accepts a ``date``/``datetime`` as-is (the ``today``/``now`` keywords and
+    nested ``date()`` calls already produce these) and parses an ISO-8601 string
+    (the ``file.mtime``/``file.ctime`` provider form). Anything else → None.
+    Never raises — the caller decides whether None is inert or falsy.
+    """
+    if isinstance(value, (_dt.date, _dt.datetime)):
+        return value
+    if isinstance(value, str) and value:
+        text = value.strip()
+        # A date-only string (no time component) → a plain ``date`` so that
+        # ``date("2026-06-10")`` is a date, not a midnight datetime. A string
+        # carrying a time ("T" or ":") → a full ``datetime``.
+        has_time = "T" in text or ":" in text
+        if not has_time:
+            try:
+                return _dt.date.fromisoformat(text)
+            except ValueError:
+                return None
+        try:
+            return _dt.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _make_date(args: list[Any]) -> _dt.date | _dt.datetime:
+    """``date(x)`` — build a real date from ``today``/``now`` (already resolved)
+    or an ISO string. An unparseable value raises BasesExecutionError (inert)."""
+    value = _arg(args, 0)
+    coerced = _coerce_to_date(value)
+    if coerced is None:
+        raise BasesExecutionError(f"date() cannot parse value: {value!r}")
+    return coerced
+
+
+def _dateformat(args: list[Any]) -> str:
+    """``dateformat(value, "pattern")`` — format a date with a closed token map.
+
+    ``value`` is coerced to a date/datetime (a ``date()`` result or a raw ISO
+    string). Tokens (yyyy/MM/dd/HH/mm/ss) map to ``strftime`` directives; any
+    other literal text in the pattern is preserved verbatim (an unknown token is
+    therefore rendered as-is — graceful degradation, never a crash). A value that
+    is not a date raises BasesExecutionError (inert)."""
+    value = _arg(args, 0)
+    pattern = _to_str(_arg(args, 1))
+    coerced = _coerce_to_date(value)
+    if coerced is None:
+        raise BasesExecutionError(f"dateformat() value is not a date: {value!r}")
+    # Translate the closed token set to strftime, leaving every other character
+    # verbatim. Longest tokens first (see _DATEFORMAT_TOKENS order).
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        matched = False
+        for token, directive in _DATEFORMAT_TOKENS:
+            if pattern.startswith(token, i):
+                out.append(coerced.strftime(directive))
+                i += len(token)
+                matched = True
+                break
+        if not matched:
+            out.append(pattern[i])
+            i += 1
+    return "".join(out)
+
+
 _FUNCTIONS = {
     # --- Text ---
     "lower": lambda a: _to_str(_arg(a, 0)).lower(),
@@ -602,9 +821,11 @@ _FUNCTIONS = {
     "number": lambda a: float(_arg(a, 0)),
     "min": lambda a: min(a) if a else None,
     "max": lambda a: max(a) if a else None,
-    # --- Date (string passthrough in the sandbox; no OS clock access) ---
-    "dateformat": lambda a: _to_str(_arg(a, 0)),
-    "date": lambda a: _to_str(_arg(a, 0)),
+    # --- Date / duration (US-2 / ADR-006 §Gap #4). Real datetime arithmetic;
+    # the clock is the INJECTED `now` (today/now keywords), never os.time. ---
+    "dateformat": _dateformat,
+    "date": _make_date,
+    "dur": _make_dur,
     # --- Logic / default ---
     "default": lambda a: _arg(a, 0) if _arg(a, 0) is not None else _arg(a, 1),
     "if": lambda a: _arg(a, 1) if _arg(a, 0) else _arg(a, 2),
@@ -742,7 +963,10 @@ _MEMBERS = {
 # Public API
 # --------------------------------------------------------------------------- #
 def evaluate_formula(
-    node: FormulaNode, row: dict[str, Any], host: dict[str, Any] | None = None
+    node: FormulaNode,
+    row: dict[str, Any],
+    host: dict[str, Any] | None = None,
+    now: _dt.datetime | None = None,
 ) -> Any:
     """Evaluate a formula AST against a dataset row (raises typed BasesError).
 
@@ -752,16 +976,22 @@ def evaluate_formula(
     ``host`` (US-b / ADR-005 §Axe 2): the host-note identity backing ``this``.
     ``None`` when no host is wired → ``this`` resolves to ``None``.
 
+    ``now`` (US-2 / ADR-006 §Gap #4): the reference instant for ``today``/``now``.
+    ``None`` → the real wall clock. Tests inject a fixed clock for determinism.
+
     Raises:
         BasesUnsupportedError: unknown node, function or property-chain member.
         BasesLimitError: a recursion/iteration/time bound was exceeded.
         BasesExecutionError: an operation failed during evaluation.
     """
-    return FormulaEvaluator(row, host=host).eval(node)
+    return FormulaEvaluator(row, host=host, now=now).eval(node)
 
 
 def safe_evaluate_formula(
-    node: FormulaNode, row: dict[str, Any], host: dict[str, Any] | None = None
+    node: FormulaNode,
+    row: dict[str, Any],
+    host: dict[str, Any] | None = None,
+    now: _dt.datetime | None = None,
 ) -> tuple[Any, str | None]:
     """Evaluate a formula, mapping any failure to ``(None, error_type)``.
 
@@ -770,13 +1000,14 @@ def safe_evaluate_formula(
     so the MCP handler renders an inert block and never crashes.
 
     ``host`` (US-b / ADR-005 §Axe 2): the host-note identity backing ``this``.
+    ``now`` (US-2 / ADR-006 §Gap #4): the reference instant for ``today``/``now``.
 
     Returns:
         ``(value, None)`` on success, ``(None, error_type)`` on failure, where
         ``error_type`` ∈ {parse, unsupported, limit, execution, unexpected}.
     """
     try:
-        return FormulaEvaluator(row, host=host).eval(node), None
+        return FormulaEvaluator(row, host=host, now=now).eval(node), None
     except Exception as exc:  # noqa: BLE001 — inert-block boundary, never crash
         return None, error_type_for(exc)
 
