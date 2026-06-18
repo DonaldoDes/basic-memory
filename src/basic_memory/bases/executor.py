@@ -352,9 +352,19 @@ class BasesExecutor:
             # synthetic row IS the group's summary dict, so summary names resolve
             # as fields (FieldResolver/row lookup in _eval_field). Division by
             # zero degrades to None (safe_evaluate maps the sandbox exception).
+            #
+            # ORDER INDEPENDENCE (US-e hardening, ADR-005 §Axe 4): every
+            # aggFormula evaluates against the SAME immutable snapshot of the
+            # summaries computed BEFORE this loop (plain + conditional only).
+            # Without the frozen snapshot, a later aggFormula could resolve an
+            # earlier aggFormula's output as a summary, making the result depend
+            # on declaration order. The snapshot excludes the agg-formula outputs,
+            # so aggFormulas never see one another (an aggFormula referencing
+            # another's name degrades to None — an undeclared summary).
+            summary_snapshot = dict(grp.summary)
             for name, formula_ast in agg_formulas.items():
                 value, _err = safe_evaluate_formula(
-                    formula_ast, dict(grp.summary), host=self.host
+                    formula_ast, summary_snapshot, host=self.host
                 )
                 grp.summary[name] = value
         return aggregated
