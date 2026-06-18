@@ -14,10 +14,10 @@ from basic_memory.bases.errors import (
     BasesUnsupportedError,
     BasesLimitError,
 )
+from basic_memory.bases.filter_leaf import FormulaLeafNode
+from basic_memory.bases.formula_ast import FBinOp, FCall, FField, FLiteral, FPropChain
 from basic_memory.dataview.ast import (
     BinaryOpNode,
-    FieldNode,
-    FunctionCallNode,
     LiteralNode,
 )
 
@@ -128,7 +128,14 @@ views:
 
 
 # ---------------------------------------------------------------------------
-# BASES-05 / BASES-06 — leaf grammar + compilation to Dataview AST
+# BASES-05 / BASES-06 — leaf grammar + compilation
+#
+# US-a (M-Bases-P3, ADR-005 §Axe 1) CONTRACT CHANGE: a filter leaf is no longer
+# compiled to a Dataview AST node by the deprecated leaf_parser. It is routed to
+# the Phase 2 formula sandbox (formula_parser) and wrapped in a FormulaLeafNode
+# carrying a typed *formula* AST. The FROM/WHERE/and/or/not STRUCTURE is
+# unchanged: AND/OR/NOT combinators stay Dataview BinaryOpNode; only the leaves
+# are FormulaLeafNode. These tests assert the NEW contract.
 # ---------------------------------------------------------------------------
 class TestLeafCompilation:
     def _where_of(self, leaf: str):
@@ -141,65 +148,82 @@ views:
         )
         return query.where
 
-    def test_binary_eq_normalized(self):
+    def test_leaf_is_formula_leaf_node(self):
         node = self._where_of('status == "Active"')
-        assert isinstance(node, BinaryOpNode)
-        assert node.operator == "="  # == normalized to =
-        assert isinstance(node.left, FieldNode)
-        assert node.left.field_name == "status"
-        assert isinstance(node.right, LiteralNode)
-        assert node.right.value == "Active"
+        assert isinstance(node, FormulaLeafNode)
+        # The wrapped formula AST is an equality binary op (==, not normalised).
+        assert isinstance(node.formula, FBinOp)
+        assert node.formula.op == "=="
+        assert isinstance(node.formula.left, FField)
+        assert node.formula.left.name == "status"
+        assert isinstance(node.formula.right, FLiteral)
+        assert node.formula.right.value == "Active"
 
     def test_not_equal(self):
         node = self._where_of('status != "Done"')
-        assert node.operator == "!="
+        assert isinstance(node, FormulaLeafNode)
+        assert node.formula.op == "!="
 
     def test_comparison_operators(self):
         for op_in in ["<", ">", "<=", ">="]:
             node = self._where_of(f"priority {op_in} 3")
-            assert node.operator == op_in
-            assert node.right.value == 3
+            assert isinstance(node, FormulaLeafNode)
+            assert node.formula.op == op_in
+            assert node.formula.right.value == 3
 
-    def test_and_normalized(self):
-        node = self._where_of('status == "Active" && priority < 3')
-        assert isinstance(node, BinaryOpNode)
-        assert node.operator == "AND"
+    def test_and_keeps_dataview_binop_structure(self):
+        # Combination via the `and:` mapping keeps the Dataview BinaryOpNode
+        # structure; the operands are FormulaLeafNode leaves.
+        query = BasesParser.parse(
+            'filters:\n  and:\n    - status == "Active"\n    - priority < 3\nviews:\n  - type: list\n'
+        )
+        assert isinstance(query.where, BinaryOpNode)
+        assert query.where.operator == "AND"
+        assert isinstance(query.where.left, FormulaLeafNode)
+        assert isinstance(query.where.right, FormulaLeafNode)
 
-    def test_or_normalized(self):
-        node = self._where_of('status == "A" || status == "B"')
-        assert node.operator == "OR"
+    def test_or_keeps_dataview_binop_structure(self):
+        query = BasesParser.parse(
+            'filters:\n  or:\n    - status == "A"\n    - status == "B"\nviews:\n  - type: list\n'
+        )
+        assert isinstance(query.where, BinaryOpNode)
+        assert query.where.operator == "OR"
 
-    def test_not_unary(self):
-        # !contains(...) — negation compiles around the comparison.
-        # Quoted because YAML treats a leading '!' as a tag indicator.
-        node = self._where_of('"!status.contains(\\"x\\")"')
-        # represented as (contains(...) = False); just ensure no crash + node present
-        assert node is not None
+    def test_not_wraps_leaf_in_equality_false(self):
+        # `not:` normalises to (leaf = False): a Dataview `=` BinaryOpNode whose
+        # left is the FormulaLeafNode and right is LiteralNode(False).
+        query = BasesParser.parse(
+            'filters:\n  not:\n    - status == "Active"\nviews:\n  - type: list\n'
+        )
+        assert isinstance(query.where, BinaryOpNode)
+        assert query.where.operator == "="
+        assert isinstance(query.where.left, FormulaLeafNode)
+        assert isinstance(query.where.right, LiteralNode)
+        assert query.where.right.value is False
 
     def test_method_form_function(self):
-        # status.contains("x") -> FunctionCallNode("contains", [FieldNode(status), Literal("x")])
+        # status.contains("dev") -> FormulaLeafNode wrapping a property-chain.
         node = self._where_of('status.contains("dev")')
-        assert isinstance(node, FunctionCallNode)
-        assert node.function_name == "contains"
-        assert isinstance(node.arguments[0], FieldNode)
-        assert node.arguments[0].field_name == "status"
-        assert node.arguments[1].value == "dev"
+        assert isinstance(node, FormulaLeafNode)
+        assert isinstance(node.formula, FPropChain)
+        assert node.formula.member == "contains"
 
     def test_global_form_function(self):
         node = self._where_of('contains(status, "dev")')
-        assert isinstance(node, FunctionCallNode)
-        assert node.function_name == "contains"
-        assert node.arguments[0].field_name == "status"
+        assert isinstance(node, FormulaLeafNode)
+        assert isinstance(node.formula, FCall)
+        assert node.formula.fn == "contains"
 
     def test_boolean_and_null_literals(self):
         node = self._where_of("archived == true")
-        assert node.right.value is True
+        assert node.formula.right.value is True
         node2 = self._where_of("archived == null")
-        assert node2.right.value is None
+        assert node2.formula.right.value is None
 
     def test_dotted_field_ref(self):
         node = self._where_of('file.name == "x"')
-        assert node.left.field_name == "file.name"
+        assert isinstance(node, FormulaLeafNode)
+        assert node.formula.left.name == "file.name"
 
 
 # ---------------------------------------------------------------------------
@@ -291,21 +315,41 @@ views:
 """
             )
 
-    def test_property_chain_in_filter_rejected(self):
-        with pytest.raises(BasesUnsupportedError):
-            BasesParser.parse(
-                """
-filters: value.asFile().path == "x"
+    def test_property_chain_in_filter_now_accepted(self):
+        # CONTRACT CHANGE (US-a, ADR-005 §Axe 1): property chains in filters were
+        # rejected in Phase 1 (4-function leaf_parser); they are now ROUTED to
+        # the formula sandbox and resolved through the closed whitelisted member
+        # dispatch (asFile/path/name/...). A valid chain compiles, no longer
+        # rejected.
+        query = BasesParser.parse(
+            """
+filters: asFile(file.path).path == "x"
 views:
   - type: list
 """
-            )
+        )
+        assert query.where is not None
 
-    def test_unknown_function_rejected(self):
+    def test_link_function_now_accepted_in_filter(self):
+        # CONTRACT CHANGE (US-a): ``link`` is one of the 18 whitelisted formula
+        # functions and is now available in filter position (parity filter =
+        # formula = Obsidian).
+        query = BasesParser.parse(
+            """
+filters: link(file.name) == "x"
+views:
+  - type: list
+"""
+        )
+        assert query.where is not None
+
+    def test_genuinely_unknown_function_still_rejected(self):
+        # A function outside the closed 18-function whitelist remains rejected
+        # (block inert) — the security boundary is preserved.
         with pytest.raises(BasesUnsupportedError):
             BasesParser.parse(
                 """
-filters: link(file.name) == "x"
+filters: frobnicate(file.name) == "x"
 views:
   - type: list
 """
