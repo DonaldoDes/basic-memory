@@ -41,6 +41,21 @@ MAX_GROUP_BY_GROUPS = 500
 MAX_FLATTEN_CARDINALITY = 100
 
 # ---------------------------------------------------------------------------
+# Phase 3 aggregate-only bound (US-d / ADR-005 §Axe 4) — PROVISOIRE (NC-4).
+#
+# MAX_AGG_ONLY_GROUPS: maximum number of distinct groups an *aggregate-only*
+#   view (``aggregate: true`` — one row per group, no items) may render. Unlike
+#   the grouped item view (``MAX_GROUP_BY_GROUPS``, which TRUNCATES + marker),
+#   an aggregate-only view over the bound is made INERT (BasesLimitError ->
+#   error_type "limit"): the aggregate-only table is the per-milestone
+#   Progression surface, where a silent truncation would mislead a reader into
+#   thinking the rollup is complete. Inert + visible error is safer than a
+#   partial rollup. Value mirrors MAX_GROUP_BY_GROUPS (500) — recalibrer sur
+#   baseline réelle (NC-4, ADR-005 §Axe 4).
+# ---------------------------------------------------------------------------
+MAX_AGG_ONLY_GROUPS = 500
+
+# ---------------------------------------------------------------------------
 # Phase 2 formula bounds (ADR-004 §2.(d)) — anti-DoS for formula parsing.
 # MAX_AST_DEPTH (20) above is reused as the formula AST depth bound (ADR-004
 # fixes formula AST depth = 20, identical to the Phase 1 value).
@@ -103,6 +118,7 @@ __all__ = [
     "MAX_RENDERED_ROWS",
     "MAX_GROUP_BY_GROUPS",
     "MAX_FLATTEN_CARDINALITY",
+    "MAX_AGG_ONLY_GROUPS",
     "ViewType",
     "BasesSortClause",
     "BasesFormula",
@@ -175,6 +191,25 @@ class BasesView:
     # aggregate outside the whitelist makes the block inert (unsupported). Never
     # an evaluated string — a closed dict-dispatch over pure list functions.
     summaries: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # Phase 3 (US-d / ADR-005 §Axe 4) — CONDITIONAL aggregates. A summary whose
+    # argument is a *predicate expression* (e.g. ``count(status == "Done")``)
+    # rather than a plain field. The predicate is compiled to a formula AST by
+    # ``parse_formula`` (closed grammar) and evaluated in the Phase 2 SANDBOX per
+    # row of the group — count/sum of the rows whose predicate is truthy. Never
+    # eval/exec. Keyed by output_name → (aggregate_fn_name, predicate_ast).
+    summary_predicates: dict[str, tuple[str, "FormulaNode"]] = field(default_factory=dict)
+    # Phase 3 (US-d / ADR-005 §Axe 4) — POST-AGGREGATION formulas (cross-summary
+    # arithmetic). Keyed by output_name → formula AST referencing summary names
+    # by identifier (e.g. ``round(Done / Total * 100)``). Evaluated in the Phase 2
+    # sandbox AFTER the group summaries are computed, against a synthetic row =
+    # the group's summary dict. Division by zero degrades the cell to None (the
+    # sandbox raises BasesExecutionError on ``/0`` → safe_evaluate maps to None).
+    agg_formulas: dict[str, "FormulaNode"] = field(default_factory=dict)
+    # Phase 3 (US-d / ADR-005 §Axe 4) — aggregate-only view flag. When True the
+    # view renders ONE row per group (the summary/agg-formula values), WITHOUT
+    # the group's row-items — distinct from the Phase 2 grouped view that renders
+    # items + a summary line.
+    aggregate_only: bool = False
 
 
 @dataclass

@@ -15,6 +15,7 @@ from typing import Any
 from basic_memory.bases.aggregate import (
     AGGREGATE_WHITELIST,
     AggregatedGroup,
+    GroupResult,
     aggregate,
     flatten,
     group_by,
@@ -23,12 +24,14 @@ from basic_memory.bases.errors import BasesExecutionError
 from basic_memory.bases.filter_leaf import FormulaLeafNode
 from basic_memory.bases.formula_eval import safe_evaluate_formula
 from basic_memory.bases.schema import (
+    MAX_AGG_ONLY_GROUPS,
     MAX_FLATTEN_CARDINALITY,
     MAX_RENDERED_ROWS,
     BasesQuery,
     BasesSortClause,
     ViewType,
 )
+from basic_memory.bases.errors import BasesLimitError
 from basic_memory.dataview.ast import BinaryOpNode, ExpressionNode, LiteralNode, SortDirection
 from basic_memory.dataview.executor.field_resolver import FieldResolver
 from basic_memory.dataview.executor.result_formatter import ResultFormatter
@@ -233,6 +236,8 @@ class BasesExecutor:
         ``MAX_GROUP_BY_GROUPS`` groups exist (ADR-004 §2.(d)).
         """
         if query.view.group_by is not None:
+            if query.view.aggregate_only:
+                return self._render_aggregate_only(query)
             return self._render_grouped(query)
 
         rows = self.select(query)
@@ -264,7 +269,7 @@ class BasesExecutor:
 
         # GROUP BY and aggregate operate on entities (frontmatter/file.* present).
         group_result = group_by(entities, group_by_clause.field)
-        aggregated = aggregate(group_result, query.view.summaries, AGGREGATE_WHITELIST)
+        aggregated = self._aggregate_groups(group_result, query)
 
         sections: list[str] = []
         all_rows: list[dict[str, Any]] = []
@@ -300,3 +305,122 @@ class BasesExecutor:
 
         lines.append(self._render_flat(query, grp_rows))
         return "\n\n".join(lines)
+
+    # ----------------------------------------------- Phase 3 aggregation (US-d)
+    def _aggregate_groups(
+        self, group_result: "GroupResult", query: BasesQuery
+    ) -> list["AggregatedGroup"]:
+        """Compute each group's full summary: plain + conditional + post-agg.
+
+        Pipeline per group (US-d / ADR-005 §Axe 4):
+          1. plain summaries (Phase 2 ``aggregate`` over the closed whitelist).
+          2. CONDITIONAL aggregates (``count``/``sum`` over a predicate): the
+             predicate AST is evaluated in the Phase 2 SANDBOX
+             (``safe_evaluate_formula``) per group row; count = #truthy rows,
+             sum = Σ(1 per truthy row). The sandbox NEVER eval/exec/getattr; a
+             per-row predicate error degrades that row to falsy (not counted).
+          3. POST-AGGREGATION formulas (cross-summary arithmetic): each formula
+             AST is evaluated in the sandbox against a SYNTHETIC row = the
+             group's summary dict (so ``Done``/``Total`` resolve to the computed
+             summary values). Division by zero raises ``BasesExecutionError`` in
+             the sandbox → ``safe_evaluate_formula`` maps it to ``None`` (cell
+             degraded, block still renders — BP3-D-03 invariant).
+
+        Steps 2 and 3 run THROUGH the audited Phase 2 sandbox — no new
+        unsandboxed evaluation path is introduced (ADR-005 §Axe 5).
+        """
+        # Step 1: plain summaries via the closed-whitelist Phase 2 aggregate.
+        aggregated = aggregate(group_result, query.view.summaries, AGGREGATE_WHITELIST)
+
+        predicates = query.view.summary_predicates
+        agg_formulas = query.view.agg_formulas
+        if not predicates and not agg_formulas:
+            return aggregated
+
+        for grp in aggregated:
+            # Step 2: conditional aggregates over predicates (sandboxed).
+            for name, (fn_name, predicate_ast) in predicates.items():
+                matches = 0
+                for row in grp.rows:
+                    value, _err = safe_evaluate_formula(predicate_ast, row, host=self.host)
+                    if value:
+                        matches += 1
+                # count == sum(1 per truthy) for a predicate aggregate.
+                grp.summary[name] = matches
+
+            # Step 3: post-aggregation cross-summary formulas (sandboxed). The
+            # synthetic row IS the group's summary dict, so summary names resolve
+            # as fields (FieldResolver/row lookup in _eval_field). Division by
+            # zero degrades to None (safe_evaluate maps the sandbox exception).
+            for name, formula_ast in agg_formulas.items():
+                value, _err = safe_evaluate_formula(
+                    formula_ast, dict(grp.summary), host=self.host
+                )
+                grp.summary[name] = value
+        return aggregated
+
+    def aggregate_only(self, query: BasesQuery) -> list["AggregatedGroup"]:
+        """Return one ``AggregatedGroup`` per group with its full summary (US-d).
+
+        The aggregate-only contract: 1 row per group, no row-items. The group's
+        ``summary`` carries plain + conditional + post-agg values. The group key
+        is exposed via ``AggregatedGroup.key``.
+
+        Anti-DoS (ADR-005 §Axe 4): more than ``MAX_AGG_ONLY_GROUPS`` distinct
+        groups makes the block INERT (``BasesLimitError`` → error_type "limit")
+        — NOT a truncation. An aggregate-only rollup that silently dropped groups
+        would mislead a reader into trusting a partial Progression table.
+        """
+        group_by_clause = query.view.group_by
+        assert group_by_clause is not None  # guaranteed by render() dispatch
+        entities = self._pipeline_rows(query)
+        group_result = group_by(entities, group_by_clause.field)
+        # Aggregate-only does not truncate: over the bound the block is inert.
+        if group_result.total_groups > MAX_AGG_ONLY_GROUPS:
+            raise BasesLimitError(
+                f"Aggregate-only view over {MAX_AGG_ONLY_GROUPS} groups "
+                f"({group_result.total_groups} groups) — block inert"
+            )
+        return self._aggregate_groups(group_result, query)
+
+    def _render_aggregate_only(self, query: BasesQuery) -> tuple[str, list[dict[str, Any]]]:
+        """Render the aggregate-only view: 1 row per group, no items (US-d).
+
+        Each rendered row carries the group key (under the groupBy field name)
+        plus every summary/agg-formula value (keyed by its output name). The
+        ``order`` columns select which of these appear (the groupBy field and the
+        summary names). The flat row list is returned for link discovery
+        symmetry, though aggregate-only rows have no per-note identity.
+        """
+        groups = self.aggregate_only(query)
+        group_field = query.view.group_by.field  # type: ignore[union-attr]
+
+        rows: list[dict[str, Any]] = []
+        for grp in groups:
+            row: dict[str, Any] = {
+                "title": str(grp.key) if grp.key is not None else "(none)",
+                "file.link": "",
+                "file.path": "",
+                # Group key keyed by the groupBy field name AND its alias (when
+                # declared via ``properties:``) so the column resolves whichever
+                # the header uses (alias-aware, mirroring _project).
+                group_field: grp.key,
+                self._column_key(query, group_field): grp.key,
+            }
+            # Summary/agg-formula values keyed by output name AND alias, so an
+            # aliased summary column ("Progress %") resolves against the row.
+            for sname, svalue in grp.summary.items():
+                row[sname] = svalue
+                row[self._column_key(query, sname)] = svalue
+            rows.append(row)
+
+        if query.view.sort:
+            rows = self._apply_sort(rows, query.view.sort)
+
+        # Header columns = the declared order (group field + summary names).
+        if query.view.view_type == ViewType.TABLE:
+            field_names = [self._column_key(query, col) for col in query.view.order]
+            markdown = self.formatter.format_table(rows, field_names)
+        else:
+            markdown = self.formatter.format_list(rows)
+        return markdown, rows
