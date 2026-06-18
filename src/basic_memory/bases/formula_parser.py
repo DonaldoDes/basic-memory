@@ -21,8 +21,9 @@ Grammar (closed):
     formula     := lambda | or_expr
     lambda      := params "=>" or_expr
     params      := ident | "(" ident ( "," ident )* ")"
-    or_expr     := and_expr ( "||" and_expr )*
-    and_expr    := equality ( "&&" equality )*
+    or_expr     := and_expr ( ( "||" | "or" ) and_expr )*
+    and_expr    := not_expr ( ( "&&" | "and" ) not_expr )*
+    not_expr    := ( "!" | "not" )* equality
     equality    := comparison ( ( "==" | "!=" ) comparison )*
     comparison  := additive ( ( "<" | ">" | "<=" | ">=" ) additive )*
     additive    := multiplicative ( ( "+" | "-" ) multiplicative )*
@@ -139,6 +140,20 @@ _COMPARISON_OPS = {"<", ">", "<=", ">="}
 _EQUALITY_OPS = {"==", "!="}
 _ADDITIVE_OPS = {"+", "-"}
 _MULT_OPS = {"*", "/"}
+
+# Word-form boolean operators (US-f / ADR-005 §Axe 4): Obsidian Bases — and the
+# vault's Progression blocks — write ``count(status == "Done" or status ==
+# "Completed")`` with the WORDS ``or``/``and``/``not``, not the symbols
+# ``||``/``&&``/``!``. They are tokenized as bare identifiers and recognised as
+# operators HERE, in the precedence chain, never reaching _parse_primary as a
+# field reference. They normalise to the existing closed binops (``||``/``&&``)
+# and the ``!`` unary — no new AST node, no new evaluation path: the closed
+# sandbox is unchanged (ADR-005 §Axe 5). Reserved keywords: they cannot be used
+# as a field name (a bare ``or`` is a syntax error, mirroring Python).
+_OR_TOKENS = {"||", "or"}
+_AND_TOKENS = {"&&", "and"}
+_NOT_TOKENS = {"!", "not"}
+_RESERVED_KEYWORDS = {"or", "and", "not"}
 
 
 class _Tokenizer:
@@ -334,18 +349,34 @@ def _try_parse_lambda(tz: _Tokenizer) -> FormulaNode | None:
 
 def _parse_or(tz: _Tokenizer) -> FormulaNode:
     node = _parse_and(tz)
-    while tz.peek() == "||":
-        tz.next()
+    while tz.peek() in _OR_TOKENS:
+        tz.next()  # consume "||" or the word "or"
+        # Both forms normalise to the same closed ``||`` binop.
         node = FBinOp(op="||", left=node, right=_parse_and(tz))
     return node
 
 
 def _parse_and(tz: _Tokenizer) -> FormulaNode:
-    node = _parse_equality(tz)
-    while tz.peek() == "&&":
-        tz.next()
-        node = FBinOp(op="&&", left=node, right=_parse_equality(tz))
+    node = _parse_not(tz)
+    while tz.peek() in _AND_TOKENS:
+        tz.next()  # consume "&&" or the word "and"
+        node = FBinOp(op="&&", left=node, right=_parse_not(tz))
     return node
+
+
+def _parse_not(tz: _Tokenizer) -> FormulaNode:
+    """Unary boolean negation: ( "!" | "not" )* equality.
+
+    ``not x`` / ``!x`` normalises to the existing closed shape ``(x == False)``
+    — the SAME node the WHERE parser already emits for ``not`` (see
+    ``parser._walk_filter``), so evaluation reuses the audited binop path with
+    no new AST node. Stacked negations (``not not x``) fold left-to-right.
+    """
+    if tz.peek() in _NOT_TOKENS:
+        tz.next()  # consume "!" or the word "not"
+        operand = _parse_not(tz)
+        return FBinOp(op="==", left=operand, right=FLiteral(value=False))
+    return _parse_equality(tz)
 
 
 def _parse_equality(tz: _Tokenizer) -> FormulaNode:
@@ -485,6 +516,12 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
     if tok == "this":
         tz.next()
         return FThis()
+
+    # Reserved boolean keywords are operators, never operands — a bare ``or`` /
+    # ``and`` / ``not`` in operand position is a syntax error (mirrors Python),
+    # so they can't be smuggled in as a field name (US-f / ADR-005 §Axe 4).
+    if tok in _RESERVED_KEYWORDS:
+        raise BasesParseError(f"Reserved keyword '{tok}' cannot be used as an operand")
 
     # identifier: function call or field reference
     if _IDENT_RE.fullmatch(tok):

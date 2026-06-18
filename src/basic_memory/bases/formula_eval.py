@@ -155,9 +155,17 @@ class _HostRef:
     def __init__(self, host: dict[str, Any]):
         path = host.get("path") or host.get("permalink") or ""
         permalink = host.get("permalink")
-        # The host file's identity strings: both its path and permalink so a row
-        # that links by either form matches in hasLink.
-        identities = [v for v in (path, permalink) if v]
+        title = host.get("title")
+        # The host file's identity strings: path, permalink AND title so a row
+        # matches in hasLink whichever form it linked by. US-f live-path fix:
+        # the provider populates a row's outlinks from its outgoing relations as
+        # the target PERMALINK *and* the raw ``to_name`` — and ``to_name`` is
+        # frequently the host's TITLE (a ``[[Title]]`` wikilink). Without the
+        # title here, every Activity block whose backlinks were authored by
+        # title resolved to 0 (the production failure on the ~169 Activity
+        # blocks). Identity stays a bounded set of dataset strings — no FS, no
+        # graph recompute (ADR-005 §Axe 2 invariant preserved).
+        identities = [v for v in (path, permalink, title) if v]
         self.file = _VirtualFile(path, identities=identities or [path])
 
 
