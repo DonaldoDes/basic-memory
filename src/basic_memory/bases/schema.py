@@ -25,6 +25,22 @@ MAX_VIEWS = 10
 MAX_RENDERED_ROWS = 500
 
 # ---------------------------------------------------------------------------
+# Phase 2 aggregation bounds (ADR-004 §2.(d), US-001 NC-3) — FIGÉES.
+#
+# MAX_GROUP_BY_GROUPS: maximum number of distinct groups kept after GROUP BY.
+#   Crossing it is a *partial render*: the first MAX_GROUP_BY_GROUPS groups are
+#   rendered and a visible truncation marker is appended ("N groupes non
+#   affichés") — ADR-004 §2.(d) "Troncature + marqueur". NOT inert.
+#
+# MAX_FLATTEN_CARDINALITY: maximum expansion of a single row by FLATTEN. A row
+#   whose list field expands beyond this bound makes the *block inert*
+#   (BasesLimitError -> error_type "limit") — ADR-004 §2.(d) "Bloc inerte",
+#   distinct from GROUP BY which truncates. Both values are FIGÉES in US-001.
+# ---------------------------------------------------------------------------
+MAX_GROUP_BY_GROUPS = 500
+MAX_FLATTEN_CARDINALITY = 100
+
+# ---------------------------------------------------------------------------
 # Phase 2 formula bounds (ADR-004 §2.(d)) — anti-DoS for formula parsing.
 # MAX_AST_DEPTH (20) above is reused as the formula AST depth bound (ADR-004
 # fixes formula AST depth = 20, identical to the Phase 1 value).
@@ -85,6 +101,8 @@ __all__ = [
     "MAX_YAML_NODES",
     "MAX_VIEWS",
     "MAX_RENDERED_ROWS",
+    "MAX_GROUP_BY_GROUPS",
+    "MAX_FLATTEN_CARDINALITY",
     "ViewType",
     "BasesSortClause",
     "BasesFormula",
@@ -149,9 +167,14 @@ class BasesView:
     order: list[str] = field(default_factory=list)
     sort: list[BasesSortClause] = field(default_factory=list)
     limit: int | None = None
-    # Phase 2 (ADR-004 §4) — declared here, wired in US-005 (GROUP BY/FLATTEN).
+    # Phase 2 (ADR-004 §4, US-005) — GROUP BY / FLATTEN / summaries.
     group_by: BasesGroupBy | None = None
     flatten: str | None = None
+    # summaries: {output_name: (aggregate_fn_name, source_field)}. The fn name
+    # is validated against the closed AGGREGATE_WHITELIST at parse time; an
+    # aggregate outside the whitelist makes the block inert (unsupported). Never
+    # an evaluated string — a closed dict-dispatch over pure list functions.
+    summaries: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass

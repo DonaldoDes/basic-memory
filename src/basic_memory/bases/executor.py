@@ -12,9 +12,17 @@ dataset (``file.inFolder`` ≡ FROM) — never a filesystem access.
 
 from typing import Any
 
+from basic_memory.bases.aggregate import (
+    AGGREGATE_WHITELIST,
+    AggregatedGroup,
+    aggregate,
+    flatten,
+    group_by,
+)
 from basic_memory.bases.errors import BasesExecutionError
 from basic_memory.bases.formula_eval import safe_evaluate_formula
 from basic_memory.bases.schema import (
+    MAX_FLATTEN_CARDINALITY,
     MAX_RENDERED_ROWS,
     BasesQuery,
     BasesSortClause,
@@ -40,17 +48,20 @@ class BasesExecutor:
 
     # ------------------------------------------------------------------ select
     def select(self, query: BasesQuery) -> list[dict[str, Any]]:
-        """Filter + project + sort + limit, returning structured rows.
+        """Run the Phase 2 pipeline, returning the flat list of projected rows.
 
-        Each row always carries ``title``, ``file.link``, ``file.path`` (for
-        link discovery) plus the projected columns (TABLE ``order``) keyed by
-        their alias-or-field-name.
+        Pipeline (ADR-004 §3): ``filter -> flatten -> [group_by] -> project ->
+        sort -> limit``. When a ``group_by`` is set, ``select`` returns the
+        rows of *all* groups concatenated (the grouped structure is produced by
+        ``render``/``_grouped`` for sectioned output). ``flatten`` runs before
+        grouping and may raise ``BasesLimitError`` (block inert) if a row
+        expands beyond ``MAX_FLATTEN_CARDINALITY``.
+
+        Each row carries ``title``, ``file.link``, ``file.path`` plus the
+        projected columns (TABLE ``order``) keyed by alias-or-field-name.
         """
-        filtered = self._filter_by_from(query.from_source)
-        if query.where is not None:
-            filtered = self._filter_by_where(filtered, query.where)
-
-        rows = self._project(filtered, query)
+        entities = self._pipeline_rows(query)
+        rows = self._project(entities, query)
 
         if query.view.sort:
             rows = self._apply_sort(rows, query.view.sort)
@@ -61,6 +72,21 @@ class BasesExecutor:
             rows = rows[: query.view.limit]
 
         return rows
+
+    def _pipeline_rows(self, query: BasesQuery) -> list[dict[str, Any]]:
+        """filter -> flatten — the entity-level stages shared by select/render.
+
+        FLATTEN may raise ``BasesLimitError`` here (a row over the cardinality
+        bound makes the block inert); the integration envelope catches it.
+        """
+        filtered = self._filter_by_from(query.from_source)
+        if query.where is not None:
+            filtered = self._filter_by_where(filtered, query.where)
+
+        if query.view.flatten is not None:
+            filtered = flatten(filtered, query.view.flatten, MAX_FLATTEN_CARDINALITY)
+
+        return filtered
 
     def _filter_by_from(self, from_source: str | None) -> list[dict[str, Any]]:
         if not from_source:
@@ -161,19 +187,77 @@ class BasesExecutor:
     def render(self, query: BasesQuery) -> tuple[str, list[dict[str, Any]]]:
         """Render the query result as markdown + structured rows.
 
-        Returns (markdown, rows). Reuses ResultFormatter for byte-identical
-        output with Dataview.
+        Returns (markdown, rows). Without ``group_by`` the output is a single
+        TABLE/LIST (Phase 1 path, unchanged). With ``group_by`` the output is
+        one section per group, each with its own TABLE/LIST and (optionally) a
+        summary line; a visible truncation marker is appended when more than
+        ``MAX_GROUP_BY_GROUPS`` groups exist (ADR-004 §2.(d)).
         """
-        rows = self.select(query)
+        if query.view.group_by is not None:
+            return self._render_grouped(query)
 
+        rows = self.select(query)
+        return self._render_flat(query, rows), rows
+
+    def _render_flat(self, query: BasesQuery, rows: list[dict[str, Any]]) -> str:
+        """Render a single (ungrouped) TABLE/LIST."""
         if query.view.view_type == ViewType.TABLE:
             field_names = [self._column_key(query, col) for col in query.view.order]
-            markdown = self.formatter.format_table(rows, field_names)
-            return markdown, rows
-
+            return self.formatter.format_table(rows, field_names)
         if query.view.view_type == ViewType.LIST:
-            markdown = self.formatter.format_list(rows)
-            return markdown, rows
-
+            return self.formatter.format_list(rows)
         # Should not reach here: unsupported view types are rejected at parse.
         raise BasesExecutionError(f"Unsupported view type: {query.view.view_type}")
+
+    def _render_grouped(self, query: BasesQuery) -> tuple[str, list[dict[str, Any]]]:
+        """Render one section per GROUP BY group + truncation marker.
+
+        Pipeline: filter -> flatten -> group_by -> aggregate -> project. Group
+        keys and aggregate sources are resolved on the *entities* (which carry
+        frontmatter + ``file.*``), then each group's entities are projected and
+        sorted for display. Each group becomes a ``### <key>`` section. The flat
+        list of all projected rows (across groups, capped) is returned as the
+        second element for link discovery, mirroring the ungrouped contract.
+        """
+        group_by_clause = query.view.group_by
+        assert group_by_clause is not None  # guaranteed by render() dispatch
+        entities = self._pipeline_rows(query)
+
+        # GROUP BY and aggregate operate on entities (frontmatter/file.* present).
+        group_result = group_by(entities, group_by_clause.field)
+        aggregated = aggregate(group_result, query.view.summaries, AGGREGATE_WHITELIST)
+
+        sections: list[str] = []
+        all_rows: list[dict[str, Any]] = []
+        for grp in aggregated:
+            # Project (and sort) the entities of this group for display.
+            grp_rows = self._project(grp.rows, query)
+            if query.view.sort:
+                grp_rows = self._apply_sort(grp_rows, query.view.sort)
+            sections.append(self._render_group_section(query, grp, grp_rows))
+            all_rows.extend(grp_rows)
+
+        if group_result.truncated:
+            sections.append(
+                f"_{group_result.omitted} groupes non affichés "
+                f"({group_result.total_groups} groupes au total, "
+                f"limite {len(group_result.groups)})_"
+            )
+
+        # Apply the hard cap on the flat row list returned for link discovery.
+        all_rows = all_rows[:MAX_RENDERED_ROWS]
+        return "\n\n".join(sections), all_rows
+
+    def _render_group_section(
+        self, query: BasesQuery, grp: "AggregatedGroup", grp_rows: list[dict[str, Any]]
+    ) -> str:
+        """Render one group: a heading, an optional summary line, and a body."""
+        key_label = grp.key if grp.key is not None else "(none)"
+        lines = [f"### {key_label}"]
+
+        if grp.summary:
+            summary_parts = [f"{name}: {value}" for name, value in grp.summary.items()]
+            lines.append("_" + " · ".join(summary_parts) + "_")
+
+        lines.append(self._render_flat(query, grp_rows))
+        return "\n\n".join(lines)

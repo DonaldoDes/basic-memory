@@ -148,3 +148,83 @@ class TestProcessNoteIsolation:
         results = integ.process_note(LIST_BLOCK)
         assert results[0]["status"] == "success"
         assert results[0]["result_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# US-005 — Phase 2 aggregation through the full envelope (AC-3 / inert blocks)
+# ---------------------------------------------------------------------------
+def _flatten_notes():
+    # one note whose tags list exceeds MAX_FLATTEN_CARDINALITY (100)
+    return [
+        {
+            "title": "Huge",
+            "file": {"path": "projects/Huge.md", "name": "Huge", "folder": "projects"},
+            "frontmatter": {"tags": list(range(150))},
+        }
+    ]
+
+
+def _group_notes():
+    return [
+        {
+            "title": "Alpha",
+            "file": {"path": "projects/Alpha.md", "name": "Alpha", "folder": "projects"},
+            "frontmatter": {"type": "project"},
+        },
+        {
+            "title": "Beta",
+            "file": {"path": "areas/Beta.md", "name": "Beta", "folder": "areas"},
+            "frontmatter": {"type": "area"},
+        },
+    ]
+
+
+class TestPhase2Envelope:
+    def test_group_by_block_renders_success_with_sections(self):
+        block = (
+            "```base\n"
+            "views:\n"
+            "  - type: table\n"
+            "    order: [title]\n"
+            "    groupBy: type\n"
+            "```"
+        )
+        integ = create_bases_integration(notes_provider=_group_notes)
+        r = integ.process_note(block)[0]
+        assert r["status"] == "success"
+        assert "### project" in r["result_markdown"]
+        assert "### area" in r["result_markdown"]
+
+    def test_flatten_over_bound_is_inert_limit(self):
+        # ADR-004 §2.(d): FLATTEN over MAX_FLATTEN_CARDINALITY -> block inert,
+        # error_type "limit", no crash of the handler.
+        block = (
+            "```base\n"
+            "views:\n"
+            "  - type: table\n"
+            "    order: [tags]\n"
+            "    flatten: tags\n"
+            "```"
+        )
+        integ = create_bases_integration(notes_provider=_flatten_notes)
+        r = integ.process_note(block)[0]
+        assert r["status"] == "error"
+        assert r["error_type"] == "limit"
+
+    def test_aggregate_outside_whitelist_is_inert_unsupported(self):
+        # An aggregate outside the closed whitelist -> block inert, error_type
+        # "unsupported" (refused at parse, never evaluated).
+        block = (
+            "```base\n"
+            "views:\n"
+            "  - type: table\n"
+            "    order: [title]\n"
+            "    groupBy: type\n"
+            "    summaries:\n"
+            "      x: eval(title)\n"
+            "```"
+        )
+        integ = create_bases_integration(notes_provider=_group_notes)
+        r = integ.process_note(block)[0]
+        assert r["status"] == "error"
+        assert r["error_type"] == "unsupported"

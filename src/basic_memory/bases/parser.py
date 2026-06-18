@@ -13,6 +13,7 @@ Pipeline:
 
 from typing import Any
 
+from basic_memory.bases.aggregate import AGGREGATE_WHITELIST
 from basic_memory.bases.errors import (
     BasesLimitError,
     BasesParseError,
@@ -27,6 +28,7 @@ from basic_memory.bases.schema import (
     MAX_VIEWS,
     MAX_YAML_NODES,
     BasesFormula,
+    BasesGroupBy,
     BasesQuery,
     BasesSortClause,
     BasesView,
@@ -45,9 +47,10 @@ from basic_memory.dataview.ast import (
 # remains out of scope until US-005.
 _UNSUPPORTED_TOP_KEYS = {"summaries"}
 
-# Keys recognized at the view level. Anything implying aggregation/grouping is
-# rejected.
-_UNSUPPORTED_VIEW_KEYS = {"groupBy", "group_by", "summaries", "formulas"}
+# Keys still unsupported at the view level. ``groupBy``/``group_by``/
+# ``summaries``/``flatten`` are now accepted (US-005). ``formulas`` is a
+# top-level construct (US-004), never a view key.
+_UNSUPPORTED_VIEW_KEYS = {"formulas"}
 
 # inFolder reference (FROM source).
 _INFOLDER = "file.inFolder"
@@ -170,13 +173,104 @@ class BasesParser:
                 raise BasesParseError("'limit' must be an integer")
             limit = raw_limit
 
+        group_by = cls._parse_group_by(raw)
+        flatten = cls._parse_flatten(raw.get("flatten"))
+        summaries = cls._parse_summaries(raw.get("summaries"), group_by)
+
         return BasesView(
             view_type=view_type,
             name=raw.get("name"),
             order=order,
             sort=sort,
             limit=limit,
+            group_by=group_by,
+            flatten=flatten,
+            summaries=summaries,
         )
+
+    @classmethod
+    def _parse_group_by(cls, raw: dict[str, Any]) -> BasesGroupBy | None:
+        """Parse ``groupBy:``/``group_by:`` — a *simple property* only (NC-4).
+
+        The group key is a frontmatter key or a ``file.*`` field name (a plain
+        string), never a formula expression in v1 (ADR-004 §4). Anything else
+        (a list, a mapping) is a parse error -> block inert.
+        """
+        value = raw.get("groupBy", raw.get("group_by"))
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise BasesParseError(
+                "'groupBy' must be a simple property name (string) — formula "
+                "expressions are not allowed as a group key (ADR-004 NC-4)"
+            )
+        return BasesGroupBy(field=value)
+
+    @classmethod
+    def _parse_flatten(cls, flatten: Any) -> str | None:
+        """Parse ``flatten:`` — the name of a list-valued field to expand."""
+        if flatten is None:
+            return None
+        if not isinstance(flatten, str):
+            raise BasesParseError("'flatten' must be a field name (string)")
+        return flatten
+
+    @classmethod
+    def _parse_summaries(
+        cls, summaries: Any, group_by: BasesGroupBy | None
+    ) -> dict[str, tuple[str, str]]:
+        """Parse ``summaries:`` into ``{output_name: (fn_name, source_field)}``.
+
+        Each value is a closed-form aggregate call ``fn(field)`` where ``fn`` is
+        validated against the closed ``AGGREGATE_WHITELIST`` AT PARSE TIME — an
+        aggregate outside the whitelist raises ``BasesUnsupportedError`` and the
+        block is inert (the hostile call is never evaluated). ``summaries`` only
+        make sense with a ``groupBy``; standalone summaries are unsupported.
+        """
+        if summaries is None:
+            return {}
+        if group_by is None:
+            raise BasesUnsupportedError(
+                "'summaries:' requires a 'groupBy:' — standalone aggregation is "
+                "outside the supported surface"
+            )
+        if not isinstance(summaries, dict):
+            raise BasesParseError("'summaries:' must be a mapping of name -> aggregate")
+        parsed: dict[str, tuple[str, str]] = {}
+        for name, expr in summaries.items():
+            if not isinstance(name, str):
+                raise BasesParseError("Summary names must be strings")
+            if not isinstance(expr, str):
+                raise BasesParseError(f"Summary '{name}' must be a string aggregate call")
+            fn_name, source = cls._parse_aggregate_call(name, expr)
+            if fn_name not in AGGREGATE_WHITELIST:
+                # Hard security boundary: an aggregate outside the closed
+                # whitelist makes the block inert. Never a getattr/eval dispatch.
+                raise BasesUnsupportedError(
+                    f"Aggregate '{fn_name}' (for summary '{name}') is not in the "
+                    f"closed aggregate whitelist (block inert)"
+                )
+            parsed[name] = (fn_name, source)
+        return parsed
+
+    @staticmethod
+    def _parse_aggregate_call(name: str, expr: str) -> tuple[str, str]:
+        """Parse a closed-form ``fn(field)`` aggregate call into ``(fn, field)``.
+
+        Only the shape ``identifier(identifier-or-field)`` is accepted — a
+        regex with no evaluation. Anything else is a parse error.
+        """
+        import re
+
+        m = re.fullmatch(
+            r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([A-Za-z_][\w.]*)\s*\)\s*",
+            expr,
+        )
+        if not m:
+            raise BasesParseError(
+                f"Summary '{name}' must be of the form fn(field), got {expr!r}"
+            )
+        return m.group(1), m.group(2)
 
     @classmethod
     def _parse_order(cls, order: Any) -> list[str]:

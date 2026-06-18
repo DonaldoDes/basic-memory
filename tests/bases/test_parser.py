@@ -325,16 +325,20 @@ views:
         )
         assert "formula.total" in query.view.order
 
-    def test_group_by_rejected(self):
-        with pytest.raises(BasesUnsupportedError):
-            BasesParser.parse(
-                """
+    def test_group_by_accepted(self):
+        # Contract change (US-005): ``groupBy:`` is now parsed into a
+        # BasesGroupBy clause (simple-property key, NC-4) and wired into the
+        # executor pipeline. It is no longer rejected as unsupported.
+        query = BasesParser.parse(
+            """
 views:
   - type: table
     order: [file.name]
     groupBy: status
 """
-            )
+        )
+        assert query.view.group_by is not None
+        assert query.view.group_by.field == "status"
 
 
 # ---------------------------------------------------------------------------
