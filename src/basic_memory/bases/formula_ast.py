@@ -107,6 +107,24 @@ class FBinOp(FormulaNode):
     right: "FormulaNode"
 
 
+@dataclass
+class FSubscript(FormulaNode):
+    """A bounded subscript access ``receiver[index]`` (US-c / ADR-005 §Axe 3).
+
+    ``receiver`` is any formula expression (typically a list-valued field, a
+    method/property-chain result, or another subscript). ``index`` is a formula
+    expression that MUST evaluate to a plain integer at eval time; anything else
+    (string, float, bool, None) degrades to ``None``. There is NO slice form:
+    ``[a:b]`` is rejected at parse time (out of v1). Evaluation is bounded —
+    out-of-range indices yield ``None``, never an exception, never arbitrary
+    memory access (ADR-005 invariant, continuity with the Phase 2 row-level
+    degradation contract).
+    """
+
+    receiver: "FormulaNode"
+    index: "FormulaNode"
+
+
 __all__ = [
     "FormulaNode",
     "FLiteral",
@@ -116,4 +134,5 @@ __all__ = [
     "FLambda",
     "FBinOp",
     "FThis",
+    "FSubscript",
 ]

@@ -61,6 +61,7 @@ from basic_memory.bases.formula_ast import (
     FLiteral,
     FormulaNode,
     FPropChain,
+    FSubscript,
     FThis,
 )
 from basic_memory.bases.schema import (
@@ -349,6 +350,8 @@ class FormulaEvaluator:
                 return self._eval_lambda(node)
             if isinstance(node, FThis):
                 return self._eval_this(node)
+            if isinstance(node, FSubscript):
+                return self._eval_subscript(node)
             # Unknown node type — never a dynamic fallback.
             raise BasesUnsupportedError(f"Unsupported formula node type: {type(node).__name__}")
         finally:
@@ -365,6 +368,42 @@ class FormulaEvaluator:
         if not self._host:
             return None
         return _HostRef(self._host)
+
+    # ----------------------------------------------------------- FSubscript
+    def _eval_subscript(self, node: FSubscript) -> Any:
+        """Evaluate ``receiver[index]`` — bounded indexed access (US-c).
+
+        Security/robustness invariants (ADR-005 §Axe 3, continuity ADR-004 §2):
+        - The index MUST be a plain ``int`` (a ``bool`` is NOT an int here, so
+          ``true``/``false`` never index 1/0). A non-integer index (str, float,
+          bool, None) yields ``None`` — the row degrades gracefully, never an
+          exception.
+        - The receiver must be an indexable SEQUENCE the sandbox produces:
+          ``list``, ``tuple`` or ``str``. Anything else (dict, None, int, a
+          ``_VirtualFile``, ...) yields ``None`` — NO ``getattr``/``__getitem__``
+          probing on arbitrary content objects, no mapping key access.
+        - Out-of-range indices (positive or negative) yield ``None`` — bounded
+          access, never an ``IndexError``, never arbitrary memory access. A huge
+          index allocates nothing (it is a pure bounds comparison).
+        - There is NO slice path here: the parser already rejected ``[a:b]``; the
+          index is therefore always a scalar, never a ``slice`` object.
+        """
+        receiver = self.eval(node.receiver)
+        index = self.eval(node.index)
+        # Reject non-integer indices (bool excluded — it is an int subclass).
+        if not isinstance(index, int) or isinstance(index, bool):
+            return None
+        # Only sandbox-produced sequences are indexable — never a mapping nor an
+        # arbitrary object. This is an explicit type allowlist, not getattr.
+        if not isinstance(receiver, (list, tuple, str)):
+            return None
+        length = len(receiver)
+        # Bounds check WITHOUT relying on Python's IndexError: covers positive and
+        # negative indices uniformly (Obsidian uses non-negative; negative kept as
+        # a bounded Python convenience, still None when out of range).
+        if index < -length or index >= length:
+            return None
+        return self._guard_result_size(receiver[index])
 
     # --------------------------------------------------------------- FField
     def _eval_field(self, node: FField) -> Any:

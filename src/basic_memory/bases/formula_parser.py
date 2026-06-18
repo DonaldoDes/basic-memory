@@ -27,7 +27,8 @@ Grammar (closed):
     comparison  := additive ( ( "<" | ">" | "<=" | ">=" ) additive )*
     additive    := multiplicative ( ( "+" | "-" ) multiplicative )*
     multiplicative := postfix ( ( "*" | "/" ) postfix )*
-    postfix     := primary ( "." member call? )*
+    postfix     := primary ( "." member call? | "[" index "]" )*
+    index       := or_expr            (* integer expression; no slice in v1 *)
     primary     := literal | funcall | field_ref | "(" or_expr ")"
     funcall     := name "(" args? ")"
     field_ref   := ident ( "." ident )*
@@ -51,6 +52,7 @@ from basic_memory.bases.formula_ast import (
     FLiteral,
     FormulaNode,
     FPropChain,
+    FSubscript,
     FThis,
 )
 from basic_memory.bases.schema import MAX_AST_DEPTH, MAX_FORMULA_LENGTH
@@ -123,6 +125,7 @@ _TOKEN_RE = re.compile(
       | \+|\-|\*|/                 # arithmetic operators
       | !                           # not
       | \(|\)|,|\.                  # grouping / chain dot / arg sep
+      | \[|\]|:                     # subscript brackets + slice colon (US-c)
       | "(?:[^"\\]|\\.)*"           # double-quoted string
       | '(?:[^'\\]|\\.)*'           # single-quoted string
       | -?\d+\.\d+|-?\d+            # numbers
@@ -262,7 +265,10 @@ def _check_depth(node: FormulaNode, depth: int) -> None:
             _check_depth(arg, depth + 1)
     elif isinstance(node, FLambda):
         _check_depth(node.body, depth + 1)
-    # FLiteral / FField are leaves.
+    elif isinstance(node, FSubscript):
+        _check_depth(node.receiver, depth + 1)
+        _check_depth(node.index, depth + 1)
+    # FLiteral / FField / FThis are leaves.
 
 
 # ---------------------------------------------------------------------------
@@ -375,17 +381,27 @@ def _parse_multiplicative(tz: _Tokenizer) -> FormulaNode:
 
 
 def _parse_postfix(tz: _Tokenizer) -> FormulaNode:
-    """primary ( "." member call? )*  — property/method chains, whitelisted."""
+    """primary ( "." member call? | "[" index "]" )*  — chains + subscript.
+
+    Property/method chains stay whitelisted (closed member table). The subscript
+    ``[index]`` (US-c / ADR-005 §Axe 3) is a bounded indexed access: a slice
+    ``[a:b]`` is refused outright (out of v1) so the block goes inert rather than
+    producing an arbitrary sublist.
+    """
     node = _parse_primary(tz)
-    # The chain loop is iterative, but each link nests an FPropChain one level
-    # deeper. Bound the cumulative chain depth DURING parsing so a long
-    # property/method chain (value.path.path...) is rejected with the limit type
-    # instead of building an arbitrarily deep tree (P1 DoS rework).
+    # The chain loop is iterative, but each link nests an FPropChain/FSubscript
+    # one level deeper. Bound the cumulative chain depth DURING parsing so a long
+    # property/method/subscript chain (value.path.path..., list[0][0][0]...) is
+    # rejected with the limit type instead of building an arbitrarily deep tree
+    # (P1 DoS rework).
     chain_depth = 0
-    while tz.peek() == ".":
+    while tz.peek() in (".", "["):
         chain_depth += 1
         if chain_depth > MAX_AST_DEPTH:
             raise BasesLimitError(f"Formula property chain exceeds depth {MAX_AST_DEPTH}")
+        if tz.peek() == "[":
+            node = _parse_subscript(tz, node)
+            continue
         tz.next()  # "."
         member = tz.peek()
         if member is None or not _IDENT_RE.fullmatch(member):
@@ -402,6 +418,28 @@ def _parse_postfix(tz: _Tokenizer) -> FormulaNode:
             args = _parse_call_args(tz)
         node = FPropChain(receiver=node, member=member, args=args)
     return node
+
+
+def _parse_subscript(tz: _Tokenizer, receiver: FormulaNode) -> FormulaNode:
+    """Parse ``receiver "[" index "]"`` into an FSubscript (US-c / ADR-005 §Axe 3).
+
+    The index is a full expression (``_parse_or``) — a literal or an integer
+    expression — never a slice. A slice ``[a:b]`` is detected by a ``:`` token
+    inside the brackets and refused with ``BasesUnsupportedError`` so the block
+    goes inert (arbitrary slicing is out of v1). The bracket must close: an
+    unbalanced ``[`` is a parse error (inert), never silently swallowed.
+    """
+    tz.next()  # "["
+    if tz.peek() == "]":
+        # Empty subscript ``[]`` is meaningless — refuse explicitly.
+        raise BasesParseError("Empty subscript '[]' is not allowed")
+    index = _parse_or(tz)
+    # Slice form ``[a:b]`` (or bare ``[:b]`` / ``[a:]``) — deferred out of v1.
+    if tz.peek() == ":":
+        raise BasesUnsupportedError("Slice subscript '[a:b]' is deferred out of v1")
+    if tz.next() != "]":
+        raise BasesParseError("Unbalanced subscript brackets — expected ']'")
+    return FSubscript(receiver=receiver, index=index)
 
 
 def _parse_primary(tz: _Tokenizer) -> FormulaNode:
