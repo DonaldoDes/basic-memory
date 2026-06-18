@@ -160,12 +160,20 @@ class TestSortLimit:
 
 class TestAdversarialEvaluation:
     def test_unknown_function_refused_at_parse(self, sample_notes):
+        # US-a (ADR-005 §Axe 1): ``round`` is now one of the 18 whitelisted
+        # formula functions available in filter position, so it must NOT be
+        # refused. A genuinely unknown function still is (security boundary
+        # preserved): the filter leaf routes to the closed formula whitelist.
         import pytest
         from basic_memory.bases.errors import BasesUnsupportedError
 
+        # round is now accepted (parity surface).
+        BasesParser.parse('filters: round(priority, 0) == 1\nviews:\n  - type: list\n')
+
+        # A name outside the closed whitelist is still refused (block inert).
         with pytest.raises(BasesUnsupportedError):
             BasesParser.parse(
-                'filters: round(priority) == 1\nviews:\n  - type: list\n'
+                'filters: frobnicate(priority) == 1\nviews:\n  - type: list\n'
             )
 
     def test_infolder_traversal_stays_in_dataset(self, sample_notes):

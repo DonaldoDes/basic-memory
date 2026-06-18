@@ -19,8 +19,8 @@ from basic_memory.bases.errors import (
     BasesParseError,
     BasesUnsupportedError,
 )
+from basic_memory.bases.filter_leaf import compile_filter_leaf
 from basic_memory.bases.formula_parser import parse_formula
-from basic_memory.bases.leaf_parser import parse_leaf
 from basic_memory.bases.schema import (
     MAX_FILTER_DEPTH,
     MAX_FILTER_LEAVES,
@@ -267,9 +267,7 @@ class BasesParser:
             expr,
         )
         if not m:
-            raise BasesParseError(
-                f"Summary '{name}' must be of the form fn(field), got {expr!r}"
-            )
+            raise BasesParseError(f"Summary '{name}' must be of the form fn(field), got {expr!r}")
         return m.group(1), m.group(2)
 
     @classmethod
@@ -422,7 +420,14 @@ class BasesParser:
             from_holder["from"] = infolder
             return None
 
-        return parse_leaf(leaf)
+        # US-a / ADR-005 §Axe 1: route the leaf to the Phase 2 formula sandbox
+        # (formula_parser → FormulaLeafNode evaluated by formula_eval) instead of
+        # the deprecated 4-function leaf_parser. The FROM/WHERE/and/or/not
+        # structure above is unchanged; only this atomic expression delegates to
+        # the audited sandbox, reaching parity filter = formula = Obsidian. Any
+        # hostile/unsupported construct raises a typed BasesError here (block
+        # inert), never evaluated.
+        return compile_filter_leaf(leaf)
 
     @staticmethod
     def _extract_infolder(leaf: str) -> str | None:

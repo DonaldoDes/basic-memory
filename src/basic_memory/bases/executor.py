@@ -20,6 +20,7 @@ from basic_memory.bases.aggregate import (
     group_by,
 )
 from basic_memory.bases.errors import BasesExecutionError
+from basic_memory.bases.filter_leaf import FormulaLeafNode
 from basic_memory.bases.formula_eval import safe_evaluate_formula
 from basic_memory.bases.schema import (
     MAX_FLATTEN_CARDINALITY,
@@ -28,8 +29,7 @@ from basic_memory.bases.schema import (
     BasesSortClause,
     ViewType,
 )
-from basic_memory.dataview.ast import SortDirection
-from basic_memory.dataview.executor.expression_eval import ExpressionEvaluator
+from basic_memory.dataview.ast import BinaryOpNode, ExpressionNode, LiteralNode, SortDirection
 from basic_memory.dataview.executor.field_resolver import FieldResolver
 from basic_memory.dataview.executor.result_formatter import ResultFormatter
 
@@ -101,18 +101,52 @@ class BasesExecutor:
                 filtered.append(note)
         return filtered
 
-    def _filter_by_where(self, notes: list[dict[str, Any]], where) -> list[dict[str, Any]]:
+    def _filter_by_where(
+        self, notes: list[dict[str, Any]], where: ExpressionNode
+    ) -> list[dict[str, Any]]:
         filtered = []
         for note in notes:
-            evaluator = ExpressionEvaluator(note)
             try:
-                if evaluator.evaluate(where):
+                if self._eval_where(where, note):
                     filtered.append(note)
             except Exception:
                 # Degradation: a note that raises during evaluation is skipped,
                 # never crashes the whole block (mirror DataviewExecutor).
                 continue
         return filtered
+
+    def _eval_where(self, node: ExpressionNode, note: dict[str, Any]) -> bool:
+        """Evaluate the WHERE tree against one note.
+
+        US-a / ADR-005 §Axe 1: the FROM/WHERE/and/or/not STRUCTURE is unchanged —
+        AND/OR/NOT combinators are Dataview ``BinaryOpNode`` (and a ``=`` against
+        ``False`` for ``not``). Only the LEAVES changed: each is a
+        :class:`FormulaLeafNode` whose typed formula AST is evaluated by the
+        closed Phase 2 sandbox (``safe_evaluate_formula``) — the same audited
+        objects, never ``getattr``/``eval``/``exec`` on note content.
+
+        ``safe_evaluate_formula`` never raises: a per-leaf evaluation error
+        degrades that leaf to ``None`` (falsy), the block is not crashed.
+        """
+        # Leaf: delegate to the sandbox.
+        if isinstance(node, FormulaLeafNode):
+            value, _err = safe_evaluate_formula(node.formula, note)
+            return bool(value)
+
+        # Combination node: AND / OR (and the `= False` shape used by `not`).
+        if isinstance(node, BinaryOpNode):
+            op = (node.operator or "").upper()
+            if op == "AND":
+                return self._eval_where(node.left, note) and self._eval_where(node.right, note)
+            if op == "OR":
+                return self._eval_where(node.left, note) or self._eval_where(node.right, note)
+            if node.operator == "=" and isinstance(node.right, LiteralNode):
+                # `not <leaf>` is normalised to (<leaf> = False) by the parser.
+                left = self._eval_where(node.left, note)
+                return bool(left) == bool(node.right.value)
+            raise BasesExecutionError(f"Unsupported WHERE combinator: {node.operator!r}")
+
+        raise BasesExecutionError(f"Unsupported WHERE node: {type(node).__name__}")
 
     def _project(self, notes: list[dict[str, Any]], query: BasesQuery) -> list[dict[str, Any]]:
         order = query.view.order

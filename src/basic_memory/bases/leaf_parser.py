@@ -1,5 +1,15 @@
 """Closed-grammar parser for Bases filter-leaf expressions.
 
+.. deprecated:: M-Bases-P3 (US-a, ADR-005 §Axe 1)
+    This 4-function leaf grammar (``contains/length/lower/upper``) is NO LONGER
+    the filter-leaf evaluation path. Filter leaves are now routed to the Phase 2
+    formula sandbox (``filter_leaf.compile_filter_leaf`` → ``formula_parser`` →
+    ``FormulaLeafNode`` evaluated by ``formula_eval``), reaching parity with
+    Obsidian Bases (18 functions + property-chains + lambdas in filters). This
+    module is kept for historical/structural reference only; ``parse_leaf`` is no
+    longer called by ``parser.BasesParser``. Do not extend it — extend the
+    formula whitelist (with an ADR-004 amendment) instead.
+
 Grammar (ADR-003 §3.2):
 
     expr        := or_expr

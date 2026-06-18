@@ -174,14 +174,18 @@ class TestInjection:
         assert results[0]["error_type"] in {"parse", "unsupported"}
 
     def test_dunder_attribute_chain_never_accessed(self):
-        # status.__class__.__mro__ tokenizes as a bare dotted field ref. The
-        # FieldResolver does dict lookups only — it NEVER touches Python
-        # attributes — so this resolves to None and matches nothing. The key
-        # security property is: no attribute access / no code execution.
+        # US-a (ADR-005 §Axe 1) HARDENING: the filter leaf now routes to the
+        # formula sandbox, whose parser REJECTS dunder identifiers outright
+        # (_reject_dunder) rather than silently resolving them to None. So
+        # ``status.__class__.__mro__`` makes the block inert
+        # (error_type: unsupported) — a stronger contract than Phase 1's
+        # silent-None. The key security property is unchanged and reinforced:
+        # no attribute access / no code execution; the dunder is refused before
+        # any evaluation.
         block = 'filters: status.__class__.__mro__ == "x"\nviews:\n  - type: list\n'
         results = _process(block)
-        assert results[0]["status"] == "success"
-        assert results[0]["result_count"] == 0
+        assert results[0]["status"] == "error"
+        assert results[0]["error_type"] == "unsupported"
 
     def test_no_arbitrary_function_executed(self):
         # A function call to a non-whitelisted name must be refused, not run.
