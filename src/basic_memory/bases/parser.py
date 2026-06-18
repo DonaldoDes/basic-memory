@@ -20,6 +20,7 @@ from basic_memory.bases.errors import (
     BasesUnsupportedError,
 )
 from basic_memory.bases.filter_leaf import compile_filter_leaf
+from basic_memory.bases.formula_ast import FormulaNode
 from basic_memory.bases.formula_parser import parse_formula
 from basic_memory.bases.schema import (
     MAX_FILTER_DEPTH,
@@ -175,7 +176,9 @@ class BasesParser:
 
         group_by = cls._parse_group_by(raw)
         flatten = cls._parse_flatten(raw.get("flatten"))
-        summaries = cls._parse_summaries(raw.get("summaries"), group_by)
+        summaries, summary_predicates = cls._parse_summaries(raw.get("summaries"), group_by)
+        agg_formulas = cls._parse_agg_formulas(raw.get("aggFormulas"), group_by)
+        aggregate_only = cls._parse_aggregate_flag(raw.get("aggregate"))
 
         return BasesView(
             view_type=view_type,
@@ -186,7 +189,63 @@ class BasesParser:
             group_by=group_by,
             flatten=flatten,
             summaries=summaries,
+            summary_predicates=summary_predicates,
+            agg_formulas=agg_formulas,
+            aggregate_only=aggregate_only,
         )
+
+    @classmethod
+    def _parse_aggregate_flag(cls, value: Any) -> bool:
+        """Parse ``aggregate:`` — the aggregate-only view flag (US-d).
+
+        Accepts a YAML boolean only. A non-bool value is a parse error (block
+        inert) — never coerced, so a hostile string can't enable the mode.
+        """
+        if value is None:
+            return False
+        if not isinstance(value, bool):
+            raise BasesParseError("'aggregate' must be a boolean (true/false)")
+        return value
+
+    @classmethod
+    def _parse_agg_formulas(
+        cls, agg_formulas: Any, group_by: BasesGroupBy | None
+    ) -> dict[str, "FormulaNode"]:
+        """Parse ``aggFormulas:`` — post-aggregation cross-summary formulas (US-d).
+
+        Each value is a formula expression referencing summary names (e.g.
+        ``round(Done / Total * 100)``). It is compiled by ``parse_formula`` (the
+        closed-grammar parser) — any hostile construct (eval/exec/dunder/function
+        outside the whitelist) is REFUSED there (block inert). ``parse_formula``
+        also enforces ``MAX_FORMULA_LENGTH`` and ``MAX_AST_DEPTH`` (BP3-D-07: a
+        depth bomb is inert at parse). The AST is stored, never a runtime string.
+
+        ``aggFormulas`` only make sense with a ``groupBy`` (they combine the
+        group's summaries); standalone is unsupported.
+        """
+        if agg_formulas is None:
+            return {}
+        if group_by is None:
+            raise BasesUnsupportedError(
+                "'aggFormulas:' requires a 'groupBy:' — post-aggregation formulas "
+                "combine a group's summaries"
+            )
+        if not isinstance(agg_formulas, dict):
+            raise BasesParseError("'aggFormulas:' must be a mapping of name -> expression")
+        if len(agg_formulas) > MAX_FORMULAS_PER_BLOCK:
+            raise BasesLimitError(
+                f"Base block declares more than {MAX_FORMULAS_PER_BLOCK} aggFormulas"
+            )
+        compiled: dict[str, "FormulaNode"] = {}
+        for name, expr in agg_formulas.items():
+            if not isinstance(name, str):
+                raise BasesParseError("aggFormula names must be strings")
+            if not isinstance(expr, str):
+                raise BasesParseError(f"aggFormula '{name}' must be a string expression")
+            # parse_formula raises BasesLimitError / BasesParseError /
+            # BasesUnsupportedError on any hostile or malformed input (inert).
+            compiled[name] = parse_formula(expr)
+        return compiled
 
     @classmethod
     def _parse_group_by(cls, raw: dict[str, Any]) -> BasesGroupBy | None:
@@ -218,17 +277,26 @@ class BasesParser:
     @classmethod
     def _parse_summaries(
         cls, summaries: Any, group_by: BasesGroupBy | None
-    ) -> dict[str, tuple[str, str]]:
-        """Parse ``summaries:`` into ``{output_name: (fn_name, source_field)}``.
+    ) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, "FormulaNode"]]]:
+        """Parse ``summaries:`` into plain + CONDITIONAL aggregates (US-d).
 
-        Each value is a closed-form aggregate call ``fn(field)`` where ``fn`` is
-        validated against the closed ``AGGREGATE_WHITELIST`` AT PARSE TIME — an
-        aggregate outside the whitelist raises ``BasesUnsupportedError`` and the
-        block is inert (the hostile call is never evaluated). ``summaries`` only
-        make sense with a ``groupBy``; standalone summaries are unsupported.
+        Returns ``(plain, predicates)`` where:
+          * ``plain``: ``{name: (fn_name, source_field)}`` — the Phase 2 form
+            ``fn(field)`` (e.g. ``count(title)``, ``sum(v)``), unchanged.
+          * ``predicates``: ``{name: (fn_name, predicate_ast)}`` — the Phase 3
+            CONDITIONAL form ``fn(predicate_expr)`` (e.g. ``count(status ==
+            "Done")``). The predicate is compiled by ``parse_formula`` (closed
+            grammar — any hostile construct refused, block inert) and evaluated
+            in the Phase 2 SANDBOX per group row. Only ``count``/``sum`` accept a
+            predicate; other aggregates over a predicate are unsupported.
+
+        Each ``fn`` is validated against the closed ``AGGREGATE_WHITELIST`` AT
+        PARSE TIME — an aggregate outside the whitelist raises
+        ``BasesUnsupportedError`` (block inert, never a getattr/eval dispatch).
+        ``summaries`` only make sense with a ``groupBy``.
         """
         if summaries is None:
-            return {}
+            return {}, {}
         if group_by is None:
             raise BasesUnsupportedError(
                 "'summaries:' requires a 'groupBy:' — standalone aggregation is "
@@ -236,13 +304,14 @@ class BasesParser:
             )
         if not isinstance(summaries, dict):
             raise BasesParseError("'summaries:' must be a mapping of name -> aggregate")
-        parsed: dict[str, tuple[str, str]] = {}
+        plain: dict[str, tuple[str, str]] = {}
+        predicates: dict[str, tuple[str, "FormulaNode"]] = {}
         for name, expr in summaries.items():
             if not isinstance(name, str):
                 raise BasesParseError("Summary names must be strings")
             if not isinstance(expr, str):
                 raise BasesParseError(f"Summary '{name}' must be a string aggregate call")
-            fn_name, source = cls._parse_aggregate_call(name, expr)
+            fn_name, arg = cls._split_aggregate_call(name, expr)
             if fn_name not in AGGREGATE_WHITELIST:
                 # Hard security boundary: an aggregate outside the closed
                 # whitelist makes the block inert. Never a getattr/eval dispatch.
@@ -250,25 +319,66 @@ class BasesParser:
                     f"Aggregate '{fn_name}' (for summary '{name}') is not in the "
                     f"closed aggregate whitelist (block inert)"
                 )
-            parsed[name] = (fn_name, source)
-        return parsed
+            if cls._is_simple_field(arg):
+                # Phase 2 plain form fn(field): no predicate, no sandbox.
+                plain[name] = (fn_name, arg)
+            else:
+                # Phase 3 conditional form fn(predicate): only count/sum.
+                if fn_name not in ("count", "sum"):
+                    raise BasesUnsupportedError(
+                        f"Conditional aggregate '{fn_name}' (for summary '{name}') "
+                        f"is unsupported — only count/sum accept a predicate"
+                    )
+                # parse_formula refuses any hostile/over-long/over-deep predicate
+                # (block inert); the AST is evaluated in the sandbox at exec time.
+                predicates[name] = (fn_name, parse_formula(arg))
+        return plain, predicates
 
     @staticmethod
-    def _parse_aggregate_call(name: str, expr: str) -> tuple[str, str]:
-        """Parse a closed-form ``fn(field)`` aggregate call into ``(fn, field)``.
+    def _split_aggregate_call(name: str, expr: str) -> tuple[str, str]:
+        """Split a ``fn(arg)`` aggregate call into ``(fn, arg)`` — no evaluation.
 
-        Only the shape ``identifier(identifier-or-field)`` is accepted — a
-        regex with no evaluation. Anything else is a parse error.
+        Only the outer ``identifier( ... )`` shape is matched by a regex; the
+        inner ``arg`` is returned verbatim (it may be a simple field name OR a
+        predicate expression, disambiguated by :meth:`_is_simple_field`). The
+        inner text is NEVER evaluated here — a predicate is compiled later by
+        ``parse_formula`` (closed grammar). Balanced-paren matching keeps a
+        predicate like ``count(round(x) == 1)`` intact.
         """
         import re
 
-        m = re.fullmatch(
-            r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([A-Za-z_][\w.]*)\s*\)\s*",
-            expr,
-        )
+        m = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*", expr, re.DOTALL)
         if not m:
-            raise BasesParseError(f"Summary '{name}' must be of the form fn(field), got {expr!r}")
-        return m.group(1), m.group(2)
+            raise BasesParseError(
+                f"Summary '{name}' must be of the form fn(field) or fn(predicate), "
+                f"got {expr!r}"
+            )
+        return m.group(1), m.group(2).strip()
+
+    @staticmethod
+    def _is_simple_field(arg: str) -> bool:
+        """True iff ``arg`` is a bare (optionally dotted) field name.
+
+        A simple field is the Phase 2 plain-summary path (``count(title)``); any
+        argument containing an operator / literal / call is a predicate and goes
+        through the sandbox. Pure syntactic test — no evaluation.
+
+        A dotted segment that is a **dunder** (``__class__``, ``__bases__`` …) is
+        NOT a simple field: it falls through to the predicate path, where
+        ``parse_formula`` refuses the dunder (block inert). This keeps a hostile
+        ``count(status.__class__)`` from being silently treated as a (degraded)
+        field instead of being refused — defense in depth on the field path.
+        """
+        import re
+
+        if re.fullmatch(r"[A-Za-z_][\w.]*", arg) is None:
+            return False
+        # Reject any dunder segment — force it down the predicate path so the
+        # closed-grammar parser refuses it (block inert), never a degraded field.
+        for segment in arg.split("."):
+            if segment.startswith("__") and segment.endswith("__"):
+                return False
+        return True
 
     @classmethod
     def _parse_order(cls, order: Any) -> list[str]:
