@@ -51,6 +51,7 @@ from basic_memory.bases.formula_ast import (
     FLiteral,
     FormulaNode,
     FPropChain,
+    FThis,
 )
 from basic_memory.bases.schema import MAX_AST_DEPTH, MAX_FORMULA_LENGTH
 
@@ -102,6 +103,14 @@ ALLOWED_MEMBERS = frozenset(
         "startsWith",
         "endsWith",
         "contains",
+        # US-b (ADR-005 §Axe 2): self-reference + backlinks-as-boolean.
+        # ``hasLink`` is a boolean method on the row's file reading the row's
+        # outlinks (no filesystem, no graph recompute). ``file`` is the only
+        # member of ``this`` (``this.file`` = host identity). ``backlinks``
+        # (the list form) is DELIBERATELY excluded — deferred out of v1 (NC-1)
+        # so ``file.backlinks`` is refused as unsupported.
+        "hasLink",
+        "file",
     }
 )
 
@@ -141,7 +150,7 @@ class _Tokenizer:
             m = _TOKEN_RE.match(text, pos)
             if not m or m.group(1) is None:
                 raise BasesParseError(
-                    f"Unexpected character in formula at: {text[pos:pos + 16]!r}"
+                    f"Unexpected character in formula at: {text[pos : pos + 16]!r}"
                 )
             self.tokens.append(m.group(1))
             pos = m.end()
@@ -188,24 +197,29 @@ class _Tokenizer:
         """
         self.descent_depth += 1
         if self.descent_depth > MAX_AST_DEPTH:
-            raise BasesLimitError(
-                f"Formula recursion exceeds depth {MAX_AST_DEPTH}"
-            )
+            raise BasesLimitError(f"Formula recursion exceeds depth {MAX_AST_DEPTH}")
         try:
             yield
         finally:
             self.descent_depth -= 1
 
 
+# Members explicitly DEFERRED out of v1 and refused outright in any position
+# (US-b / ADR-005 §Axe 2, NC-1). ``file.backlinks`` returns the *list* form of
+# backlinks (perf-heavy) and is out of v1 — only the boolean ``hasLink`` ships.
+# Refused here (not silently swallowed as a dotted field name) so the block goes
+# inert (unsupported) rather than resolving ``file.backlinks`` to None.
+REJECTED_MEMBERS = frozenset({"backlinks"})
+
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"-?\d+\.\d+|-?\d+")
+
+
 # Dunder identifiers (__class__, __import__, __globals__, ...) are an attack
 # surface for sandbox escape and are refused outright in any position.
 def _reject_dunder(ident: str) -> None:
     if "__" in ident:
-        raise BasesUnsupportedError(
-            f"Dunder identifier '{ident}' is forbidden in formulas"
-        )
+        raise BasesUnsupportedError(f"Dunder identifier '{ident}' is forbidden in formulas")
 
 
 def parse_formula(text: str) -> FormulaNode:
@@ -218,9 +232,7 @@ def parse_formula(text: str) -> FormulaNode:
             function, property-chain member outside the table, dunder access.
     """
     if len(text) > MAX_FORMULA_LENGTH:
-        raise BasesLimitError(
-            f"Formula expression exceeds {MAX_FORMULA_LENGTH} characters"
-        )
+        raise BasesLimitError(f"Formula expression exceeds {MAX_FORMULA_LENGTH} characters")
 
     tz = _Tokenizer(text)
     if tz.eof():
@@ -373,9 +385,7 @@ def _parse_postfix(tz: _Tokenizer) -> FormulaNode:
     while tz.peek() == ".":
         chain_depth += 1
         if chain_depth > MAX_AST_DEPTH:
-            raise BasesLimitError(
-                f"Formula property chain exceeds depth {MAX_AST_DEPTH}"
-            )
+            raise BasesLimitError(f"Formula property chain exceeds depth {MAX_AST_DEPTH}")
         tz.next()  # "."
         member = tz.peek()
         if member is None or not _IDENT_RE.fullmatch(member):
@@ -405,9 +415,7 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
         # kept as a redundant, parenthesis-specific net.
         tz.paren_depth += 1
         if tz.paren_depth > MAX_AST_DEPTH:
-            raise BasesLimitError(
-                f"Formula parenthesis nesting exceeds depth {MAX_AST_DEPTH}"
-            )
+            raise BasesLimitError(f"Formula parenthesis nesting exceeds depth {MAX_AST_DEPTH}")
         tz.next()
         with tz.descend():
             node = _parse_or(tz)
@@ -417,9 +425,7 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
         return node
 
     # string literal
-    if (tok.startswith('"') and tok.endswith('"')) or (
-        tok.startswith("'") and tok.endswith("'")
-    ):
+    if (tok.startswith('"') and tok.endswith('"')) or (tok.startswith("'") and tok.endswith("'")):
         tz.next()
         return FLiteral(value=_unquote(tok))
 
@@ -432,6 +438,15 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
     if tok in ("true", "false", "null"):
         tz.next()
         return FLiteral(value={"true": True, "false": False, "null": None}[tok])
+
+    # self-reference keyword: ``this`` (US-b / ADR-005 §Axe 2). Returned as a
+    # dedicated FThis primary so the subsequent ``.file`` is parsed by
+    # _parse_postfix as a property chain (FPropChain) through the closed member
+    # table — never collected into a dotted FField. ``this`` bare (with no
+    # ``.file``) is also a valid primary (resolves to the host wrapper).
+    if tok == "this":
+        tz.next()
+        return FThis()
 
     # identifier: function call or field reference
     if _IDENT_RE.fullmatch(tok):
@@ -451,9 +466,7 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
         # property access through _parse_postfix, we treat a leading
         # `ident.ident` as a field ref unless a call follows.
         name = tok
-        while tz.peek() == "." and tz.peek2() is not None and _IDENT_RE.fullmatch(
-            tz.peek2() or ""
-        ):
+        while tz.peek() == "." and tz.peek2() is not None and _IDENT_RE.fullmatch(tz.peek2() or ""):
             # Look ahead: if the segment after the dot is a known member followed
             # by "(" (method call) or is part of a property chain, stop here and
             # let _parse_postfix handle it.
@@ -461,6 +474,10 @@ def _parse_primary(tz: _Tokenizer) -> FormulaNode:
             after = tz.tokens[tz.i + 2] if tz.i + 2 < len(tz.tokens) else None
             if seg in ALLOWED_MEMBERS and (after == "(" or after == "."):
                 break
+            # Deferred members (e.g. file.backlinks) are refused, never absorbed
+            # into a dotted field name (US-b / NC-1).
+            if seg in REJECTED_MEMBERS:
+                raise BasesUnsupportedError(f"Member '{seg}' is deferred out of v1 (not supported)")
             tz.next()  # "."
             seg_tok = tz.next()
             _reject_dunder(seg_tok or "")

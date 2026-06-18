@@ -41,8 +41,13 @@ _FORMULA_PREFIX = "formula."
 class BasesExecutor:
     """Executes a parsed BasesQuery against a collection of entities."""
 
-    def __init__(self, notes: list[dict[str, Any]]):
+    def __init__(self, notes: list[dict[str, Any]], host: dict[str, Any] | None = None):
         self.notes = notes
+        # US-b (ADR-005 §Axe 2): the host-note identity threaded into the formula
+        # sandbox so ``this`` / ``file.hasLink(this.file)`` resolve. ``None`` when
+        # no host is wired (block without ``this`` is non-regressed; a ``this``
+        # block with no host degrades each leaf to falsy → empty result).
+        self.host = host
         self.field_resolver = FieldResolver()
         self.formatter = ResultFormatter()
 
@@ -128,9 +133,9 @@ class BasesExecutor:
         ``safe_evaluate_formula`` never raises: a per-leaf evaluation error
         degrades that leaf to ``None`` (falsy), the block is not crashed.
         """
-        # Leaf: delegate to the sandbox.
+        # Leaf: delegate to the sandbox (host threaded for ``this``/``hasLink``).
         if isinstance(node, FormulaLeafNode):
-            value, _err = safe_evaluate_formula(node.formula, note)
+            value, _err = safe_evaluate_formula(node.formula, note, host=self.host)
             return bool(value)
 
         # Combination node: AND / OR (and the `= False` shape used by `not`).
@@ -174,7 +179,7 @@ class BasesExecutor:
                         # Column references a formula not declared in formulas:.
                         row[alias] = None
                         continue
-                    value, _err = safe_evaluate_formula(formula.ast, note)
+                    value, _err = safe_evaluate_formula(formula.ast, note, host=self.host)
                     row[alias] = value
                     continue
                 # Static column (Phase 1 path, unchanged).
