@@ -351,6 +351,26 @@ async def list_entities_for_dataview(
         if entity.permalink:
             note["permalink"] = entity.permalink
 
+        # US-2 (ADR-006 §Gap #4): expose ``file.mtime`` / ``file.ctime`` so the
+        # temporal dashboards (``file.mtime > date(today) - dur("7 days")``,
+        # ``dateformat(file.mtime, "yyyy-MM-dd")``) resolve on the live path.
+        # FieldResolver maps file.mtime → note["updated_at"] and file.ctime →
+        # note["created_at"]; populate them here as ISO-8601 strings (the form the
+        # date sandbox coerces). Read straight from the already-loaded entity
+        # timestamps — no filesystem stat, no extra query.
+        if entity.updated_at is not None:
+            note["updated_at"] = (
+                entity.updated_at.isoformat()
+                if hasattr(entity.updated_at, "isoformat")
+                else str(entity.updated_at)
+            )
+        if entity.created_at is not None:
+            note["created_at"] = (
+                entity.created_at.isoformat()
+                if hasattr(entity.created_at, "isoformat")
+                else str(entity.created_at)
+            )
+
         # Add entity_metadata as frontmatter for Dataview field resolution
         if entity.entity_metadata:
             note.update(entity.entity_metadata)

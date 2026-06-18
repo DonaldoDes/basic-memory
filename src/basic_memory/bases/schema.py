@@ -99,6 +99,20 @@ FORMULA_BUDGET_MS = 1_000  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
 # PROVISOIRE — recalibrer (ADR-004 §2.(d))
 MAX_FORMULA_RESULT_SIZE = 100_000  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
 
+# ---------------------------------------------------------------------------
+# Phase 4 date-arithmetic bound (US-2 / ADR-006 §Gap #4, §"Bornes anti-DoS").
+#
+# MAX_DURATION_DAYS bounds the magnitude (in days) of any ``dur(...)`` value.
+# A pathological ``dur(1e12, "days")`` would otherwise build a timedelta whose
+# day count overflows datetime arithmetic (Python ``date`` ranges over years
+# 1..9999, ~3.65M days) and crashes ``date ± dur``. Crossing the bound raises
+# BasesLimitError (block inert) BEFORE the timedelta is built — no allocation,
+# no overflow. 100_000 days (~274 years) is generous for any legitimate vault
+# filter (the dashboards use 7/90/180 days) while staying well inside the
+# datetime range. PROVISOIRE — recalibrer sur baseline (ADR-006 §NC-4).
+# ---------------------------------------------------------------------------
+MAX_DURATION_DAYS = 100_000  # PROVISOIRE — recalibrer (ADR-006 §NC-4)
+
 # Re-export for executor convenience.
 __all__ = [
     "MAX_BLOCK_BYTES",
@@ -113,6 +127,7 @@ __all__ = [
     "MAX_FORMULA_ITERATIONS",
     "FORMULA_BUDGET_MS",
     "MAX_FORMULA_RESULT_SIZE",
+    "MAX_DURATION_DAYS",
     "MAX_YAML_NODES",
     "MAX_VIEWS",
     "MAX_RENDERED_ROWS",

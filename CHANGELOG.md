@@ -32,6 +32,33 @@
     `__import__` on note content; relations are read from the already-resolved
     dataset, never the filesystem.
 
+- **M-Bases-P4 / US-2 (real date arithmetic & functions)**: `base` blocks now
+  support real date/duration arithmetic, unblocking the Vault Lint Dashboard
+  temporal filters and formatted-date columns (design: ADR-006 §Gap #4).
+  - `dur(...)` builds a real duration from both Dataview forms — `dur("7 days")`
+    and `dur(7, "days")` (units: day(s)/week(s)/hour(s)/minute(s)/second(s)).
+  - `date(...)` builds a real date: `date(today)` / `date(now)` resolve against
+    an injected reference clock (deterministic), `date("2026-06-10")` parses an
+    ISO string (date-only → `date`, with a time component → `datetime`).
+  - Date ± duration arithmetic and date comparisons work
+    (`date(today) - dur("7 days")`, `mtime > …`). A `file.mtime`/`file.ctime`
+    ISO string is coerced to a date when compared against a real date, so
+    `file.mtime > date(today) - dur("7 days")` filters by recency.
+  - `dateformat(value, "yyyy-MM-dd")` renders a formatted date (closed
+    Luxon/Dataview token map: `yyyy`/`MM`/`dd`/`HH`/`mm`/`ss`; unknown tokens are
+    preserved verbatim — graceful degradation).
+  - The provider (`knowledge_router.list_entities_for_dataview`) now exposes
+    `file.mtime` / `file.ctime` (from entity `updated_at` / `created_at` as
+    ISO strings) so the temporal dashboards resolve on the live render path.
+  - Anti-DoS: a duration magnitude over `MAX_DURATION_DAYS` (100 000 days,
+    provisional — ADR-006 NC-4) is refused (block inert) before the timedelta is
+    built; an invalid date/duration/unknown unit degrades to an inert block,
+    never a crash.
+  - Continuity of the closed sandbox: `dur`/`date`/`dateformat` are closed
+    whitelist functions; no `eval`/`exec`/`getattr`/`__import__` on note content;
+    the `today`/`now` clock is injected, never read inline from the OS in the
+    evaluation path.
+
 - **M-Bases-P1 (Obsidian Bases executor, Phase 1 — parity-first)**: new
   `enable_bases` flag on `read_note` / `build_context` / `search_notes` renders
   ```` ```base ```` fenced blocks agent-side, mirroring `enable_dataview`
