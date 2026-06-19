@@ -38,6 +38,10 @@ from basic_memory.bases.formula_eval import (
     safe_evaluate_formula,
 )
 from basic_memory.bases.formula_parser import parse_formula
+from basic_memory.bases.integration import create_bases_integration
+from basic_memory.bases.parser import BasesParser
+from basic_memory.bases.schema import MAX_FLATTEN_CARDINALITY
+from tests.bases.test_live_path_integration import _Entity, _Rel, build_dataview_dataset
 
 
 @pytest.fixture
@@ -172,3 +176,86 @@ class TestIteratorCardinalityBound:
         node = parse_formula("any(ok, x => x > 0)")
         # Evaluates without raising; the predicate is true for some element.
         assert evaluate_formula(node, row) is True
+
+
+# ---------------------------------------------------------------------------
+# [ADVERSARIAL] FLATTEN-on-expression — closed whitelist + anti-DoS cardinality
+# ---------------------------------------------------------------------------
+class TestFlattenExpressionHostileInput:
+    """[ADVERSARIAL] The ``flatten: {expression: ..., as: ...}`` surface
+    (ADR-006 §Gap #5) must (a) refuse any expression outside the CLOSED
+    ``_FLATTEN_FILE_EXPRESSIONS`` whitelist at PARSE time — no dynamic dispatch
+    on ``file.*`` — and (b) make the WHOLE block inert (``error_type: limit``)
+    when an expression list over-expands a row, with NO partial evaluation and
+    the rest of the note still rendering.
+    """
+
+    def test_flatten_unknown_expression_refused(self):
+        """[ADVERSARIAL] ``flatten: {expression: file.evil, as: x}`` — an
+        expression outside the closed ``_FLATTEN_FILE_EXPRESSIONS`` whitelist is
+        refused at PARSE time with ``BasesUnsupportedError``: it is never resolved,
+        never dispatched against ``file.*``, the block is inert before execution.
+        """
+        block = (
+            "views:\n"
+            "  - type: table\n"
+            "    flatten:\n"
+            "      expression: file.evil\n"
+            "      as: x\n"
+            "    order:\n"
+            "      - x\n"
+        )
+        with pytest.raises(BasesUnsupportedError):
+            BasesParser.parse(block)
+
+    def test_flatten_expression_over_cardinality_inert(self):
+        """[ADVERSARIAL] A FLATTEN over a computed list EXPRESSION
+        (``file.outlinks``) whose length exceeds ``MAX_FLATTEN_CARDINALITY``
+        makes the WHOLE block inert (``status: error`` / ``error_type: limit``) —
+        NO partial expansion, no truncated row dump — while a SECOND, benign block
+        in the same note still renders (``status: success``). A hostile note must
+        neither silently drop data nor poison the rest of the note.
+        """
+        # One entity whose file.outlinks over-expands a single row past the bound.
+        # Each _Rel with to_name-only contributes exactly one outlink, so
+        # MAX_FLATTEN_CARDINALITY + 1 relations => one element over the bound.
+        over = MAX_FLATTEN_CARDINALITY + 1
+        hostile = _Entity(
+            title="Hostile Hub",
+            file_path="notes/hostile.md",
+            permalink="notes/hostile",
+            outgoing_relations=[
+                _Rel(to_name=f"Target {i}", to_permalink=None) for i in range(over)
+            ],
+        )
+        entities = [hostile]
+        integ = create_bases_integration(
+            notes_provider=lambda: build_dataview_dataset(entities)
+        )
+
+        flatten_block = (
+            "views:\n"
+            "  - type: table\n"
+            "    flatten:\n"
+            "      expression: file.outlinks\n"
+            "      as: link\n"
+            "    order:\n"
+            "      - link\n"
+        )
+        benign_block = "views:\n  - type: list\n"
+        note = f"```base\n{flatten_block}```\n\n```base\n{benign_block}```"
+
+        results = integ.process_note(note)
+        assert len(results) == 2
+
+        flatten_result, benign_result = results
+
+        # (a) The FLATTEN block is INERT — a typed limit error, not a crash, and
+        #     NOT a partial render (zero rows emitted).
+        assert flatten_result["status"] == "error"
+        assert flatten_result["error_type"] == "limit"
+        assert flatten_result["result_count"] == 0
+
+        # (b) The rest of the note renders: the benign block is unaffected by the
+        #     hostile sibling and still succeeds.
+        assert benign_result["status"] == "success", benign_result.get("error")
