@@ -120,25 +120,41 @@ class AggregatedGroup:
 # FLATTEN
 # ---------------------------------------------------------------------------
 def flatten(
-    rows: list[dict[str, Any]], field_name: str, max_cardinality: int
+    rows: list[dict[str, Any]],
+    field_name: str,
+    max_cardinality: int,
+    alias: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Expand each row over the list-valued frontmatter ``field_name``.
+    """Expand each row over a list-valued source — a frontmatter FIELD or a
+    computed list EXPRESSION (US-3 / ADR-006 §Gap #5).
 
-    For a row whose ``field_name`` is a list, emit one row per element (a deep
-    copy with that element substituted as a scalar). Scalar or missing values
-    yield a single unchanged row. An empty list yields zero rows.
+    Phase 2: ``field_name`` is a plain frontmatter list property; each element is
+    substituted back under the SAME key (``alias`` omitted).
 
-    Anti-DoS (ADR-004 §2.(d), FIGÉE): if a single row expands beyond
-    ``max_cardinality`` elements, the whole block is **inert** — a
+    Phase 4 (US-3): ``field_name`` may be a computed ``file.*`` list EXPRESSION
+    (e.g. ``file.links`` → the row's outlinks). The list is read from the
+    already-resolved dataset row (never the filesystem, never a graph recompute);
+    each element is bound under ``alias`` so a projected column can address it.
+
+    For a row whose source is a list, emit one row per element (a deep copy with
+    that element substituted). Scalar or missing values yield a single unchanged
+    row. An empty list yields zero rows.
+
+    Anti-DoS (ADR-004 §2.(d) / ADR-006 §Gap #5, FIGÉE): if a single row expands
+    beyond ``max_cardinality`` elements, the whole block is **inert** — a
     ``BasesLimitError`` is raised (caught by the integration envelope as
     error_type "limit"). This is intentionally *not* a per-row truncation: a
     hostile note must not silently drop data.
 
     The input rows are never mutated (deep-copied on expansion).
     """
+    # The key under which each unfolded element is written. For an expression
+    # FLATTEN the alias makes the element addressable as a column; for a plain
+    # field FLATTEN it stays the field name (Phase 2 behaviour).
+    out_key = alias or field_name
     out: list[dict[str, Any]] = []
     for row in rows:
-        value = _read_frontmatter_field(row, field_name)
+        value = _read_flatten_source(row, field_name)
         if not isinstance(value, list):
             # scalar or missing -> single unchanged row (no copy needed)
             out.append(row)
@@ -150,7 +166,7 @@ def flatten(
             )
         for element in value:
             new_row = deepcopy(row)
-            new_row.setdefault("frontmatter", {})[field_name] = element
+            new_row.setdefault("frontmatter", {})[out_key] = element
             out.append(new_row)
     return out
 
@@ -235,15 +251,51 @@ def aggregate(
                 # Degradation (ADR-004 §2.(e)): a heterogeneous/invalid input to
                 # a pure aggregate degrades the cell to None, never crashes.
                 summary[output_name] = None
-        aggregated.append(
-            AggregatedGroup(key=key, rows=group_rows, summary=summary)
-        )
+        aggregated.append(AggregatedGroup(key=key, rows=group_rows, summary=summary))
     return aggregated
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers (pure, no I/O)
 # ---------------------------------------------------------------------------
+# Computed ``file.*`` list expressions FLATTEN may target (US-3 / ADR-006 §Gap
+# #5). A CLOSED map — never a getattr on the row's file dict. Each reader pulls
+# the list from the already-resolved dataset row (nested ``file`` dict, then the
+# flat fallbacks the provider also emits), never the filesystem nor a graph
+# recompute. ``file.links`` and ``file.outlinks`` are aliases of the row's
+# outlinks (the union the provider exposes); kept as two names so a block may use
+# either spelling.
+_FLATTEN_FILE_EXPRESSIONS: dict[str, Any] = {
+    "file.links": lambda row: _read_outlinks(row),
+    "file.outlinks": lambda row: _read_outlinks(row),
+}
+
+
+def _read_outlinks(row: dict[str, Any]) -> Any:
+    """Read the row's outlinks list from the dataset only (no FS, no getattr)."""
+    file_obj = row.get("file")
+    if isinstance(file_obj, dict):
+        value = file_obj.get("outlinks")
+        if value is not None:
+            return value
+    # Flat fallbacks the provider may emit alongside the nested shape.
+    return row.get("file.outlinks") or row.get("outlinks")
+
+
+def _read_flatten_source(row: dict[str, Any], field_name: str) -> Any:
+    """Read the FLATTEN source — a computed ``file.*`` expression or a property.
+
+    For a computed ``file.*`` list EXPRESSION (US-3), resolve it through the
+    CLOSED ``_FLATTEN_FILE_EXPRESSIONS`` map (dataset only). Otherwise fall back
+    to the Phase 2 plain-field reader (frontmatter / row root). No filesystem
+    access and no dynamic dispatch in either path.
+    """
+    reader = _FLATTEN_FILE_EXPRESSIONS.get(field_name)
+    if reader is not None:
+        return reader(row)
+    return _read_frontmatter_field(row, field_name)
+
+
 def _read_frontmatter_field(row: dict[str, Any], field_name: str) -> Any:
     """Read a frontmatter (or top-level) field for FLATTEN without FieldResolver.
 

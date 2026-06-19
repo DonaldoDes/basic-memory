@@ -90,6 +90,12 @@ ALLOWED_FUNCTIONS = frozenset(
         "sum",
         "average",
         "count",
+        # Lambda iterators OUTSIDE an aggregate (US-3 / ADR-006 §Gap #5):
+        # ``any(list, lambda)`` → bool, ``filter(list, lambda)`` → sub-list. They
+        # reuse the SAME sandboxed lambda mechanism as P2 (FLambda compiled by the
+        # evaluator) — no second evaluator, closed dispatch only.
+        "any",
+        "filter",
         # Property-chain converter usable in call position
         "asFile",
     }

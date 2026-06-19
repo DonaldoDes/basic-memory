@@ -28,6 +28,7 @@ from basic_memory.bases.schema import (
     MAX_FORMULAS_PER_BLOCK,
     MAX_VIEWS,
     MAX_YAML_NODES,
+    BasesFlatten,
     BasesFormula,
     BasesGroupBy,
     BasesQuery,
@@ -282,9 +283,7 @@ class BasesParser:
         return compiled, predicates
 
     @classmethod
-    def _try_conditional_aggregate(
-        cls, name: str, expr: str
-    ) -> tuple[str, "FormulaNode"] | None:
+    def _try_conditional_aggregate(cls, name: str, expr: str) -> tuple[str, "FormulaNode"] | None:
         """Return ``(fn_name, predicate_ast)`` iff ``expr`` is ``count``/``sum``
         over a predicate; else ``None`` (the expression is a post-agg formula).
 
@@ -327,13 +326,40 @@ class BasesParser:
         return BasesGroupBy(field=value)
 
     @classmethod
-    def _parse_flatten(cls, flatten: Any) -> str | None:
-        """Parse ``flatten:`` — the name of a list-valued field to expand."""
+    def _parse_flatten(cls, flatten: Any) -> "str | BasesFlatten | None":
+        """Parse ``flatten:`` — a field name OR an expression+alias (US-3).
+
+        Two accepted forms:
+          - ``flatten: <field>`` (string) — Phase 2: a list-valued frontmatter
+            property unfolded under its own key.
+          - ``flatten: {expression: file.links, as: link}`` (mapping) — Phase 4
+            (ADR-006 §Gap #5): a COMPUTED ``file.*`` list expression unfolded one
+            row per element, bound under the ``as`` alias.
+
+        The expression is validated against the CLOSED
+        ``_FLATTEN_FILE_EXPRESSIONS`` whitelist — an unknown expression makes the
+        block inert (refused at parse, never executed). No dynamic dispatch.
+        """
         if flatten is None:
             return None
-        if not isinstance(flatten, str):
-            raise BasesParseError("'flatten' must be a field name (string)")
-        return flatten
+        if isinstance(flatten, str):
+            return flatten
+        if isinstance(flatten, dict):
+            from basic_memory.bases.aggregate import _FLATTEN_FILE_EXPRESSIONS
+
+            expression = flatten.get("expression")
+            alias = flatten.get("as") or flatten.get("alias")
+            if not isinstance(expression, str) or not expression:
+                raise BasesParseError("'flatten' mapping requires a string 'expression'")
+            if not isinstance(alias, str) or not alias:
+                raise BasesParseError("'flatten' mapping requires a string 'as' alias")
+            if expression not in _FLATTEN_FILE_EXPRESSIONS:
+                raise BasesUnsupportedError(
+                    f"FLATTEN expression '{expression}' is outside the closed "
+                    f"whitelist {sorted(_FLATTEN_FILE_EXPRESSIONS)}"
+                )
+            return BasesFlatten(expression=expression, alias=alias)
+        raise BasesParseError("'flatten' must be a field name or an expression mapping")
 
     @classmethod
     def _parse_summaries(
@@ -411,8 +437,7 @@ class BasesParser:
         m = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*", expr, re.DOTALL)
         if not m:
             raise BasesParseError(
-                f"Summary '{name}' must be of the form fn(field) or fn(predicate), "
-                f"got {expr!r}"
+                f"Summary '{name}' must be of the form fn(field) or fn(predicate), got {expr!r}"
             )
         return m.group(1), m.group(2).strip()
 

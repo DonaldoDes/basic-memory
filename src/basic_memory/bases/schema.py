@@ -113,6 +113,21 @@ MAX_FORMULA_RESULT_SIZE = 100_000  # PROVISOIRE — recalibrer (ADR-004 §2.(d))
 # ---------------------------------------------------------------------------
 MAX_DURATION_DAYS = 100_000  # PROVISOIRE — recalibrer (ADR-006 §NC-4)
 
+# ---------------------------------------------------------------------------
+# Phase 4 iterator bound (US-3 / ADR-006 §Gap #5, §"Bornes anti-DoS").
+#
+# MAX_ITERATOR_CARDINALITY bounds the length of the list a lambda iterator
+# (``any(list, lambda)`` / ``filter(list, lambda)``) may scan. Each element runs
+# the predicate (a sandboxed closure), so an unbounded list would let a hostile
+# note drive an arbitrary number of predicate evaluations (a DoS amplification
+# the per-node iteration bound does not directly cap, since one ``filter`` node
+# fans out to N sub-evaluations). Crossing the bound raises BasesLimitError
+# (block inert, error_type "limit") BEFORE any predicate runs — NO partial
+# evaluation: a hostile note must not silently drop data. Value inherits the
+# P2/P3 list bound (≤ 500). PROVISOIRE — recalibrer sur baseline (ADR-006 §NC-4).
+# ---------------------------------------------------------------------------
+MAX_ITERATOR_CARDINALITY = 500  # PROVISOIRE — recalibrer (ADR-006 §NC-4)
+
 # Re-export for executor convenience.
 __all__ = [
     "MAX_BLOCK_BYTES",
@@ -128,6 +143,7 @@ __all__ = [
     "FORMULA_BUDGET_MS",
     "MAX_FORMULA_RESULT_SIZE",
     "MAX_DURATION_DAYS",
+    "MAX_ITERATOR_CARDINALITY",
     "MAX_YAML_NODES",
     "MAX_VIEWS",
     "MAX_RENDERED_ROWS",
@@ -138,6 +154,7 @@ __all__ = [
     "BasesSortClause",
     "BasesFormula",
     "BasesGroupBy",
+    "BasesFlatten",
     "BasesView",
     "BasesQuery",
 ]
@@ -190,6 +207,22 @@ class BasesGroupBy:
 
 
 @dataclass
+class BasesFlatten:
+    """A FLATTEN-on-EXPRESSION clause (Phase 4, US-3 / ADR-006 §Gap #5).
+
+    Unfolds a COMPUTED list (e.g. ``file.links`` — the row's outlinks) into one
+    row per element, binding each element to ``alias``. Distinct from the Phase 2
+    plain-field FLATTEN (``flatten: <field>``, a frontmatter list property): the
+    expression is a ``file.*`` computed list resolved from the dataset row (no
+    filesystem, no graph recompute). The alias makes the element addressable as a
+    projected column (``order: [- link]``).
+    """
+
+    expression: str
+    alias: str
+
+
+@dataclass
 class BasesView:
     """A rendered view (only views[0] is rendered in Phase 1)."""
 
@@ -200,7 +233,10 @@ class BasesView:
     limit: int | None = None
     # Phase 2 (ADR-004 §4, US-005) — GROUP BY / FLATTEN / summaries.
     group_by: BasesGroupBy | None = None
-    flatten: str | None = None
+    # Phase 2: a plain frontmatter list field (``str``). Phase 4 (US-3): a
+    # ``BasesFlatten`` to unfold a computed list EXPRESSION (``file.links``) with
+    # an alias. Both forms drive the same ``aggregate.flatten`` pipeline stage.
+    flatten: "str | BasesFlatten | None" = None
     # summaries: {output_name: (aggregate_fn_name, source_field)}. The fn name
     # is validated against the closed AGGREGATE_WHITELIST at parse time; an
     # aggregate outside the whitelist makes the block inert (unsupported). Never
