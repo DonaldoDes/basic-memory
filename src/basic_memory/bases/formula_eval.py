@@ -71,6 +71,7 @@ from basic_memory.bases.schema import (
     MAX_FORMULA_ITERATIONS,
     MAX_FORMULA_RECURSION,
     MAX_FORMULA_RESULT_SIZE,
+    MAX_ITERATOR_CARDINALITY,
 )
 from basic_memory.dataview.executor.field_resolver import FieldResolver
 
@@ -451,6 +452,16 @@ class FormulaEvaluator:
         # straight from the dataset row, never the OS, never a graph recompute.
         if name == "file":
             return self._row_file()
+        # US-3 (ADR-006 §Gap #5): ``file.links`` / ``file.outlinks`` resolve to
+        # the row's outlinks list (the union the provider exposes), read straight
+        # from the dataset row — never the OS, never a graph recompute. This lets
+        # an iterator ``any(file.outlinks, l => …)`` / ``filter(file.links, …)``
+        # scan the same outlinks ``file.hasLink`` uses. Resolved here (in the
+        # bases sandbox), NOT in the core ``FieldResolver`` (diff confined to
+        # ``bases/``). A row field of the same flat key still takes precedence
+        # below (so a synthetic flat dataset is honoured first).
+        if name in ("file.links", "file.outlinks") and name not in self.row:
+            return self._row_file()._outlinks
         # Executor-projected rows carry file.* as a flat top-level key
         # (e.g. row["file.path"]); honour it first so asFile().path reads the
         # dataset value directly (US-003 spec). Then fall back to FieldResolver
@@ -728,9 +739,7 @@ def _make_dur(args: list[Any]) -> _dt.timedelta:
     kwarg, days_per_unit = _DUR_UNITS[unit]
     # Bound the magnitude BEFORE constructing the timedelta (anti-DoS).
     if abs(count * days_per_unit) > MAX_DURATION_DAYS:
-        raise BasesLimitError(
-            f"Duration magnitude exceeds {MAX_DURATION_DAYS} days bound"
-        )
+        raise BasesLimitError(f"Duration magnitude exceeds {MAX_DURATION_DAYS} days bound")
     return _dt.timedelta(**{kwarg: count})
 
 
@@ -804,6 +813,65 @@ def _dateformat(args: list[Any]) -> str:
     return "".join(out)
 
 
+# --------------------------------------------------------------------------- #
+# Lambda iterators OUTSIDE an aggregate (US-3 / ADR-006 §Gap #5).
+#
+# ``any(list, lambda)`` and ``filter(list, lambda)`` are closed, audited entries
+# of ``_FUNCTIONS`` like every other whitelist function. They receive the already
+# evaluated argument list: ``args[0]`` is the iterable (resolved from the dataset
+# row by the evaluator — never the filesystem) and ``args[1]`` is the predicate,
+# which is the EXACT callable produced by ``FormulaEvaluator._eval_lambda`` (the
+# P2 closed-env closure) — there is no second evaluator. The predicate runs over
+# the host Python ``bool``; no eval/exec/getattr is introduced.
+#
+# Anti-DoS (ADR-006 §"Bornes anti-DoS"): the iterable length is bounded by
+# ``MAX_ITERATOR_CARDINALITY`` BEFORE any predicate runs. Over the bound the
+# whole block is inert (BasesLimitError → error_type "limit") with NO partial
+# evaluation — a hostile note must not silently drop data.
+# --------------------------------------------------------------------------- #
+def _as_iter_list(value: Any) -> list[Any]:
+    """Coerce the iterator's first arg to a bounded list (no FS, no generator).
+
+    ``None``/scalar → empty list (a non-list receiver yields no elements, never a
+    crash). A list/tuple is length-checked against the cardinality bound first.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        if len(value) > MAX_ITERATOR_CARDINALITY:
+            raise BasesLimitError(
+                f"Iterator over {len(value)} elements exceeds the bound of "
+                f"{MAX_ITERATOR_CARDINALITY}"
+            )
+        return list(value)
+    # A bare string/scalar is not an iterable-of-elements for our purposes.
+    return []
+
+
+def _iter_predicate(args: list[Any]) -> Callable[[Any], Any]:
+    """Return the predicate callable (the P2 ``_eval_lambda`` closure).
+
+    A non-callable second argument makes the iterator inert via a typed error
+    (never a getattr/exec fallback).
+    """
+    pred = _arg(args, 1)
+    if not callable(pred):
+        raise BasesExecutionError("Iterator predicate is not a lambda")
+    return pred
+
+
+def _fn_any(args: list[Any]) -> bool:
+    items = _as_iter_list(_arg(args, 0))
+    predicate = _iter_predicate(args)
+    return any(bool(predicate(element)) for element in items)
+
+
+def _fn_filter(args: list[Any]) -> list[Any]:
+    items = _as_iter_list(_arg(args, 0))
+    predicate = _iter_predicate(args)
+    return [element for element in items if bool(predicate(element))]
+
+
 _FUNCTIONS = {
     # --- Text ---
     "lower": lambda a: _to_str(_arg(a, 0)).lower(),
@@ -844,6 +912,12 @@ _FUNCTIONS = {
         )
     ),
     "count": lambda a: len(a),
+    # --- Lambda iterators OUTSIDE an aggregate (US-3 / ADR-006 §Gap #5) ---
+    # any(list, lambda) -> bool ; filter(list, lambda) -> sub-list. The lambda is
+    # the P2 _eval_lambda closure; the list is bounded by MAX_ITERATOR_CARDINALITY
+    # (block inert over the bound, no partial eval). No second evaluator.
+    "any": _fn_any,
+    "filter": _fn_filter,
     # --- Property-chain converter usable in call position ---
     "asFile": lambda a: _VirtualFile(_arg(a, 0)),
 }

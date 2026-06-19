@@ -28,6 +28,7 @@ from basic_memory.bases.schema import (
     MAX_AGG_ONLY_GROUPS,
     MAX_FLATTEN_CARDINALITY,
     MAX_RENDERED_ROWS,
+    BasesFlatten,
     BasesQuery,
     BasesSortClause,
     ViewType,
@@ -113,7 +114,19 @@ class BasesExecutor:
             filtered = self._filter_by_where(filtered, query.where)
 
         if query.view.flatten is not None:
-            filtered = flatten(filtered, query.view.flatten, MAX_FLATTEN_CARDINALITY)
+            flatten_clause = query.view.flatten
+            if isinstance(flatten_clause, BasesFlatten):
+                # FLATTEN on a computed list EXPRESSION (US-3 / ADR-006 §Gap #5):
+                # unfold ``expression`` (a closed file.* list) under ``alias``.
+                filtered = flatten(
+                    filtered,
+                    flatten_clause.expression,
+                    MAX_FLATTEN_CARDINALITY,
+                    alias=flatten_clause.alias,
+                )
+            else:
+                # Phase 2 plain-field FLATTEN (string field name).
+                filtered = flatten(filtered, flatten_clause, MAX_FLATTEN_CARDINALITY)
 
         return filtered
 
@@ -159,9 +172,7 @@ class BasesExecutor:
         """
         # Leaf: delegate to the sandbox (host threaded for ``this``/``hasLink``).
         if isinstance(node, FormulaLeafNode):
-            value, _err = safe_evaluate_formula(
-                node.formula, note, host=self.host, now=self._now
-            )
+            value, _err = safe_evaluate_formula(node.formula, note, host=self.host, now=self._now)
             return bool(value)
 
         # Combination node: AND / OR (and the `= False` shape used by `not`).
