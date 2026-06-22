@@ -102,7 +102,7 @@ Normalisation vers l'AST Dataview : `==` → `=`, `&&` → `AND`, `||` → `OR`,
 
 ### Fonctions de parité (whitelist fermée, 5)
 
-- `file.inFolder(str)` — ≡ `FROM` préfixe : match par préfixe de `file.path` des entités du dataset, **jamais d'accès filesystem**.
+- `file.inFolder(str)` — ≡ `FROM` préfixe : match par préfixe de `file.path` des entités du dataset, **jamais d'accès filesystem**. **Négation (US-7, M-Bases-P4)** : `not file.inFolder("X")` / `!file.inFolder("X")` en feuille de filtre est une **exclusion de sous-arbre** (pas une source `FROM`) — réécrite en `not contains(file.path, "X")` (test de préfixe par row, grammaire fermée), routée vers le même sandbox que toute feuille fonction-appel niée ; `inFolder` n'est **jamais** ajouté à la whitelist de formules.
 - `contains`, `length`, `lower`, `upper` — tolérantes aux **deux formes** (méthode `value.lower()` ET globale `lower(value)`), normalisées vers `FunctionCallNode`.
 
 Toute autre fonction (`link`, `meta`, `round`, `dateformat`, …), toute property chain (`value.asFile()…`), tout lambda → `BasesUnsupportedError` → bloc inerte.

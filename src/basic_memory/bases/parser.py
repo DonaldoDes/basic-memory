@@ -616,6 +616,20 @@ class BasesParser:
             from_holder["from"] = infolder
             return None
 
+        # US-7 (M-Bases-P4): a NEGATED file.inFolder leaf (``not
+        # file.inFolder(...)`` / ``!file.inFolder(...)``) is NOT a FROM source —
+        # it is a per-row SUBTREE EXCLUSION. ``inFolder`` is deliberately NOT in
+        # the formula whitelist, so the negated leaf can't reach the formula
+        # sandbox as-is (it would fail with "Trailing tokens"). Rewrite it to the
+        # closed-grammar equivalent ``not contains(file.path, "<folder>")`` —
+        # mirroring ``_filter_by_from``'s substring path test — so it routes
+        # through the SAME audited sandbox as every other negated function leaf.
+        # The dispatch stays closed (no new function), the predicate evaluates on
+        # the dataset row (never the filesystem).
+        negated_infolder = cls._rewrite_negated_infolder(leaf)
+        if negated_infolder is not None:
+            return compile_filter_leaf(negated_infolder)
+
         # US-a / ADR-005 §Axe 1: route the leaf to the Phase 2 formula sandbox
         # (formula_parser → FormulaLeafNode evaluated by formula_eval) instead of
         # the deprecated 4-function leaf_parser. The FROM/WHERE/and/or/not
@@ -637,6 +651,41 @@ class BasesParser:
         if m:
             return m.group(2)
         return None
+
+    @staticmethod
+    def _rewrite_negated_infolder(leaf: str) -> str | None:
+        """Rewrite ``not file.inFolder("X")`` to ``not contains(file.path, "X")``.
+
+        US-7 (M-Bases-P4): a negated ``file.inFolder`` leaf is a per-row subtree
+        exclusion, not a FROM source. ``inFolder`` is intentionally outside the
+        closed formula whitelist, so this rewrites the leaf to the equivalent
+        closed-grammar predicate over ``file.path`` (a substring path test that
+        mirrors ``BasesExecutor._filter_by_from``'s ``from_source in path``),
+        keeping the negation word/operator so the formula parser's ``_parse_not``
+        applies it. Returns ``None`` if the leaf is not a negated inFolder (so the
+        caller falls through to the normal formula-leaf path unchanged).
+
+        Only the leading ``not ``/``!`` operator and the inner string literal are
+        recognised — the folder is taken verbatim from the quoted literal, never
+        evaluated. A folder containing a literal ``"`` would break the rewritten
+        string; such a path is refused downstream by the formula parser (block
+        inert), never mis-evaluated.
+        """
+        import re
+
+        m = re.fullmatch(
+            r"\s*(not\s+|!\s*)" + re.escape(_INFOLDER) + r'\(\s*(["\'])(.*?)\2\s*\)\s*',
+            leaf,
+        )
+        if not m:
+            return None
+        folder = m.group(3)
+        # Reject a folder literal carrying a double-quote: it would break the
+        # rewritten ``contains(file.path, "<folder>")`` string. Returning the leaf
+        # to the formula path lets the closed parser refuse it (block inert).
+        if '"' in folder:
+            return None
+        return f'not contains(file.path, "{folder}")'
 
     # ------------------------------------------------------------------ bounds
     @classmethod
