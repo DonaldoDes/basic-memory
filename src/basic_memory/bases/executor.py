@@ -190,8 +190,42 @@ class BasesExecutor:
 
         raise BasesExecutionError(f"Unsupported WHERE node: {type(node).__name__}")
 
-    def _project(self, notes: list[dict[str, Any]], query: BasesQuery) -> list[dict[str, Any]]:
+    @staticmethod
+    def _summary_names(query: BasesQuery) -> set[str]:
+        """Output names of every GROUP-level aggregate declared on the view.
+
+        Union of plain ``summaries:``, CONDITIONAL summaries
+        (``summary_predicates``, e.g. ``count(status == "Done")``) and
+        post-aggregation ``aggFormulas:`` (e.g. ``round(Done/Total*100)``). These
+        names are NOT item frontmatter — they are computed once per group. Used
+        by ``_project`` to materialise the group value into each item row's cell
+        (BUG-019), the same set the aggregate-only path already injects.
+        """
+        names: set[str] = set()
+        names.update(query.view.summaries.keys())
+        names.update(query.view.summary_predicates.keys())
+        names.update(query.view.agg_formulas.keys())
+        return names
+
+    def _project(
+        self,
+        notes: list[dict[str, Any]],
+        query: BasesQuery,
+        group_summary: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Project item rows for the (flat or per-group) table.
+
+        ``group_summary`` (BUG-019): when the rows belong to a GROUP BY group,
+        this is that group's computed summary dict (plain + conditional + post-agg
+        values). A column whose raw token is a summary OUTPUT NAME resolves to the
+        group value here — a group aggregate is constant across the group's items,
+        so it repeats per-row (Obsidian Bases / Dataview grouped-table semantics).
+        The group value is AUTHORITATIVE: it wins over any item frontmatter field
+        that happens to collide with a summary name (BUG-019 ADV-1/ADV-3), and it
+        is read from the trusted summary dict, never from item content.
+        """
         order = query.view.order
+        summary_names = self._summary_names(query) if group_summary else set()
         rows: list[dict[str, Any]] = []
         for note in notes:
             title = note.get("title", "Untitled")
@@ -209,6 +243,13 @@ class BasesExecutor:
             # Project TABLE columns (key by alias when defined).
             for col in order:
                 alias = self._column_key(query, col)
+                # Group-level summary column (BUG-019): the value is the group's
+                # computed aggregate, NOT a per-item field. Resolved BEFORE the
+                # static path so an item frontmatter field colliding with a
+                # summary name can never override the trusted group value.
+                if col in summary_names:
+                    row[alias] = group_summary.get(col)  # type: ignore[union-attr]
+                    continue
                 if col.startswith(_FORMULA_PREFIX):
                     # Calculated column: evaluate the formula AST in the sandbox
                     # against the (nested-shape) note, so field references like
@@ -358,8 +399,11 @@ class BasesExecutor:
         sections: list[str] = []
         all_rows: list[dict[str, Any]] = []
         for grp in aggregated:
-            # Project (and sort) the entities of this group for display.
-            grp_rows = self._project(grp.rows, query)
+            # Project (and sort) the entities of this group for display. The
+            # group's summary dict is threaded in so summary/aggFormula columns
+            # referenced in ``order:`` render the GROUP value in each item cell
+            # (BUG-019) instead of an empty static-field lookup.
+            grp_rows = self._project(grp.rows, query, group_summary=grp.summary)
             if query.view.sort:
                 grp_rows = self._apply_sort(grp_rows, query.view.sort, query)
             sections.append(self._render_group_section(query, grp, grp_rows))
