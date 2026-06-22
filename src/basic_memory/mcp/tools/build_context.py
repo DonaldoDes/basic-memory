@@ -23,7 +23,6 @@ from basic_memory.schemas.memory import (
     ObservationSummary,
     RelationSummary,
 )
-from basic_memory.dataview.integration import create_dataview_integration
 from basic_memory.bases.detector import BasesDetector
 from basic_memory.bases.integration import create_bases_integration
 
@@ -284,73 +283,11 @@ async def build_context(
                 max_related=max_related,
             )
 
-            # Enrich with Dataview if enabled. Looks at dataview_queries
-            # stored in primary result metadata, fetches notes once, and
-            # appends rendered query results to primary.content.
-            if enable_dataview:
-                has_queries = any(
-                    context_result.primary_result.type == "entity"
-                    and context_result.primary_result.metadata
-                    and "dataview_queries" in context_result.primary_result.metadata
-                    for context_result in graph.results
-                )
-
-                if has_queries:
-                    logger.info(
-                        "Enriching graph context with Dataview queries from metadata"
-                    )
-                    knowledge_client = KnowledgeClient(
-                        client, active_project.external_id
-                    )
-                    notes = await knowledge_client.list_entities_for_dataview()
-                    integration = create_dataview_integration(
-                        notes_provider=lambda: notes
-                    )
-
-                    for context_result in graph.results:
-                        primary = context_result.primary_result
-                        if (
-                            primary.type == "entity"
-                            and primary.metadata
-                            and "dataview_queries" in primary.metadata
-                            and primary.content
-                        ):
-                            queries = primary.metadata["dataview_queries"]
-                            if queries:
-                                try:
-                                    dataview_section = (
-                                        "\n\n---\n## Dataview Query Results\n\n"
-                                    )
-                                    for idx, query_text in enumerate(queries, 1):
-                                        result = integration.execute_raw_query(
-                                            query_text=query_text,
-                                            query_id=f"dv-{idx}",
-                                        )
-                                        if (
-                                            result["status"] == "success"
-                                            and result.get("result_markdown")
-                                        ):
-                                            dataview_section += (
-                                                result["result_markdown"] + "\n\n"
-                                            )
-
-                                    if len(dataview_section) > len(
-                                        "\n\n---\n## Dataview Query Results\n\n"
-                                    ):
-                                        primary.content = (
-                                            cast(str, primary.content)
-                                            + dataview_section
-                                        )
-                                except Exception as e:  # pragma: no cover
-                                    logger.warning(
-                                        "Failed to execute Dataview queries "
-                                        f"from metadata: {e}"
-                                    )
-                else:
-                    logger.debug(
-                        "No dataview_queries found in metadata, skipping "
-                        "Dataview enrichment"
-                    )
+            # Dataview enrichment is DEPRECATED (no-op). ``enable_dataview`` is
+            # still accepted on the signature for backward compatibility but no
+            # longer executes ``​```dataview​`` blocks (they are left inert). The
+            # Dataview→Bases migration is complete; use ``enable_bases`` below
+            # for live query rendering.
 
             # Enrich with Bases (```base```) via on-the-fly detection on the
             # primary content. Unlike Dataview (which reads dataview_queries
