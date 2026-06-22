@@ -548,6 +548,20 @@ class FormulaEvaluator:
         # already a date — it never turns two strings into dates (non-regression:
         # ``title == "foo"`` stays a string compare).
         left, right = self._coerce_date_operands(op, left, right)
+        # BUG-018 (M-Bases-P4): a YAML frontmatter boolean ``agent_context: true``
+        # is NOT stored as a Python ``bool``. The core parser
+        # ``entity_parser.normalize_frontmatter_value(True)`` returns ``str(True)``
+        # == ``"True"``, so the row projected by ``list_entities_for_dataview``
+        # carries the STRING ``"True"`` / ``"False"`` (confirmed on the live DB).
+        # Without coercion ``field == true`` evaluates ``"True" == True`` → False
+        # for every note → the 0-item live bug. Mirror of ``_coerce_date_operands``:
+        # for the equality ops ONLY, when exactly one side is a Python ``bool`` and
+        # the other is the stringified boolean from the provider, coerce that string
+        # to the matching ``bool`` from a CLOSED {true,false} table (case-insensitive).
+        # Never turns an arbitrary string into a bool (``"Truelike"`` stays a string),
+        # never fires unless one operand is already a real ``bool`` (non-regression:
+        # ``status == "Active"`` is untouched), and never introduces eval/getattr.
+        left, right = self._coerce_boolean_operands(op, left, right)
         # Bound the PROJECTED result size of amplifying ops BEFORE allocating
         # (pillar (d) — allocation-bomb class). Raises BasesLimitError on excess.
         self._guard_amplifying_result(op, left, right)
@@ -620,6 +634,44 @@ class FormulaEvaluator:
                     left = left.date()
                 if r_is_dt:
                     right = right.date()
+        return left, right
+
+    # ------------------------------------------ boolean coercion (BUG-018)
+    _BOOL_OPS = frozenset({"==", "!="})
+    # CLOSED table: the only strings ever coerced to a bool. The provider stores
+    # YAML booleans via ``str(True)`` / ``str(False)`` → ``"True"`` / ``"False"``;
+    # the lower forms are tolerated for parity with any other import path. Nothing
+    # outside this table is ever turned into a bool (``"Truelike"`` stays a string).
+    _BOOL_STRINGS = {"true": True, "false": False}
+
+    @classmethod
+    def _coerce_boolean_operands(cls, op: str, left: Any, right: Any) -> tuple[Any, Any]:
+        """Coerce a stringified-boolean operand to a ``bool`` against a real bool.
+
+        Fires ONLY for ``==`` / ``!=`` and ONLY when exactly one side is a Python
+        ``bool`` and the other is a string in the CLOSED {true,false} table
+        (case-insensitive). This bridges the provider's stringified frontmatter
+        boolean (``"True"`` from ``normalize_frontmatter_value``) to a literal
+        ``true`` / ``false`` in a filter. A string outside the table is left
+        unchanged (so ``"Truelike" == true`` stays a string-vs-bool compare →
+        False), and two non-bool operands pass through untouched (non-regression:
+        ``status == "Active"`` is a plain string compare). ``bool`` is a subclass
+        of ``int``, so the ``isinstance(..., bool)`` guard is explicit on both
+        sides to avoid catching ``1 == true``-style numeric operands.
+        """
+        if op not in cls._BOOL_OPS:
+            return left, right
+        left_is_bool = isinstance(left, bool)
+        right_is_bool = isinstance(right, bool)
+        # Exactly one side a real bool; the other a string in the closed table.
+        if left_is_bool and not right_is_bool and isinstance(right, str):
+            coerced = cls._BOOL_STRINGS.get(right.strip().lower())
+            if coerced is not None:
+                right = coerced
+        elif right_is_bool and not left_is_bool and isinstance(left, str):
+            coerced = cls._BOOL_STRINGS.get(left.strip().lower())
+            if coerced is not None:
+                left = coerced
         return left, right
 
     # ---------------------------------------------------------------- FCall
