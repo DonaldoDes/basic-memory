@@ -2,6 +2,19 @@
 
 This module provides parsing and execution of Dataview queries for Basic Memory.
 
+> **DEPRECATED — the MCP Dataview *rendering path* is inert.** The
+> Dataview→Bases migration is complete (vault 100% Obsidian Bases). The
+> `enable_dataview` flag on `read_note` / `build_context` / `search_notes` is
+> still **accepted** for backward compatibility but is now a **no-op**:
+> ```` ```dataview ```` blocks are left inert (raw markdown), exactly like
+> ```` ```base ```` blocks when `enable_bases=False`. The integration entry
+> point (`DataviewIntegration.process_note` / `execute_raw_query`) is
+> neutralised.
+>
+> The parser / lexer / detector / executor *primitives* below are **retained**:
+> the Bases executor (`basic_memory.bases`) reuses them. Only the MCP-facing
+> rendering wrapper is deprecated. Use `enable_bases` for live query rendering.
+
 ## Features
 
 ### Phase 1: Parser ✅

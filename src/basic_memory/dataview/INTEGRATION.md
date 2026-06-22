@@ -1,6 +1,15 @@
 # Dataview MCP Integration
 
-This document describes how Dataview queries are integrated into Basic Memory's MCP tools.
+> **DEPRECATED (no-op).** The Dataview→Bases migration is complete. The
+> integration described below no longer executes any query: `enable_dataview`
+> on `read_note` / `search_notes` / `build_context` is accepted for backward
+> compatibility but renders ```` ```dataview ```` blocks **inert** (raw
+> markdown). `DataviewIntegration.process_note` returns `[]` and
+> `execute_raw_query` returns an inert `status="deprecated"` payload. This
+> document is retained for historical reference; use `enable_bases` (Obsidian
+> Bases) for live query rendering.
+
+This document describes how Dataview queries were integrated into Basic Memory's MCP tools.
 
 ## Overview
 

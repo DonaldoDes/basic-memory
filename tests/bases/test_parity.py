@@ -15,7 +15,8 @@ Stratification (ADR-003 §5 / US-006):
 import pytest
 
 from basic_memory.bases.integration import create_bases_integration
-from basic_memory.dataview.integration import create_dataview_integration
+from basic_memory.dataview.executor.executor import DataviewExecutor
+from basic_memory.dataview.parser import DataviewParser
 
 
 def _corpus_notes():
@@ -53,11 +54,16 @@ def _corpus_notes():
 
 
 def _render_dataview(dql: str) -> str:
-    integ = create_dataview_integration(notes_provider=_corpus_notes)
-    block = f"```dataview\n{dql}\n```"
-    results = integ.process_note(block)
-    assert results and results[0]["status"] == "success", results
-    return results[0]["result_markdown"]
+    """Oracle: render a DQL query with the retained Dataview *executor* primitives.
+
+    The MCP-facing ``DataviewIntegration`` wrapper is deprecated (no-op), but the
+    underlying parser/executor remain as shared infrastructure (the Bases
+    executor reuses them). The parity oracle therefore drives them directly,
+    keeping Bases↔Dataview byte-parity coverage intact.
+    """
+    query = DataviewParser.parse(dql)
+    executor = DataviewExecutor(_corpus_notes())
+    return executor.execute(query)
 
 
 def _render_bases(yaml_body: str) -> str:

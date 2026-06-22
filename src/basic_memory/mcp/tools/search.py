@@ -31,7 +31,6 @@ from basic_memory.schemas.search import (
     SearchResult,
     SearchRetrievalMode,
 )
-from basic_memory.dataview.integration import create_dataview_integration
 from basic_memory.bases.integration import create_bases_integration
 
 
@@ -1012,34 +1011,11 @@ async def search_notes(
                     # Don't treat this as an error, but the user might want guidance
                     # We return the empty result as normal - the user can decide if they need help
 
-                # Enrich with Dataview if enabled and results have content.
-                # Preserves the fork's on-the-fly Dataview integration alongside
-                # the upstream typed SearchClient pipeline.
-                if enable_dataview and result.results:
-                    logger.info(
-                        f"Enriching {len(result.results)} search results with Dataview"
-                    )
-                    integration = create_dataview_integration()
-
-                    for search_result in result.results:
-                        content = getattr(search_result, "content", None)
-                        if content:
-                            try:
-                                dataview_results = integration.process_note(content)
-                                if dataview_results:
-                                    if not search_result.metadata:
-                                        search_result.metadata = {}
-                                    search_result.metadata["dataview_results"] = (
-                                        dataview_results
-                                    )
-                                    search_result.metadata["dataview_query_count"] = len(
-                                        dataview_results
-                                    )
-                            except Exception as e:  # pragma: no cover
-                                logger.warning(
-                                    "Failed to process Dataview for result "
-                                    f"{search_result.permalink}: {e}"
-                                )
+                # Dataview enrichment is DEPRECATED (no-op). ``enable_dataview``
+                # is still accepted on the signature for backward compatibility
+                # but no longer executes ``​```dataview​`` blocks — they are left
+                # inert. The Dataview→Bases migration is complete; use
+                # ``enable_bases`` below for live query rendering.
 
                 # Enrich with Bases if enabled and results have content.
                 # Independent of the Dataview flag (ADR-003 §4 — flag

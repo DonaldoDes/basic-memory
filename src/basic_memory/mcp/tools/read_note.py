@@ -19,7 +19,6 @@ from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tools.search import search_notes
 from basic_memory.schemas.memory import memory_url_path
 from basic_memory.utils import validate_project_path
-from basic_memory.dataview.integration import create_dataview_integration
 from basic_memory.bases.integration import create_bases_integration
 
 
@@ -102,58 +101,14 @@ async def _enrich_with_bases(
 
 
 async def _enrich_with_dataview(content: str, project_name: str, knowledge_client) -> str:
+    """DEPRECATED no-op: the Dataview executor is retired.
+
+    ``enable_dataview`` is kept on the public signature for backward
+    compatibility but no longer executes ``​```dataview​`` blocks. The blocks are
+    left inert (raw markdown), symmetric to ``​```base​`` when
+    ``enable_bases=False``. Returns ``content`` unchanged.
     """
-    Enrich note content with executed Dataview queries.
-    
-    Args:
-        content: The markdown content
-        project_name: Name of the project (for logging)
-        knowledge_client: KnowledgeClient instance for fetching notes
-        
-    Returns:
-        Content with Dataview results appended
-    """
-    try:
-        # Fetch all notes for Dataview queries
-        notes = await knowledge_client.list_entities_for_dataview()
-        
-        # Create integration with notes provider
-        integration = create_dataview_integration(notes_provider=lambda: notes)
-        
-        # Process the note
-        dataview_results = integration.process_note(content)
-        
-        if not dataview_results:
-            return content
-        
-        # Append Dataview results as a special section
-        enriched = content + "\n\n---\n\n## Dataview Query Results\n\n"
-        enriched += f"*Found {len(dataview_results)} Dataview quer{'y' if len(dataview_results) == 1 else 'ies'}*\n\n"
-        
-        for result in dataview_results:
-            enriched += f"### Query {result['query_id']} (Line {result['line_number']})\n\n"
-            enriched += f"**Type:** {result['query_type']}  \n"
-            enriched += f"**Status:** {result['status']}  \n"
-            enriched += f"**Execution time:** {result['execution_time_ms']}ms  \n\n"
-            
-            if result['status'] == 'success':
-                enriched += f"**Results:** {result['result_count']} item(s)\n\n"
-                if result.get('result_markdown'):
-                    enriched += result['result_markdown'] + "\n\n"
-                
-                if result.get('discovered_links'):
-                    enriched += f"**Discovered links:** {len(result['discovered_links'])}\n\n"
-            else:
-                enriched += f"**Error:** {result.get('error', 'Unknown error')}\n\n"
-            
-            enriched += "---\n\n"
-        
-        return enriched
-        
-    except Exception as e:
-        logger.warning(f"Failed to enrich note with Dataview results: {e}")
-        # Return original content on error
-        return content
+    return content
 
 
 def _is_exact_title_match(identifier: str, title: str) -> bool:
