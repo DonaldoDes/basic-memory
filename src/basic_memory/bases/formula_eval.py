@@ -46,6 +46,7 @@ How that invariant is guaranteed (the 6 pillars of ADR-004 §2):
 import datetime as _dt
 import time
 from collections.abc import Callable
+from pathlib import PurePosixPath as _PurePosixPath
 from typing import Any
 
 from basic_memory.bases.errors import (
@@ -462,6 +463,18 @@ class FormulaEvaluator:
         # below (so a synthetic flat dataset is honoured first).
         if name in ("file.links", "file.outlinks") and name not in self.row:
             return self._row_file()._outlinks
+        # US-8 (ADR-006): ``file.folder`` is a requestable file member. The
+        # provider (knowledge_router) already nests an explicit ``folder`` derived
+        # from ``file_path``; honour it verbatim. But an executor-projected FLAT
+        # row may carry only ``file.path`` and no folder — in that case DERIVE the
+        # folder from the path's parent so ``startsWith(file.folder, …)`` and the
+        # ``file.folder`` column read the REAL dossier instead of an empty string
+        # (the silent-empty trap). Derivation is a pure string parent op on the
+        # dataset row (PurePosixPath) — never the filesystem, never getattr on
+        # content. Resolved here in the bases sandbox (diff confined to bases/),
+        # mirroring the ``file.links`` resolution above.
+        if name == "file.folder":
+            return self._row_folder()
         # Executor-projected rows carry file.* as a flat top-level key
         # (e.g. row["file.path"]); honour it first so asFile().path reads the
         # dataset value directly (US-003 spec). Then fall back to FieldResolver
@@ -469,6 +482,34 @@ class FormulaEvaluator:
         if name in self.row:
             return self.row[name]
         return FieldResolver.resolve_field(self.row, name)
+
+    def _row_folder(self) -> str:
+        """Resolve ``file.folder`` from the dataset row — explicit, else derived.
+
+        Order (dataset only, never the OS):
+        1. explicit nested ``row["file"]["folder"]`` (provider shape), or flat
+           ``row["file.folder"]`` (synthetic/override) — honoured verbatim;
+        2. otherwise DERIVE from the row's ``file.path`` parent
+           (``PurePosixPath(path).parent``) — a pure string operation. A note at
+           the vault root has no parent → empty string (not ``"."``).
+        Never opens, stats or lists a path: derivation is string-only.
+        """
+        file_obj = self.row.get("file")
+        if isinstance(file_obj, dict) and file_obj.get("folder"):
+            return _to_str(file_obj["folder"])
+        flat = self.row.get("file.folder")
+        if flat:
+            return _to_str(flat)
+        path = ""
+        if isinstance(file_obj, dict):
+            path = file_obj.get("path") or ""
+        path = path or self.row.get("file.path") or self.row.get("path") or ""
+        if not path:
+            return ""
+        parent = _PurePosixPath(_to_str(path)).parent
+        # ``PurePosixPath("readme.md").parent`` is ``"."`` — a root-level note has
+        # no folder, expose it as the empty string (not the cwd marker).
+        return "" if str(parent) == "." else str(parent)
 
     def _row_file(self) -> "_VirtualFile":
         """Build the row's own file object, carrying its dataset outlinks.
