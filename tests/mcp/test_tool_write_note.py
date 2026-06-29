@@ -7,8 +7,102 @@ import pytest
 
 from basic_memory import config as config_module
 from basic_memory.mcp.tools import write_note, read_note, delete_note
+from basic_memory.mcp.tools.write_note import _compose_workspace_project_route
 from basic_memory.repository.relation_repository import RelationRepository
 from basic_memory.utils import normalize_newlines
+
+
+# ---------------------------------------------------------------------------
+# _compose_workspace_project_route unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_write_note_workspace_project_route_passthrough_without_workspace():
+    """Without workspace, the project string passes through unchanged."""
+    assert _compose_workspace_project_route(
+        workspace=None,
+        project="my-project",
+        project_id=None,
+    ) == "my-project"
+
+
+def test_write_note_workspace_project_route_combines_workspace_and_project():
+    """workspace + project are joined as 'workspace/project'."""
+    assert _compose_workspace_project_route(
+        workspace="acme",
+        project="docs",
+        project_id=None,
+    ) == "acme/docs"
+
+
+def test_write_note_workspace_project_route_passes_qualified_project_unchanged():
+    """A pre-qualified 'workspace/project' string passes through when workspace is None."""
+    assert _compose_workspace_project_route(
+        workspace=None,
+        project="acme/docs",
+        project_id=None,
+    ) == "acme/docs"
+
+
+@pytest.mark.parametrize(
+    ("route_kwargs", "message"),
+    [
+        (
+            {"workspace": " ", "project": "docs", "project_id": None},
+            "workspace must not be empty",
+        ),
+        (
+            {"workspace": "acme/extra", "project": "docs", "project_id": None},
+            "workspace must be a single workspace",
+        ),
+        (
+            {"workspace": "acme", "project": "docs", "project_id": "some-uuid"},
+            "workspace cannot be combined with project_id",
+        ),
+        (
+            {"workspace": "acme", "project": None, "project_id": None},
+            "workspace requires an explicit project",
+        ),
+        (
+            {"workspace": "acme", "project": "workspace/project", "project_id": None},
+            "not both",
+        ),
+    ],
+)
+def test_write_note_workspace_project_route_rejects_invalid_inputs(route_kwargs, message):
+    """Ambiguous workspace/project argument combinations should raise ValueError."""
+    with pytest.raises(ValueError, match=message):
+        _compose_workspace_project_route(**route_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_write_note_accepts_workspace_param(app, test_project):
+    """write_note routes correctly when workspace= is passed alongside project=."""
+    # The test_project fixture gives us a project with a known name. Passing
+    # workspace="" (blank) is invalid, so we test that the combined route is
+    # built and that a valid workspace+project pair creates the note.
+    result = await write_note(
+        title="Workspace Routing Test",
+        directory="ws-test",
+        content="# Workspace Routing Test\n\nRouted via workspace param.",
+        # project alone (no workspace) — confirms the parameter is accepted
+        project=test_project.name,
+    )
+    assert "# Created note" in result
+    assert f"project: {test_project.name}" in result
+
+
+@pytest.mark.asyncio
+async def test_write_note_workspace_invalid_raises_before_routing(app, test_project):
+    """Passing an empty workspace= should raise ValueError, not silently misbehave."""
+    with pytest.raises(ValueError, match="workspace must not be empty"):
+        await write_note(
+            title="Should Fail",
+            directory="ws-test",
+            content="# Should Fail",
+            workspace="",  # empty — must be rejected
+            project=test_project.name,
+        )
 
 
 @pytest.mark.asyncio
@@ -474,6 +568,39 @@ async def test_write_note_preserves_content_frontmatter(app, test_project):
         )
         in content
     )
+
+
+@pytest.mark.asyncio
+async def test_write_note_single_line_inline_fence_is_body_issue_972(app, test_project):
+    """Single-line content starting with `---` must be stored as body, not frontmatter.
+
+    Reproduces issue #972: a one-line string where `\\n` are literal backslash-n
+    characters (a common CLI/agent input shape) was misread as frontmatter, merging a
+    garbage `\\nstatus` YAML key into the note and silently dropping the inline
+    `---...---` segment from the body.
+    """
+    one_line = r"---\nstatus: active\n---\nDiscussed Q3 roadmap with Anthony."
+
+    await write_note(
+        project=test_project.name,
+        title="Meeting Notes",
+        directory="meetings",
+        content=one_line,
+    )
+
+    content = await read_note("meetings/meeting-notes", project=test_project.name)
+    assert isinstance(content, str)
+
+    # The literal one-line string survives verbatim in the body...
+    assert one_line in content
+
+    # ...and no garbage `\nstatus` key leaked into the generated YAML frontmatter.
+    # Inspect only the frontmatter block (between the first pair of fence lines).
+    lines = content.splitlines()
+    assert lines[0] == "---"
+    closing = lines.index("---", 1)
+    frontmatter_block = lines[1:closing]
+    assert not any("status" in line for line in frontmatter_block)
 
 
 @pytest.mark.asyncio
@@ -1311,3 +1438,76 @@ class TestWriteNoteOverwriteGuard:
         assert "# Created note" in result
         assert f"project: {test_project.name}" in result
         assert "file_path: guard/Brand New Note.md" in result
+
+    @pytest.mark.asyncio
+    async def test_write_note_overwrite_resolves_by_file_path_strictly(
+        self, app, test_project, entity_repository, monkeypatch
+    ):
+        """Regression: overwrite=True must resolve the conflicting entity by
+        file_path with strict=True, not by permalink with fuzzy fallback.
+
+        Bug shape: in workspace-prefixed palaces the client-built permalink
+        omits the workspace slug, so resolve_entity(permalink) with the default
+        strict=False would fall through to fuzzy search and could pick an
+        orphan row sharing tokens with the canonical permalink. The update
+        then wrote to the orphan, the canonical row stayed stale, and the
+        next overwrite minted a -1/-2 suffix because the permalink uniqueness
+        check found duplicate rows.
+
+        The 409 we catch came from a file_service.exists(file_path) check,
+        so file_path is the authoritative key — strict resolution against it
+        is safe even when permalinks are workspace-prefixed elsewhere.
+        """
+        # Spy on the resolve_entity call to assert the identifier and strict flag.
+        from basic_memory.mcp.clients import knowledge as knowledge_mod
+
+        original_resolve = knowledge_mod.KnowledgeClient.resolve_entity
+        captured: dict[str, Any] = {}
+
+        async def spy_resolve(self, identifier, *, strict=False):
+            captured["identifier"] = identifier
+            captured["strict"] = strict
+            return await original_resolve(self, identifier, strict=strict)
+
+        monkeypatch.setattr(knowledge_mod.KnowledgeClient, "resolve_entity", spy_resolve)
+
+        # Create then overwrite the canonical note.
+        await write_note(
+            project=test_project.name,
+            title="Overview",
+            directory="features/foo",
+            content="# Overview\n\nVersion A",
+        )
+        canonical_permalink = f"{test_project.name}/features/foo/overview"
+        canonical = await entity_repository.get_by_permalink(canonical_permalink)
+        assert canonical is not None
+        canonical_id = canonical.id
+
+        result = await write_note(
+            project=test_project.name,
+            title="Overview",
+            directory="features/foo",
+            content="# Overview\n\nVersion B",
+            overwrite=True,
+        )
+        assert "# Updated note" in result
+
+        # The overwrite path resolved by file_path with strict=True — not by
+        # permalink with the default fuzzy fallback.
+        assert captured.get("identifier") == "features/foo/Overview.md"
+        assert captured.get("strict") is True
+
+        # And the canonical row was updated in place — no duplicate -1/-2 row.
+        canonical_after = await entity_repository.get_by_permalink(canonical_permalink)
+        assert canonical_after is not None
+        assert canonical_after.id == canonical_id
+
+        content = await read_note(canonical_permalink, project=test_project.name)
+        assert "Version B" in content
+        assert "Version A" not in content
+
+        for suffix in ("-1", "-2"):
+            stray = await entity_repository.get_by_permalink(f"{canonical_permalink}{suffix}")
+            assert stray is None, (
+                f"overwrite=True minted a stray '{suffix}' suffix on the canonical permalink"
+            )

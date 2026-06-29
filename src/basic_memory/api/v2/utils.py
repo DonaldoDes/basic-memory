@@ -19,7 +19,9 @@ from basic_memory.services.context_service import (
 
 
 class EntityBatchLookup(Protocol):
-    async def find_by_ids_for_hydration(self, ids: List[int]) -> Sequence[Any]: ...
+    async def find_by_ids_for_hydration(
+        self, ids: List[int], *, include_cross_project: bool = False
+    ) -> Sequence[Any]: ...
 
 
 class EntityServiceBatchLookup(Protocol):
@@ -89,7 +91,7 @@ async def to_graph_context(
                 result_count=len(entity_ids_needed),
             ):
                 entities = await entity_repository.find_by_ids_for_hydration(
-                    list(entity_ids_needed)
+                    list(entity_ids_needed), include_cross_project=True
                 )
             for e in entities:
                 entity_title_lookup[e.id] = e.title
@@ -155,6 +157,7 @@ async def to_graph_context(
                         from_entity_id=item.from_id,
                         from_entity_external_id=from_ext_id,
                         to_entity=to_title,
+                        to_name=item.to_name,
                         to_entity_id=item.to_id,
                         to_entity_external_id=to_ext_id,
                         created_at=item.created_at,

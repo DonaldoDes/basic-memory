@@ -14,17 +14,10 @@ from loguru import logger
 from basic_memory.cli.app import app
 from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.cli.commands.routing import force_routing, validate_routing_flags
-from basic_memory.mcp.tools import build_context as mcp_build_context
-from basic_memory.mcp.tools import edit_note as mcp_edit_note
-from basic_memory.mcp.tools import list_memory_projects as mcp_list_projects
-from basic_memory.mcp.tools import list_workspaces as mcp_list_workspaces
-from basic_memory.mcp.tools import read_note as mcp_read_note
-from basic_memory.mcp.tools import recent_activity as mcp_recent_activity
-from basic_memory.mcp.tools import schema_diff as mcp_schema_diff
-from basic_memory.mcp.tools import schema_infer as mcp_schema_infer
-from basic_memory.mcp.tools import schema_validate as mcp_schema_validate
-from basic_memory.mcp.tools import search_notes as mcp_search
-from basic_memory.mcp.tools import write_note as mcp_write_note
+
+# MCP tool functions are imported inside each command: importing
+# basic_memory.mcp.tools loads the entire tool stack (fastmcp, mcp SDK,
+# SQLAlchemy), which would slow every CLI invocation, including --help (#886).
 
 tool_app = typer.Typer()
 app.add_typer(tool_app, name="tool", help="Access to MCP tools via CLI")
@@ -38,6 +31,26 @@ VALID_EDIT_OPERATIONS = ["append", "prepend", "find_replace", "replace_section"]
 def _print_json(result: Any) -> None:
     """Print a result as formatted JSON."""
     print(json.dumps(result, indent=2, ensure_ascii=True, default=str))
+
+
+def _delete_note_failure_message(result: dict[str, Any]) -> str | None:
+    """Return the CLI failure message for delete-note JSON results, if any."""
+    error = result.get("error")
+    if error:
+        return str(error)
+
+    failed_deletes = result.get("failed_deletes")
+    # Trigger: directory deletion can partially fail without raising from the service.
+    # Why: cleanup scripts need a non-zero exit when files remain undeleted.
+    # Outcome: the CLI fails even if older MCP JSON did not include an error field.
+    if (
+        result.get("is_directory") is True
+        and isinstance(failed_deletes, int)
+        and failed_deletes > 0
+    ):
+        return f"Directory delete incomplete: {failed_deletes} file(s) failed"
+
+    return None
 
 
 # --- Commands ---
@@ -56,6 +69,16 @@ def write_note(
     tags: Annotated[
         Optional[List[str]], typer.Option(help="A list of tags to apply to the note")
     ] = None,
+    note_type: Annotated[
+        str,
+        typer.Option(
+            "--type",
+            help=(
+                "Note type stored in frontmatter (e.g. 'guide', 'report'). "
+                "A 'type:' in the note's own content frontmatter takes precedence."
+            ),
+        ),
+    ] = "note",
     project: Annotated[
         Optional[str],
         typer.Option(
@@ -69,6 +92,11 @@ def write_note(
             help="Project external_id (UUID). Takes precedence over --project; use to disambiguate same-named projects across cloud workspaces.",
         ),
     ] = None,
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Replace an existing note on conflict (matches MCP write_note overwrite=True)",
+    ),
     local: bool = typer.Option(
         False, "--local", help="Force local API routing (ignore cloud mode)"
     ),
@@ -79,9 +107,14 @@ def write_note(
     Examples:
 
     bm tool write-note --title "My Note" --folder "notes" --content "Note content"
+    bm tool write-note --title "My Guide" --folder "notes" --content "..." --type guide
     echo "content" | bm tool write-note --title "My Note" --folder "notes"
+    bm tool write-note --title "My Note" --folder "notes" --overwrite
     bm tool write-note --title "My Note" --folder "notes" --local
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import write_note as mcp_write_note
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -111,9 +144,23 @@ def write_note(
                     project=project,
                     project_id=project_id,
                     tags=tags,
+                    note_type=note_type,
+                    overwrite=overwrite,
                     output_format="json",
                 )
             )
+
+        # MCP tool returns an error field on failure in JSON mode (e.g.
+        # NOTE_ALREADY_EXISTS on a blocked overwrite, SECURITY_VALIDATION_ERROR).
+        # Trigger: result carries a non-empty `error`.
+        # Why: parity with delete-note/edit-note/search-notes so exit-code-driven
+        #      scripts detect a failed/blocked write instead of seeing exit 0.
+        # Outcome: print the error to stderr and exit non-zero.
+        if isinstance(result, dict) and result.get("error"):
+            typer.echo(f"Error: {result['error']}", err=True)
+            _print_json(result)
+            raise typer.Exit(1)
+
         _print_json(result)
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
@@ -154,6 +201,9 @@ def read_note(
     bm tool read-note my-note
     bm tool read-note my-note --include-frontmatter
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import read_note as mcp_read_note
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -167,6 +217,19 @@ def read_note(
                     output_format="json",
                 )
             )
+
+        # MCP tool returns an error field on failure in JSON mode (e.g.
+        # SECURITY_VALIDATION_ERROR on a path-traversal identifier). A genuine
+        # not-found returns null fields with no `error` key, so it still exits 0.
+        # Trigger: result carries a non-empty `error`.
+        # Why: parity with edit-note/delete-note/search-notes so a blocked read
+        #      surfaces a non-zero exit instead of looking like success.
+        # Outcome: print the error to stderr and exit non-zero.
+        if isinstance(result, dict) and result.get("error"):
+            typer.echo(f"Error: {result['error']}", err=True)
+            _print_json(result)
+            raise typer.Exit(1)
+
         _print_json(result)
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
@@ -174,6 +237,69 @@ def read_note(
     except Exception as e:  # pragma: no cover
         if not isinstance(e, typer.Exit):
             typer.echo(f"Error during read_note: {e}", err=True)
+            raise typer.Exit(1)
+        raise
+
+
+@tool_app.command("delete-note")
+def delete_note(
+    identifier: str,
+    is_directory: bool = typer.Option(
+        False, "--is-directory", help="Delete a directory instead of a single note"
+    ),
+    project: Annotated[
+        Optional[str],
+        typer.Option(help="The project to use. If not provided, the default project will be used."),
+    ] = None,
+    project_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--project-id",
+            help="Project external_id (UUID). Takes precedence over --project; use to disambiguate same-named projects across cloud workspaces.",
+        ),
+    ] = None,
+    local: bool = typer.Option(
+        False, "--local", help="Force local API routing (ignore cloud mode)"
+    ),
+    cloud: bool = typer.Option(False, "--cloud", help="Force cloud API routing"),
+) -> None:
+    """Delete a note or directory from the knowledge base.
+
+    Examples:
+
+    bm tool delete-note notes/old-draft
+    bm tool delete-note docs/archive --is-directory
+    """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import delete_note as mcp_delete_note
+
+    try:
+        validate_routing_flags(local, cloud)
+
+        with force_routing(local=local, cloud=cloud):
+            result = run_with_cleanup(
+                mcp_delete_note(
+                    identifier=identifier,
+                    is_directory=is_directory,
+                    project=project,
+                    project_id=project_id,
+                    output_format="json",
+                )
+            )
+
+        if isinstance(result, dict):
+            failure_message = _delete_note_failure_message(result)
+            if failure_message:
+                typer.echo(f"Error: {failure_message}", err=True)
+                raise typer.Exit(1)
+
+        _print_json(result)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+    except Exception as e:  # pragma: no cover
+        if not isinstance(e, typer.Exit):
+            typer.echo(f"Error during delete_note: {e}", err=True)
             raise typer.Exit(1)
         raise
 
@@ -221,6 +347,9 @@ def edit_note(
     bm tool edit-note my-note --operation find_replace --find-text "old" --content "new"
     bm tool edit-note my-note --operation replace_section --section "## Notes" --content "updated"
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import edit_note as mcp_edit_note
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -288,6 +417,9 @@ def build_context(
     bm tool build-context memory://specs/search
     bm tool build-context specs/search --depth 2 --timeframe 30d
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import build_context as mcp_build_context
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -324,7 +456,9 @@ def recent_activity(
         "7d", "--timeframe", help="Timeframe filter (e.g., '7d', '1 week')"
     ),
     page: int = typer.Option(1, "--page", help="Page number for pagination"),
-    page_size: int = typer.Option(50, "--page-size", help="Number of results per page"),
+    # Match the MCP recent_activity default (page_size=10) so identical default
+    # invocations return the same number of rows from CLI and MCP.
+    page_size: int = typer.Option(10, "--page-size", help="Number of results per page"),
     project: Annotated[
         Optional[str],
         typer.Option(help="The project to use. If not provided, the default project will be used."),
@@ -349,6 +483,9 @@ def recent_activity(
     bm tool recent-activity --timeframe 30d --page-size 20
     bm tool recent-activity --type entity --type observation
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import recent_activity as mcp_recent_activity
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -409,6 +546,16 @@ def search_notes(
             help="Filter by search item type: entity, observation, relation (repeatable)",
         ),
     ] = None,
+    categories: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--category",
+            help=(
+                "Filter observation results to exact categories (repeatable); "
+                "pair with --entity-type observation"
+            ),
+        ),
+    ] = None,
     meta: Annotated[
         Optional[List[str]],
         typer.Option("--meta", help="Filter by frontmatter key=value (repeatable)"),
@@ -443,7 +590,11 @@ def search_notes(
     bm tool search-notes --permalink "specs/*"
     bm tool search-notes --tag python --tag async
     bm tool search-notes --meta status=draft
+    bm tool search-notes "auth" --entity-type observation --category requirement
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import search_notes as mcp_search
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -508,6 +659,7 @@ def search_notes(
                     page_size=page_size,
                     note_types=note_types,
                     entity_types=entity_types,
+                    categories=categories,
                     metadata_filters=metadata_filters,
                     tags=tags,
                     status=status,
@@ -548,6 +700,9 @@ def list_projects(
     bm tool list-projects
     bm tool list-projects --local
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import list_memory_projects as mcp_list_projects
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -581,6 +736,9 @@ def list_workspaces(
     bm tool list-workspaces
     bm tool list-workspaces --cloud
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import list_workspaces as mcp_list_workspaces
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -633,6 +791,9 @@ def schema_validate(
     bm tool schema-validate people/ada-lovelace.md
     bm tool schema-validate --project research
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import schema_validate as mcp_schema_validate
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -701,6 +862,9 @@ def schema_infer(
     bm tool schema-infer meeting --threshold 0.5
     bm tool schema-infer person --project research
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import schema_infer as mcp_schema_infer
+
     try:
         validate_routing_flags(local, cloud)
 
@@ -757,6 +921,9 @@ def schema_diff(
     bm tool schema-diff person
     bm tool schema-diff person --project research
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import schema_diff as mcp_schema_diff
+
     try:
         validate_routing_flags(local, cloud)
 

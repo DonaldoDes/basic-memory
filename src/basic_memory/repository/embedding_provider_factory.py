@@ -3,18 +3,29 @@
 import os
 from threading import Lock
 
+from loguru import logger
+
 from basic_memory.config import BasicMemoryConfig, default_fastembed_cache_dir
 from basic_memory.repository.embedding_provider import EmbeddingProvider
 
+# Cache key fields are limited to values that change the *identity* of the loaded
+# model (provider, model_name, dimensions, LiteLLM role/input-type/forward-dimension
+# settings, batch/request knobs that affect the LiteLLM identity, and the resolved
+# cache dir). Thread/parallel knobs are deliberately excluded — they change ONNX
+# *execution* only, not the loaded weights. Including them caused #872: in a
+# container/cgroup the CPU-derived thread count can drift between calls, producing
+# a fresh cache key and reloading the ~2.3GB model into a CPU arena that never
+# returns memory to the OS.
 type ProviderCacheKey = tuple[
     str,
     str,
     int | None,
+    bool | None,
     int,
     int,
+    str | None,
+    str | None,
     str,
-    int | None,
-    int | None,
 ]
 
 _EMBEDDING_PROVIDER_CACHE: dict[ProviderCacheKey, EmbeddingProvider] = {}
@@ -75,22 +86,26 @@ def _resolve_fastembed_runtime_knobs(
 
 
 def _provider_cache_key(app_config: BasicMemoryConfig) -> ProviderCacheKey:
-    """Build a stable cache key from provider-relevant semantic embedding config.
+    """Build a stable cache key from model-identity semantic embedding config.
 
     Uses the *resolved* cache dir — not the raw config field — so different
     FASTEMBED_CACHE_PATH values produce distinct cache keys even when the
     config field itself is unset.
+
+    Deliberately excludes the FastEmbed thread/parallel knobs: they tune ONNX
+    execution, not which model weights are loaded, and resolving them from the
+    runtime CPU budget makes the key drift between calls in a container (#872).
     """
-    resolved_threads, resolved_parallel = _resolve_fastembed_runtime_knobs(app_config)
     return (
         app_config.semantic_embedding_provider.strip().lower(),
         app_config.semantic_embedding_model,
         app_config.semantic_embedding_dimensions,
+        app_config.semantic_embedding_forward_dimensions,
         app_config.semantic_embedding_batch_size,
         app_config.semantic_embedding_request_concurrency,
+        app_config.semantic_embedding_document_input_type,
+        app_config.semantic_embedding_query_input_type,
         _resolve_cache_dir(app_config),
-        resolved_threads,
-        resolved_parallel,
     )
 
 
@@ -103,10 +118,21 @@ def reset_embedding_provider_cache() -> None:
 def create_embedding_provider(app_config: BasicMemoryConfig) -> EmbeddingProvider:
     """Create an embedding provider based on semantic config.
 
-    When semantic_embedding_dimensions is set in config, it overrides
-    the provider's default dimensions (384 for FastEmbed, 1536 for OpenAI).
+    When semantic_embedding_dimensions is set in config, it overrides the
+    provider's default dimensions (384 for FastEmbed, 1536 for OpenAI and
+    the LiteLLM OpenAI default). Custom LiteLLM models require an explicit
+    dimension because the vector table schema is created before the first
+    embedding response is available.
     """
     cache_key = _provider_cache_key(app_config)
+    # Trigger: two threads miss the cache for the same key concurrently.
+    # Why: provider construction loads the ~2.3GB ONNX model and is slow, so we
+    # deliberately build it *outside* the lock to avoid serializing every caller
+    # behind a single cold start. This opens a by-design TOCTOU window where both
+    # threads may construct a provider.
+    # Outcome: the second check-and-set below resolves the race — the first writer
+    # wins and the loser's redundant provider is discarded, so the cache still
+    # yields a single process-wide singleton per key.
     with _EMBEDDING_PROVIDER_CACHE_LOCK:
         if cached_provider := _EMBEDDING_PROVIDER_CACHE.get(cache_key):
             return cached_provider
@@ -151,11 +177,49 @@ def create_embedding_provider(app_config: BasicMemoryConfig) -> EmbeddingProvide
             request_concurrency=app_config.semantic_embedding_request_concurrency,
             **extra_kwargs,
         )
+    elif provider_name == "litellm":
+        from basic_memory.repository.litellm_provider import LiteLLMEmbeddingProvider
+
+        model_name = app_config.semantic_embedding_model or "openai/text-embedding-3-small"
+        if model_name == "bge-small-en-v1.5":
+            model_name = "openai/text-embedding-3-small"
+        if (
+            app_config.semantic_embedding_dimensions is None
+            and model_name != "openai/text-embedding-3-small"
+        ):
+            raise ValueError(
+                "semantic_embedding_dimensions must be set when "
+                "semantic_embedding_provider='litellm' uses a non-default model. "
+                f"Configured model: {model_name!r}."
+            )
+        provider = LiteLLMEmbeddingProvider(
+            model_name=model_name,
+            batch_size=app_config.semantic_embedding_batch_size,
+            request_concurrency=app_config.semantic_embedding_request_concurrency,
+            document_input_type=app_config.semantic_embedding_document_input_type,
+            query_input_type=app_config.semantic_embedding_query_input_type,
+            forward_dimensions=app_config.semantic_embedding_forward_dimensions,
+            **extra_kwargs,
+        )
     else:
         raise ValueError(f"Unsupported semantic embedding provider: {provider_name}")
 
     with _EMBEDDING_PROVIDER_CACHE_LOCK:
         if cached_provider := _EMBEDDING_PROVIDER_CACHE.get(cache_key):
             return cached_provider
+        # Trigger: a distinct cache key is being inserted while the cache already
+        # holds entries for other keys.
+        # Why: the provider is meant to be a process-wide singleton (#872). A second
+        # key means something bypassed reuse — a real config change, or a regression
+        # that reintroduces volatile fields into the key — and each new key reloads
+        # the ~2.3GB ONNX model into a CPU arena that never releases memory.
+        # Outcome: surface the bypass so future leaks are diagnosable from logs.
+        if _EMBEDDING_PROVIDER_CACHE:
+            logger.warning(
+                "Creating a second distinct embedding provider in this process; "
+                "the model will be loaded again. existing_keys={existing} new_key={new}",
+                existing=list(_EMBEDDING_PROVIDER_CACHE.keys()),
+                new=cache_key,
+            )
         _EMBEDDING_PROVIDER_CACHE[cache_key] = provider
         return provider

@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError as SAOperationalError
 
 from basic_memory.schemas.project_info import EmbeddingStatus
 from basic_memory.services.project_service import ProjectService
@@ -13,6 +12,28 @@ from basic_memory.services.project_service import ProjectService
 
 def _is_postgres() -> bool:
     return os.environ.get("BASIC_MEMORY_TEST_POSTGRES", "").lower() in ("1", "true", "yes")
+
+
+async def _create_embeddings_stub(project_service: ProjectService) -> None:
+    """Create a minimal search_vector_embeddings stub so vector_tables_exist is True.
+
+    Test fixtures run with semantic search disabled, so the real vec0/pgvector
+    embeddings table is never created. get_embedding_status only probes table
+    existence and joins on chunk_id (rowid on SQLite), so a plain table suffices.
+    """
+    await project_service.repository.execute_query(
+        text(
+            "CREATE TABLE IF NOT EXISTS search_vector_embeddings (  chunk_id INTEGER PRIMARY KEY)"
+        ),
+        {},
+    )
+
+
+async def _drop_embeddings_stub(project_service: ProjectService) -> None:
+    """Drop the stub table to avoid polluting subsequent tests."""
+    await project_service.repository.execute_query(
+        text("DROP TABLE IF EXISTS search_vector_embeddings"), {}
+    )
 
 
 @pytest.mark.asyncio
@@ -70,7 +91,9 @@ async def test_embedding_status_entities_without_chunks(
     project_service: ProjectService, test_graph, test_project
 ):
     """When entities have search_index rows but no chunks, recommend reindex."""
-    # search_vector_chunks table is created by the test fixture (empty)
+    # search_vector_chunks comes from Base.metadata; the embeddings table needs a stub
+    # because fixtures run with semantic search disabled.
+    await _create_embeddings_stub(project_service)
     with patch.object(
         type(project_service),
         "config_manager",
@@ -79,6 +102,8 @@ async def test_embedding_status_entities_without_chunks(
         ),
     ):
         status = await project_service.get_embedding_status(test_project.id)
+
+    await _drop_embeddings_stub(project_service)
 
     assert status.semantic_search_enabled is True
     assert status.vector_tables_exist is True
@@ -153,20 +178,21 @@ async def test_embedding_status_orphaned_chunks(
 async def test_embedding_status_handles_sqlite_vec_unavailable(
     project_service: ProjectService, test_graph, test_project
 ):
-    """Unreadable vec0 tables should degrade to unavailable status instead of crashing."""
+    """When sqlite-vec can't load at all, degrade to unavailable status instead of crashing."""
     # Trigger: Postgres test matrix executes the same unit suite.
     # Why: sqlite-vec loading failures are specific to SQLite virtual tables, not Postgres joins.
     # Outcome: keep the regression focused on the backend that can actually hit this path.
     if _is_postgres():
         pytest.skip("sqlite-vec unavailable handling is SQLite-specific.")
 
-    original_execute_query = project_service.repository.execute_query
+    # Both vector tables must exist so the status check reaches the vec query;
+    # fixtures run with semantic search disabled, so stub the embeddings table.
+    await _create_embeddings_stub(project_service)
 
-    async def _execute_query_with_vec0_failure(query, params):
-        query_text = str(query)
-        if "JOIN search_vector_embeddings" in query_text:
-            raise SAOperationalError(query_text, params, Exception("no such module: vec0"))
-        return await original_execute_query(query, params)
+    # scalar_vec_query returns None when the extension can't be loaded on this
+    # Python build (e.g. the python.org macOS interpreter). Simulate that here.
+    async def _vec_query_unavailable(query, params=None):
+        return None
 
     with patch.object(
         type(project_service),
@@ -177,10 +203,12 @@ async def test_embedding_status_handles_sqlite_vec_unavailable(
     ):
         with patch.object(
             project_service.repository,
-            "execute_query",
-            side_effect=_execute_query_with_vec0_failure,
+            "scalar_vec_query",
+            side_effect=_vec_query_unavailable,
         ):
             status = await project_service.get_embedding_status(test_project.id)
+
+    await _drop_embeddings_stub(project_service)
 
     assert status.semantic_search_enabled is True
     assert status.total_indexed_entities > 0
@@ -276,6 +304,9 @@ async def test_embedding_status_excludes_stale_entity_ids(
     # Include 'id' column — required NOT NULL on Postgres (regular table),
     # ignored on SQLite (FTS5 virtual table where id is UNINDEXED).
     stale_entity_id = 999999
+    # Both vector tables must exist to reach the stale-filtered count queries;
+    # fixtures run with semantic search disabled, so stub the embeddings table.
+    await _create_embeddings_stub(project_service)
     await project_service.repository.execute_query(
         text(
             "INSERT INTO search_index "

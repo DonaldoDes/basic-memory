@@ -526,8 +526,20 @@ def parse_tags(tags: Union[List[str], str, None]) -> List[str]:
 
     # Process list of tags
     if isinstance(tags, list):
-        # First strip whitespace, then strip leading '#' characters to prevent accumulation
-        return [tag.strip().lstrip("#") for tag in tags if tag and tag.strip()]
+        # Trigger: a list element may itself be a comma-separated string (e.g. typer collects
+        #   `--tags "a,b"` into the one-element list `["a,b"]`).
+        # Why: keep the CLI list path and the MCP bare-string path on a single source of truth so
+        #   `--tags "a,b"`, `--tags a --tags b`, and `tags="a,b"` all converge to the same tags.
+        # Outcome: flatten by splitting each element on commas before stripping '#' / whitespace.
+        # Skip None entries (e.g. a YAML `tags: [alpha, null]`) so they are not revived as
+        # the literal tag "None" by str(raw); the old list branch ignored such falsy entries.
+        return [
+            tag.strip().lstrip("#")
+            for raw in tags
+            if raw is not None
+            for tag in str(raw).split(",")
+            if tag and tag.strip()
+        ]
 
     # Process string input
     if isinstance(tags, str):
@@ -554,6 +566,94 @@ def parse_tags(tags: Union[List[str], str, None]) -> List[str]:
     except (ValueError, TypeError):  # pragma: no cover
         logger.warning(f"Couldn't parse tags from input of type {type(tags)}: {tags}")
         return []
+
+
+def strict_search_tags(v: Any) -> Any:
+    """Strictly coerce tag input at the search_notes tool boundary.
+
+    parse_tags stringifies anything (42 -> ["42"], {"a": 1} -> junk tags), which would
+    turn caller type mistakes into silent no-result searches. At the tool boundary only
+    str, all-string lists, and None are valid tag inputs; everything else — including
+    lists with non-string elements like [42] — passes through unchanged so Pydantic
+    rejects it with a clear validation error.
+
+    JSON array strings (the MCP clients-serialize-arrays-as-strings path) get the same
+    all-string check: '[42]' or '["ok", 42]' would otherwise be stringified by
+    parse_tags' recursive JSON handling before Pydantic ever sees the bad elements.
+    """
+    if isinstance(v, list) and not all(isinstance(item, str) for item in v):
+        return v
+    # Trigger: a str that looks like a JSON array, mirroring parse_tags' detection.
+    # Why: parse_tags recursively parses JSON arrays, stringifying non-string elements
+    #   ('[42]' -> ["42"]) and hiding the type error from Pydantic.
+    # Outcome: malformed arrays pass through unchanged so Pydantic rejects them; valid
+    #   all-string arrays and plain comma strings still delegate to parse_tags.
+    if isinstance(v, str) and v.strip().startswith("[") and v.strip().endswith("]"):
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list) and not all(isinstance(item, str) for item in parsed):
+            return v
+    if v is None or isinstance(v, (str, list)):
+        return parse_tags(v)
+    return v
+
+
+def parse_str_list(v: Any) -> List[str]:
+    """Parse a list of plain strings from various input formats.
+
+    Like parse_tags but without stripping '#' — correct for type/category params
+    where the value is a literal identifier, not a hashtag.
+
+    Handles the four input shapes that MCP clients commonly produce:
+    - None → []
+    - "note,task" → ["note", "task"] (comma-split string)
+    - '["note","task"]' → ["note", "task"] (JSON array string)
+    - ["note,task"] → ["note", "task"] (list with comma-string element)
+
+    Non-str/list/None values are returned unchanged so Pydantic can reject them
+    with a clear validation error instead of silently coercing.
+    """
+    if v is None:
+        return []
+
+    if isinstance(v, list):
+        # Trigger: a list element is not a string (e.g. [42] or ["note", 42]).
+        # Why: str(raw) would silently convert 42 → "42" and let invalid caller data pass
+        #   Pydantic validation as a junk filter, producing a silent no-result search.
+        # Outcome: return the list unchanged so Pydantic rejects it with a clear error.
+        if not all(isinstance(raw, str) for raw in v if raw is not None):
+            return v  # type: ignore[return-value]
+
+        # Trigger: a list element may itself be a comma-separated string (e.g. some MCP clients
+        #   serialise `["note,task"]` when the caller passed `note_types="note,task"`).
+        # Outcome: flatten each element by splitting on commas and stripping whitespace.
+        return [
+            item.strip()
+            for raw in v
+            if raw is not None
+            for item in raw.split(",")
+            if item and item.strip()
+        ]
+
+    if isinstance(v, str):
+        # Trigger: MCP clients sometimes send a JSON array string like '["note","task"]'.
+        # Outcome: parse it as JSON first, then recurse to handle the resulting list.
+        stripped = v.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed_json = json.loads(stripped)
+                if isinstance(parsed_json, list):
+                    return parse_str_list(parsed_json)
+            except json.JSONDecodeError:
+                pass
+
+        # Plain comma-separated string: "note,task" → ["note", "task"]
+        return [item.strip() for item in v.split(",") if item and item.strip()]
+
+    # Non-str/list/None — return unchanged so Pydantic rejects with a clear error.
+    return v  # type: ignore[return-value]
 
 
 def coerce_list(v: Any) -> Any:

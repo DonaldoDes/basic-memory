@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from basic_memory.cli.app import app
+from basic_memory.config import DatabaseBackend
 import basic_memory.cli.commands.db as db_cmd  # noqa: F401
 
 
@@ -21,6 +22,8 @@ def _stub_app_config(*, semantic_search_enabled: bool = True) -> SimpleNamespace
         semantic_search_enabled=semantic_search_enabled,
         database_path=Path("/tmp/basic-memory.db"),
         get_project_mode=lambda project_name: None,
+        # app_callback reads this to decide whether to install the uvloop policy.
+        database_backend=DatabaseBackend.SQLITE,
     )
 
 
@@ -192,15 +195,21 @@ async def test_reindex_project_full_passes_force_full_to_sync_and_reports_mode(m
             if "total" in kwargs:
                 self.tasks[task_id].total = kwargs["total"]
 
-    monkeypatch.setattr(db_cmd, "reconcile_projects_with_config", AsyncMock())
+    # _reindex imports its database/sync dependencies at call time (#886),
+    # so stubs target the source modules instead of db_cmd attributes.
     monkeypatch.setattr(
-        db_cmd.db,
-        "get_or_create_db",
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
         AsyncMock(return_value=(None, session_maker)),
     )
-    monkeypatch.setattr(db_cmd.db, "shutdown_db", AsyncMock())
-    monkeypatch.setattr(db_cmd, "ProjectRepository", StubProjectRepository)
-    monkeypatch.setattr(db_cmd, "get_sync_service", AsyncMock(return_value=sync_service))
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.sync.sync_service.get_sync_service",
+        AsyncMock(return_value=sync_service),
+    )
     monkeypatch.setattr(db_cmd, "Progress", SilentProgress)
     monkeypatch.setattr(
         db_cmd.console,
@@ -274,14 +283,17 @@ async def test_reindex_embeddings_only_full_passes_force_full_to_vector_reindex(
             if "total" in kwargs:
                 self.tasks[task_id].total = kwargs["total"]
 
-    monkeypatch.setattr(db_cmd, "reconcile_projects_with_config", AsyncMock())
+    # _reindex imports its database/sync dependencies at call time (#886),
+    # so stubs target the source modules instead of db_cmd attributes.
     monkeypatch.setattr(
-        db_cmd.db,
-        "get_or_create_db",
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
         AsyncMock(return_value=(None, session_maker)),
     )
-    monkeypatch.setattr(db_cmd.db, "shutdown_db", AsyncMock())
-    monkeypatch.setattr(db_cmd, "ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
     monkeypatch.setattr(
         "basic_memory.repository.search_repository.create_search_repository",
         lambda *args, **kwargs: object(),

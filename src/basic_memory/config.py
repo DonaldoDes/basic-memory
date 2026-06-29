@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -248,7 +249,19 @@ class BasicMemoryConfig(BaseSettings):
     )
     semantic_embedding_dimensions: int | None = Field(
         default=None,
-        description="Embedding vector dimensions. Auto-detected from provider if not set (384 for FastEmbed, 1536 for OpenAI).",
+        description=(
+            "Embedding vector dimensions. Uses provider defaults when unset "
+            "(384 for FastEmbed, 1536 for OpenAI and LiteLLM OpenAI default); "
+            "required for custom LiteLLM models."
+        ),
+    )
+    semantic_embedding_forward_dimensions: bool | None = Field(
+        default=None,
+        description=(
+            "LiteLLM-only override for sending semantic_embedding_dimensions as a "
+            "provider-side output-size request parameter. When unset, Basic Memory "
+            "auto-detects model strings such as text-embedding-3."
+        ),
     )
     # Trigger: full local rebuilds spend most of their time waiting behind shared
     # embed flushes, not constructing vectors themselves.
@@ -265,6 +278,20 @@ class BasicMemoryConfig(BaseSettings):
         default=4,
         description="Maximum number of concurrent provider requests for batched embedding generation when the active provider supports request-level concurrency.",
         gt=0,
+    )
+    semantic_embedding_document_input_type: str | None = Field(
+        default=None,
+        description=(
+            "Optional LiteLLM input_type for indexed document/passages. "
+            "Use with asymmetric embedding models such as Cohere or NVIDIA retrieval models."
+        ),
+    )
+    semantic_embedding_query_input_type: str | None = Field(
+        default=None,
+        description=(
+            "Optional LiteLLM input_type for search queries. "
+            "Use with asymmetric embedding models such as Cohere or NVIDIA retrieval models."
+        ),
     )
     semantic_embedding_sync_batch_size: int = Field(
         default=2,
@@ -621,6 +648,30 @@ class BasicMemoryConfig(BaseSettings):
             or os.getenv("PYTEST_CURRENT_TEST") is not None
         )
 
+    @property
+    def cloud_mode(self) -> bool:
+        """Whether this process runs as a cloud deployment.
+
+        In-repo cloud containers build BasicMemoryConfig via ConfigManager (not
+        for_cloud_tenant), so they signal cloud mode through the environment
+        rather than skip_initialization_sync. Mirrors the detection in setup_logging.
+        """
+        return os.getenv("BASIC_MEMORY_CLOUD_MODE", "").lower() in ("1", "true")
+
+    @property
+    def skip_local_initialization(self) -> bool:
+        """Whether to skip local project seeding / reconciliation / path creation.
+
+        True for any cloud or stateless deployment: for_cloud_tenant sets
+        skip_initialization_sync, while in-repo cloud containers set
+        BASIC_MEMORY_CLOUD_MODE. A LOCAL Postgres install matches neither, so it
+        still initializes like SQLite. Gating these paths on the Postgres *backend*
+        caught local Postgres (wrong); gating only on skip_initialization_sync
+        missed BASIC_MEMORY_CLOUD_MODE deployments, letting reconcile delete tenant
+        project rows (also wrong).
+        """
+        return self.skip_initialization_sync or self.cloud_mode
+
     def get_project_mode(self, project_name: str) -> ProjectMode:
         """Get the routing mode for a project.
 
@@ -630,6 +681,26 @@ class BasicMemoryConfig(BaseSettings):
         """
         entry = self.projects.get(project_name)
         return entry.mode if entry else ProjectMode.CLOUD
+
+    def is_locally_syncable(self, project_name: str, project_path: str) -> bool:
+        """Whether a project should be synced/watched on the local filesystem.
+
+        Both conditions are required (issue #949):
+
+          * The project is present in config. Config is the source of truth, so a
+            stale database row that was removed from config — but whose deletion
+            has not yet been reconciled, or whose reconciliation failed — must
+            not be synced even though it still has a real directory on disk.
+          * Its path is absolute. An empty or relative path resolves against the
+            process cwd, so syncing it would adopt whatever directory the server
+            was launched from as the project root and mutate unrelated files.
+
+        Cloud-only projects (empty/slug path) and cloud projects with a real
+        local bisync copy (absolute path) are handled correctly by these two
+        conditions, so no separate mode check is needed.
+        """
+        entry = self.projects.get(project_name)
+        return entry is not None and Path(project_path).is_absolute()
 
     def set_project_mode(self, project_name: str, mode: ProjectMode) -> None:
         """Set the routing mode for a project.
@@ -688,9 +759,13 @@ class BasicMemoryConfig(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         """Ensure configuration is valid after initialization."""
-        # Skip project initialization in cloud mode - projects are discovered from DB
-        if self.database_backend == DatabaseBackend.POSTGRES:  # pragma: no cover
-            return  # pragma: no cover
+        # Skip default-project seeding only for cloud/stateless deployments, where
+        # projects are discovered from the database per tenant. See
+        # skip_local_initialization for why this is not gated on the Postgres
+        # backend (caught local Postgres) nor on skip_initialization_sync alone
+        # (missed BASIC_MEMORY_CLOUD_MODE deployments).
+        if self.skip_local_initialization:
+            return
 
         # Trigger: no projects configured (fresh install or empty config)
         # Why: every config needs at least one project to be functional
@@ -754,11 +829,14 @@ class BasicMemoryConfig(BaseSettings):
     def ensure_project_paths_exists(self) -> "BasicMemoryConfig":  # pragma: no cover
         """Ensure project paths exist.
 
-        Skips path creation when using Postgres backend (cloud mode) since
-        cloud tenants don't use local filesystem paths.
+        Skips path creation for cloud/stateless deployments, whose tenants don't
+        use local filesystem paths. A local Postgres install still needs its
+        project directories created like SQLite, so gate on
+        skip_local_initialization, not the backend — otherwise the seeded default's
+        directory is never created and the sync/watch path hits a non-existent
+        directory.
         """
-        # Skip path creation for cloud mode - no local filesystem
-        if self.database_backend == DatabaseBackend.POSTGRES:
+        if self.skip_local_initialization:
             return self
 
         for name, entry in self.projects.items():
@@ -1073,8 +1151,21 @@ def save_basic_memory_config(file_path: Path, config: BasicMemoryConfig) -> None
         _secure_config_dir(file_path.parent)
         # Use model_dump with mode='json' to serialize datetime objects properly
         config_dict = config.model_dump(mode="json")
-        file_path.write_text(json.dumps(config_dict, indent=2))
-        _secure_config_file(file_path)
+        # Trigger: long-lived readers (MCP stdio server config reload, background
+        # auto-update threads) re-read config.json whenever its mtime changes,
+        # concurrently with CLI commands saving it.
+        # Why: writing the destination in place truncates it first, so a concurrent
+        # reader can observe empty/partial JSON and load_config() exits the process.
+        # Outcome: write a sibling temp file (unique per process/thread so parallel
+        # savers cannot interleave) and publish atomically via os.replace — readers
+        # always see either the old or the new complete document. (#940)
+        tmp_path = file_path.parent / f"{file_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            tmp_path.write_text(json.dumps(config_dict, indent=2))
+            _secure_config_file(tmp_path)
+            os.replace(tmp_path, file_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
     except Exception as e:  # pragma: no cover
         logger.error(f"Failed to save config: {e}")
 

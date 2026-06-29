@@ -1,10 +1,14 @@
 """Tests for search MCP tools."""
 
+import inspect
+
 import pytest
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
+
+from pydantic import TypeAdapter
 
 from basic_memory.mcp.tools import write_note
 from basic_memory.mcp.tools.search import (
@@ -371,6 +375,93 @@ async def test_search_with_entity_type_filter(client, test_project):
 
 
 @pytest.mark.asyncio
+async def test_search_with_categories_filter(client, test_project):
+    """Observation category filter returns only the exact category (#430).
+
+    Writes a note whose body has a [requirement] observation and a [decision]
+    observation that also mentions the word "requirement". The categories filter
+    must return only the requirement observation.
+    """
+    await write_note(
+        project=test_project.name,
+        title="Category Filter Note",
+        directory="test",
+        content=(
+            "# Category Filter Note\n"
+            "- [requirement] The system must enforce auth on every request\n"
+            "- [decision] We deferred the auth requirement to next sprint\n"
+        ),
+    )
+
+    response = await search_notes(
+        project=test_project.name,
+        query="requirement",
+        search_type="text",
+        entity_types=["observation"],
+        categories=["requirement"],
+        output_format="json",
+    )
+
+    assert isinstance(response, dict), f"Search failed with error: {response}"
+    results = response["results"]
+    assert len(results) > 0
+    # Every result is a requirement observation; the [decision] row is excluded
+    # even though its text contains the word "requirement".
+    assert all(r["type"] == "observation" for r in results)
+    assert all(r["category"] == "requirement" for r in results)
+
+    # A non-matching category yields no results for the same text query.
+    decision = await search_notes(
+        project=test_project.name,
+        query="requirement",
+        search_type="text",
+        entity_types=["observation"],
+        categories=["decision"],
+        output_format="json",
+    )
+    assert isinstance(decision, dict), f"Search failed with error: {decision}"
+    assert all(r["category"] == "decision" for r in decision["results"])
+    # The requirement observation must not leak into a decision-scoped search.
+    assert all("requirement" != r.get("category") for r in decision["results"])
+
+
+@pytest.mark.asyncio
+async def test_search_categories_without_entity_types_returns_observations(client, test_project):
+    """categories=[...] WITHOUT entity_types must return the matching observations (#908).
+
+    search_notes defaults entity_types to "entity" when unset, but categories only exist on
+    observations — so a category filter without an explicit entity_types would AND the
+    category against entity rows (which have NULL category) and return nothing. The implicit
+    default must scope to observations when categories is supplied.
+    """
+    await write_note(
+        project=test_project.name,
+        title="Category Default Note",
+        directory="test",
+        content=(
+            "# Category Default Note\n"
+            "- [requirement] Auth tokens must rotate every 24 hours\n"
+            "- [decision] We chose JWT for the auth token format\n"
+        ),
+    )
+
+    # Note: no entity_types passed — exercises the implicit default.
+    response = await search_notes(
+        project=test_project.name,
+        query="auth",
+        search_type="text",
+        categories=["requirement"],
+        output_format="json",
+    )
+
+    assert isinstance(response, dict), f"Search failed with error: {response}"
+    results = response["results"]
+    assert len(results) > 0, "category-only search must return matching observations"
+    assert all(r["type"] == "observation" for r in results)
+    assert all(r["category"] == "requirement" for r in results)
+
+
+@pytest.mark.asyncio
 async def test_search_with_date_filter(client, test_project):
     """Test search with date filter."""
     # Create test content
@@ -478,6 +569,42 @@ class TestSearchErrorFormatting:
 
         assert "# Search Failed - Semantic Dependencies Missing" in result
         assert "pip install -U basic-memory" in result
+
+    def test_format_search_error_corrupt_embedding_model(self):
+        """Test formatting for a corrupt/missing FastEmbed model (ONNX NO_SUCHFILE)."""
+        from basic_memory.config import ConfigManager
+        from basic_memory.repository.embedding_provider_factory import _resolve_cache_dir
+
+        result = _format_search_error_response(
+            "test-project",
+            "[ONNXRuntimeError] : 3 : NO_SUCHFILE : Load model from "
+            "/home/u/.basic-memory/fastembed_cache/models--qdrant--bge-small-en-v1.5-onnx-q/"
+            "snapshots/abc/model_optimized.onnx failed. File doesn't exist",
+            "semantic query",
+            "hybrid",
+        )
+
+        expected_cache_dir = _resolve_cache_dir(ConfigManager().config)
+        assert "# Search Failed - Embedding Model Missing or Corrupt" in result
+        # Names the actual resolved cache dir so the user knows what to delete.
+        assert expected_cache_dir in result
+        # Offers full-text search as an immediate workaround.
+        assert 'search_type="text"' in result
+
+    def test_format_search_error_load_model_phrase_does_not_overmatch(self):
+        """A generic error mentioning 'load model' (no 'from') must not hit the embedding branch.
+
+        The marker was tightened from the broad 'load model' to the exact ONNX phrasing
+        'load model from' so unrelated failures fall through to the generic handler.
+        """
+        result = _format_search_error_response(
+            "test-project",
+            "Failed to load model configuration for this project",
+            "test query",
+        )
+
+        assert "# Search Failed - Embedding Model Missing or Corrupt" not in result
+        assert "# Search Failed" in result
 
     def test_format_search_error_generic(self):
         """Test formatting for generic errors."""
@@ -1499,6 +1626,243 @@ async def test_search_notes_tag_prefix_with_remaining_text(monkeypatch):
     assert captured_payload["text"] == "authentication"
 
 
+# --- Tests for comma-separated tags parameter (#910) ----------------------------
+
+
+def test_search_notes_tags_annotation_splits_comma_strings():
+    """The tags parameter annotation must parse every documented input form (#910).
+
+    Direct function calls bypass the BeforeValidator, so validate through the same
+    Annotated metadata pydantic applies on the MCP path. coerce_list wrapped a bare
+    comma string as the single literal tag ["a,b"]; parse_tags splits it like the
+    tag: query shorthand and write_note's tags convention.
+    """
+    annotation = inspect.signature(search_notes).parameters["tags"].annotation
+    adapter = TypeAdapter(annotation)
+
+    real_list = adapter.validate_python(["a", "b"])
+    comma_string = adapter.validate_python("a,b")
+    json_string = adapter.validate_python('["a", "b"]')
+    single_string = adapter.validate_python("a")
+
+    assert real_list == ["a", "b"]
+    # The comma string and the real list must behave identically (the #910 bug).
+    assert comma_string == real_list
+    assert json_string == real_list
+    assert single_string == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_search_notes_tags_comma_string_filters_via_mcp(mcp, client, test_project):
+    """tags="alpha,beta" through the real MCP layer must match like a real list (#910)."""
+    from fastmcp import Client
+
+    async with Client(mcp) as mcp_client:
+        await mcp_client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Tag Split Note",
+                "directory": "test",
+                "content": "# Tag Split Note\nTagSplitToken body",
+                "tags": ["alpha", "beta"],
+            },
+        )
+
+        async def found(tags_value: object) -> bool:
+            result = await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "TagSplitToken",
+                    "search_type": "text",
+                    "tags": tags_value,
+                },
+            )
+            return "Tag Split Note" in result.content[0].text
+
+        as_list = await found(["alpha", "beta"])
+        as_comma_string = await found("alpha,beta")
+        as_json_string = await found('["alpha", "beta"]')
+        as_single_string = await found("alpha")
+
+        assert as_list, "real-list tags must match (sanity)"
+        assert as_comma_string == as_list, "comma string must behave like the real list"
+        assert as_json_string == as_list
+        assert as_single_string == as_list
+        # Negative control: the filter is actually applied, not silently dropped.
+        assert not await found("gamma")
+
+
+def test_search_notes_tags_annotation_rejects_non_string_types():
+    """Unsupported tag types must fail validation, not be stringified (#932 follow-up).
+
+    Bare parse_tags coerces anything to strings (42 -> ["42"], {"a": 1} -> junk tags),
+    silently turning caller mistakes into no-result searches. The strict_search_tags
+    wrapper only normalizes str/list/None and lets Pydantic reject everything else.
+    """
+    from pydantic import ValidationError
+
+    annotation = inspect.signature(search_notes).parameters["tags"].annotation
+    adapter = TypeAdapter(annotation)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python(42)
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"a": 1})
+
+    # Lists with non-string elements must also fail, not be stringified ([42] -> ["42"]).
+    with pytest.raises(ValidationError):
+        adapter.validate_python([42])
+    with pytest.raises(ValidationError):
+        adapter.validate_python([{"a": 1}])
+    with pytest.raises(ValidationError):
+        adapter.validate_python(["ok", 42])
+
+    # JSON-array strings with non-string elements must fail the same way — parse_tags
+    # would otherwise recursively stringify them before Pydantic validates List[str].
+    with pytest.raises(ValidationError):
+        adapter.validate_python("[42]")
+    with pytest.raises(ValidationError):
+        adapter.validate_python('[{"a": 1}]')
+    with pytest.raises(ValidationError):
+        adapter.validate_python('["ok", 42]')
+
+    # All-string lists and all-string JSON-array strings remain valid.
+    assert adapter.validate_python(["a", "b"]) == ["a", "b"]
+    assert adapter.validate_python('["a","b"]') == ["a", "b"]
+
+    # None stays a valid "no filter" input.
+    assert adapter.validate_python(None) in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_search_notes_tags_invalid_type_rejected_via_mcp(mcp, client, test_project):
+    """tags=42 through the real MCP layer must raise a validation error (#932 follow-up)."""
+    from fastmcp import Client
+    from fastmcp.exceptions import ToolError
+
+    async with Client(mcp) as mcp_client:
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": 42,
+                },
+            )
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": {"a": 1},
+                },
+            )
+        # Lists with non-string elements must be rejected too, not stringified.
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": [42],
+                },
+            )
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": [{"a": 1}],
+                },
+            )
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": ["ok", 42],
+                },
+            )
+        # JSON-array strings with non-string elements (clients that serialize arrays as
+        # strings) must be rejected too, not recursively stringified by parse_tags.
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": "[42]",
+                },
+            )
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": '[{"a": 1}]',
+                },
+            )
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "search_notes",
+                {
+                    "project": test_project.name,
+                    "query": "anything",
+                    "tags": '["ok", 42]',
+                },
+            )
+        # Sanity: a valid all-string JSON-array string is still accepted.
+        await mcp_client.call_tool(
+            "search_notes",
+            {
+                "project": test_project.name,
+                "query": "anything",
+                "tags": '["a","b"]',
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_notes_direct_call_splits_comma_tags(client, test_project):
+    """Direct callers bypass the BeforeValidator, so the body must normalize tags.
+
+    Regression for the CLI path: `bm tool search-notes --tag alpha,beta` calls this
+    function directly with Typer's collected list ["alpha,beta"], which must split
+    into ["alpha", "beta"] instead of matching nothing (#910, #932 follow-up).
+    """
+    await write_note(
+        project=test_project.name,
+        title="Direct Tag Split Note",
+        directory="test",
+        content="# Direct Tag Split Note\nDirectTagToken body",
+        tags=["alpha", "beta"],
+    )
+
+    async def found(tags_value: list[str] | None) -> bool:
+        result = await search_notes(
+            project=test_project.name,
+            query="DirectTagToken",
+            search_type="text",
+            output_format="json",
+            tags=tags_value,
+        )
+        assert isinstance(result, dict), f"search failed: {result}"
+        return any(r["title"] == "Direct Tag Split Note" for r in result["results"])
+
+    assert await found(["alpha"]), "plain tag list must match (sanity)"
+    # The CLI regression: Typer collects --tag alpha,beta as the single element "alpha,beta".
+    assert await found(["alpha,beta"])
+    # Negative control: the filter is still applied.
+    assert not await found(["gamma"])
+
+
 # --- Tests for text output format (#641) -----------------------------------
 
 
@@ -1751,3 +2115,161 @@ def test_default_search_type_falls_back_to_text_when_semantic_disabled():
 
     with patch.object(search_module, "get_container", return_value=mock_container):
         assert search_module._default_search_type() == "text"
+
+
+# --- Tests for note_types/entity_types/categories comma-split fix (#930, Codex review) ---
+
+
+def test_search_notes_note_types_annotation_splits_comma_strings():
+    """The note_types parameter annotation must parse every documented input form (#930).
+
+    Direct function calls bypass the BeforeValidator; validate through the same
+    Annotated metadata pydantic applies on the MCP path. The old coerce_list wrapped a
+    bare comma string as the single literal type ["note,task"]; parse_str_list splits it.
+    """
+    annotation = inspect.signature(search_notes).parameters["note_types"].annotation
+    adapter = TypeAdapter(annotation)
+
+    real_list = adapter.validate_python(["note", "task"])
+    comma_string = adapter.validate_python("note,task")
+    json_string = adapter.validate_python('["note", "task"]')
+    single_string = adapter.validate_python("note")
+    comma_in_list = adapter.validate_python(["note,task"])
+
+    assert real_list == ["note", "task"]
+    assert comma_string == real_list, "comma string must behave like the real list"
+    assert json_string == real_list
+    assert single_string == ["note"]
+    assert comma_in_list == real_list, "list with comma element must be flattened"
+
+
+def test_search_notes_entity_types_annotation_splits_comma_strings():
+    """The entity_types parameter annotation must parse every documented input form (#930)."""
+    annotation = inspect.signature(search_notes).parameters["entity_types"].annotation
+    adapter = TypeAdapter(annotation)
+
+    real_list = adapter.validate_python(["entity", "observation"])
+    comma_string = adapter.validate_python("entity,observation")
+    comma_in_list = adapter.validate_python(["entity,observation"])
+
+    assert real_list == ["entity", "observation"]
+    assert comma_string == real_list
+    assert comma_in_list == real_list
+
+
+def test_search_notes_categories_annotation_splits_comma_strings():
+    """The categories parameter annotation must parse every documented input form (#930)."""
+    annotation = inspect.signature(search_notes).parameters["categories"].annotation
+    adapter = TypeAdapter(annotation)
+
+    real_list = adapter.validate_python(["requirement", "decision"])
+    comma_string = adapter.validate_python("requirement,decision")
+    comma_in_list = adapter.validate_python(["requirement,decision"])
+
+    assert real_list == ["requirement", "decision"]
+    assert comma_string == real_list
+    assert comma_in_list == real_list
+
+
+def test_search_notes_note_types_annotation_rejects_non_string_list_elements():
+    """note_types=[42] must fail Pydantic validation, not be stringified to ['42'].
+
+    parse_str_list used str(raw) to coerce list elements, silently accepting [42] as
+    ["42"]. The fix guards against non-string list elements and returns the original
+    value so Pydantic rejects it with a clear error.
+    """
+    from pydantic import ValidationError
+
+    annotation = inspect.signature(search_notes).parameters["note_types"].annotation
+    adapter = TypeAdapter(annotation)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python([42])
+    with pytest.raises(ValidationError):
+        adapter.validate_python(["note", 42])
+
+    # All-string lists remain valid.
+    assert adapter.validate_python(["note", "task"]) == ["note", "task"]
+
+
+def test_search_notes_entity_types_annotation_rejects_non_string_list_elements():
+    """entity_types=[42] must fail Pydantic validation, not be stringified."""
+    from pydantic import ValidationError
+
+    annotation = inspect.signature(search_notes).parameters["entity_types"].annotation
+    adapter = TypeAdapter(annotation)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python([42])
+    with pytest.raises(ValidationError):
+        adapter.validate_python(["entity", 42])
+
+    assert adapter.validate_python(["entity", "observation"]) == ["entity", "observation"]
+
+
+def test_search_notes_categories_annotation_rejects_non_string_list_elements():
+    """categories=[42] must fail Pydantic validation, not be stringified."""
+    from pydantic import ValidationError
+
+    annotation = inspect.signature(search_notes).parameters["categories"].annotation
+    adapter = TypeAdapter(annotation)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python([42])
+    with pytest.raises(ValidationError):
+        adapter.validate_python(["requirement", 42])
+
+    assert adapter.validate_python(["requirement", "decision"]) == ["requirement", "decision"]
+
+
+@pytest.mark.asyncio
+async def test_search_notes_direct_call_splits_comma_note_types(client, test_project):
+    """Direct callers bypass the BeforeValidator, so the body must normalize note_types.
+
+    Regression for the CLI path: `bm tool search-notes --type note,task` calls this
+    function directly with Typer's collected list ["note,task"], which must split into
+    ["note", "task"] and match the note correctly (#930, Codex review follow-up).
+    """
+    await write_note(
+        project=test_project.name,
+        title="Direct NoteType Split Note",
+        directory="test",
+        content="# Direct NoteType Split Note\nNoteTypeSplitToken body",
+    )
+
+    async def found(note_types_value: list[str] | None) -> bool:
+        result = await search_notes(
+            project=test_project.name,
+            query="NoteTypeSplitToken",
+            search_type="text",
+            output_format="json",
+            note_types=note_types_value,
+        )
+        assert isinstance(result, dict), f"search failed: {result}"
+        return any(r["title"] == "Direct NoteType Split Note" for r in result["results"])
+
+    assert await found(None), "no filter must match (sanity)"
+    assert await found(["note"]), "plain single-type list must match (sanity)"
+    # The CLI regression: Typer collects --type note,task as the single element "note,task".
+    assert await found(["note,task"]), "comma list element must be flattened and match 'note'"
+    # Negative control: a specific nonexistent type must not match.
+    assert not await found(["nonexistent_type"])
+
+
+def test_search_notes_parse_str_list_rejects_non_string_list_elements_in_place():
+    """parse_str_list must return non-str list elements unchanged for Pydantic rejection.
+
+    The old implementation used str(raw) which silently coerced [42] -> ['42'],
+    causing bad caller data to become silent no-result searches instead of a
+    clear Pydantic validation error.
+    """
+    from basic_memory.utils import parse_str_list
+
+    # Non-string list elements pass through unchanged.
+    assert parse_str_list([42]) == [42]  # type: ignore[arg-type]
+    assert parse_str_list(["ok", 42]) == ["ok", 42]  # type: ignore[arg-type]
+    assert parse_str_list([{"a": 1}]) == [{"a": 1}]  # type: ignore[arg-type]
+
+    # All-string lists still work correctly.
+    assert parse_str_list(["note", "task"]) == ["note", "task"]
+    assert parse_str_list(["note,task"]) == ["note", "task"]

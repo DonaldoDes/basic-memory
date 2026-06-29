@@ -2,28 +2,34 @@
 
 import asyncio
 import os
+import sys
+from contextlib import suppress
 from logging.config import fileConfig
 
-# Allow nested event loops (needed for pytest-asyncio and other async contexts)
-# Note: nest_asyncio doesn't work with uvloop or Python 3.14+, so we handle those cases separately
-import sys
-
-if sys.version_info < (3, 14):
-    try:
-        import nest_asyncio
-
-        nest_asyncio.apply()
-    except (ImportError, ValueError):
-        # nest_asyncio not available or can't patch this loop type (e.g., uvloop)
-        pass
-# For Python 3.14+, we rely on the thread-based fallback in run_migrations_online()
-
+from loguru import logger
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from alembic import context
 
 from basic_memory.config import ConfigManager
+from basic_memory.migration_loop import is_running_loop_error, running_on_uvloop
+
+# Allow nested event loops (needed for pytest-asyncio and other async contexts).
+# nest_asyncio cannot patch a uvloop loop or Python 3.14+; in those cases we skip
+# it and rely on the thread-based fallback in run_migrations_online() instead
+# (see basic_memory.migration_loop for why uvloop must be detected up front).
+if sys.version_info < (3, 14) and not running_on_uvloop():
+    try:
+        import nest_asyncio
+
+        nest_asyncio.apply()
+    except (ImportError, ValueError) as exc:
+        # Trigger: nest_asyncio is absent (ImportError) or refuses to patch the
+        # running loop (ValueError).
+        # Outcome: log at DEBUG (observable, not noisy) and fall through to the
+        # thread-based migration fallback.
+        logger.debug(f"nest_asyncio not applied ({exc!r}); using thread-based migration fallback")
 
 # Trigger: only set test env when actually running under pytest
 # Why: alembic/env.py is imported during normal operations (MCP server startup, migrations)
@@ -115,7 +121,15 @@ async def run_async_migrations(connectable):
     """Run migrations asynchronously with AsyncEngine."""
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
+    # Trigger: startup migrations on the asyncpg backend dispose the engine
+    # while the event loop may be tearing down around them.
+    # Why: that race surfaces "IndexError: pop from an empty deque" from
+    # base_events._run_once (#831/#877); shielding lets dispose finish atomically
+    # and suppressing CancelledError keeps a cancelled teardown from re-raising it.
+    # Outcome: the migration engine always disposes cleanly. (uvloop is the
+    # structural fix for the race; this hardens the teardown path.)
+    with suppress(asyncio.CancelledError):
+        await asyncio.shield(connectable.dispose())
 
 
 def _run_async_migrations_with_asyncio_run(connectable) -> None:
@@ -158,7 +172,7 @@ def _run_async_engine_migrations(connectable) -> None:
     try:
         _run_async_migrations_with_asyncio_run(connectable)
     except RuntimeError as e:
-        if "cannot be called from a running event loop" in str(e):
+        if is_running_loop_error(e):
             # We're in a running event loop (likely uvloop or Python 3.14+ tests).
             # Switch to a dedicated thread so Alembic can finish without nesting loops.
             _run_async_migrations_in_thread(connectable)

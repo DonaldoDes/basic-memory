@@ -43,15 +43,17 @@ def list_workspaces() -> None:
 
     table = Table(title="Available Workspaces")
     table.add_column("Name", style="cyan")
+    table.add_column("Slug", style="cyan")
     table.add_column("Type", style="blue")
     table.add_column("Role", style="green")
-    table.add_column("Tenant ID", style="yellow")
+    table.add_column("Workspace ID", style="yellow")
     table.add_column("Default", style="magenta")
 
     for workspace in workspaces:
         is_default = "[X]" if workspace.tenant_id == default_ws else ""
         table.add_row(
             workspace.name,
+            workspace.slug,
             workspace.workspace_type,
             workspace.role,
             workspace.tenant_id,
@@ -59,6 +61,9 @@ def list_workspaces() -> None:
         )
 
     console.print(table)
+    console.print(
+        "[dim]Use the Slug or Workspace ID anywhere a command asks for --workspace.[/dim]"
+    )
 
 
 @workspace_app.command("set-default")

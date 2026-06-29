@@ -56,11 +56,13 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         note_types: list[str] | None = None,
         after_date: datetime | None = None,
         search_item_types: list[SearchItemType] | None = None,
+        categories: list[str] | None = None,
         metadata_filters: dict[str, Any] | None = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: float | None = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
     ) -> list[SearchIndexRow]:
         return []  # pragma: no cover
 
@@ -132,7 +134,7 @@ async def test_page1_scores_gte_page2_scores():
 
     repo._embedding_provider = _EmbeddingProvider()
 
-    fake_index_rows = {i: FakeRow(id=i) for i in range(20)}
+    fake_index_rows = {("entity", i): FakeRow(id=i) for i in range(20)}
 
     async def run_page(offset, limit):
         with (
@@ -158,6 +160,7 @@ async def test_page1_scores_gte_page2_scores():
                 note_types=None,
                 after_date=None,
                 search_item_types=None,
+                categories=None,
                 metadata_filters=None,
                 limit=limit,
                 offset=offset,

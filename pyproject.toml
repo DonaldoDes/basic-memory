@@ -48,8 +48,13 @@ dependencies = [
     "fastembed>=0.7.4",
     "sqlite-vec>=0.1.6",
     "openai>=1.100.2",
+    "litellm>=1.60.0,<2.0.0",
     "logfire>=4.19.0",
     "psutil>=5.9.0",
+    # uvloop's C event loop has no self._ready.popleft() codepath, so the
+    # asyncpg engine-dispose race ("IndexError: pop from an empty deque") that
+    # crashes the Postgres backend cannot fire under it. Not available on Windows.
+    "uvloop>=0.21.0; sys_platform != 'win32'",
 ]
 
 [project.urls]
@@ -71,6 +76,10 @@ addopts = "--cov=basic_memory --cov-report term-missing"
 testpaths = ["tests", "test-int"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+# Any test hanging >120s fails with a stack dump instead of stalling the CI job
+# until the runner times out (the FastMCP/asyncpg cleanup-hang family).
+timeout = 120
+timeout_method = "thread"
 filterwarnings = [
     "ignore:The @wait_container_is_ready decorator is deprecated.*:DeprecationWarning:testcontainers\\.core\\.waiting_utils",
     "ignore:The default datetime adapter is deprecated as of Python 3\\.12.*:DeprecationWarning:aiosqlite\\.core",
@@ -84,6 +93,7 @@ markers = [
     "windows: Windows-specific tests (deselect with '-m \"not windows\"')",
     "smoke: Fast end-to-end smoke tests for MCP flows",
     "semantic: Tests requiring semantic dependencies (fastembed, sqlite-vec, openai)",
+    "live: Tests that call external provider APIs and require explicit opt-in",
 ]
 
 [tool.ruff]
@@ -109,6 +119,8 @@ dev = [
     "ty>=0.0.18",
     "cst-lsp>=0.1.3",
     "libcst>=1.8.6",
+    "pytest-timeout>=2.4.0",
+    "pytest-split>=0.11.0",
 ]
 
 [tool.hatch.version]

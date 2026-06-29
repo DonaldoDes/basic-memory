@@ -49,12 +49,13 @@ ENV/
 /docs/.obsidian/
 /examples/.obsidian/
 /examples/.basic-memory/
-
+/docs/assets
 
 # claude action
 claude-output
 **/.claude/settings.local.json
 .mcp.json
+!/plugins/codex/.mcp.json
 .mcpregistry_*
 /.testmondata
 .benchmarks/

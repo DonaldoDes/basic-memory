@@ -18,6 +18,7 @@ from basic_memory.repository.search_repository import SearchRepository, SearchIn
 from basic_memory.schemas.memory import MemoryUrl, memory_url_path
 from basic_memory.schemas.search import SearchItemType
 from basic_memory.utils import generate_permalink, parse_datetime
+from basic_memory.workspace_context import workspace_slug_for_canonical_permalinks
 
 if TYPE_CHECKING:
     from basic_memory.services.link_resolver import LinkResolver
@@ -36,6 +37,7 @@ class ContextResultRow:
     from_id: Optional[int] = None
     to_id: Optional[int] = None
     relation_type: Optional[str] = None
+    to_name: Optional[str] = None
     content: Optional[str] = None
     category: Optional[str] = None
     entity_id: Optional[int] = None
@@ -144,6 +146,29 @@ class ContextService:
                         primary = await self.search_repository.search(
                             permalink_match=normalized_path, limit=fetch_limit, offset=offset
                         )
+
+                        # Trigger: a workspace-qualified pattern matched nothing while a
+                        #   workspace permalink context is active.
+                        # Why: rows written before workspace canonicalization (or via
+                        #   clients that didn't forward workspace headers) store
+                        #   project-qualified permalinks; a workspace-prefixed pattern
+                        #   can never match those legacy rows (#957).
+                        # Outcome: retry once with the workspace prefix stripped so the
+                        #   pattern matches the index form the rows actually carry.
+                        if not primary:
+                            workspace_slug = workspace_slug_for_canonical_permalinks()
+                            ws_prefix = f"{workspace_slug}/" if workspace_slug else None
+                            if ws_prefix and normalized_path.startswith(ws_prefix):
+                                fallback_path = normalized_path.removeprefix(ws_prefix)
+                                logger.debug(
+                                    f"Pattern search fallback without workspace prefix: "
+                                    f"'{fallback_path}'"
+                                )
+                                primary = await self.search_repository.search(
+                                    permalink_match=fallback_path,
+                                    limit=fetch_limit,
+                                    offset=offset,
+                                )
                     else:
                         normalized_path = generate_permalink(path, split_extension=False)
                         logger.debug(f"Direct lookup for '{normalized_path}'")
@@ -246,9 +271,12 @@ class ContextService:
                                     type="observation",
                                     id=obs.id,
                                     title=f"{obs.category}: {obs.content[:50]}...",
-                                    permalink=generate_permalink(
-                                        f"{primary_item.permalink}/observations/{obs.category}/{obs.content}"
-                                    ),
+                                    # Observation.permalink is the single definition of the
+                                    # synthetic permalink format (200-char truncation plus
+                                    # content digest); rebuilding it inline diverged from the
+                                    # search index for long observations (#929). The parent
+                                    # entity is eager-loaded by ObservationRepository.
+                                    permalink=obs.permalink,
                                     file_path=primary_item.file_path,
                                     content=obs.content,
                                     category=obs.category,
@@ -334,9 +362,14 @@ class ContextService:
             relation_date_filter = ""
             timeframe_condition = ""
 
-        # Add project filtering for security - ensure all entities and relations belong to the same project
-        project_filter = "AND e.project_id = :project_id"
-        relation_project_filter = "AND e_from.project_id = :project_id"
+        # Trigger: build_context starts from a project-scoped search result.
+        # Why: the seed entity must belong to the requested project, but an
+        # explicit relation edge may point at another project.
+        # Outcome: traversal follows only project-owned edges from reached
+        # entities, instead of forcing every reached entity into the seed project.
+        seed_project_filter = "AND e.project_id = :project_id"
+        connected_entity_project_filter = ""
+        relation_project_filter = "AND e_from.project_id = r.project_id"
 
         # Use a CTE that operates directly on entity and relation tables
         # This avoids the overhead of the search_index virtual table
@@ -352,7 +385,8 @@ class ContextService:
             query = self._build_postgres_query(
                 entity_id_values,
                 date_filter,
-                project_filter,
+                seed_project_filter,
+                connected_entity_project_filter,
                 relation_date_filter,
                 relation_project_filter,
                 timeframe_condition,
@@ -363,7 +397,8 @@ class ContextService:
             query = self._build_sqlite_query(
                 entity_id_values,
                 date_filter,
-                project_filter,
+                seed_project_filter,
+                connected_entity_project_filter,
                 relation_date_filter,
                 relation_project_filter,
                 timeframe_condition,
@@ -383,6 +418,7 @@ class ContextService:
                 from_id=row.from_id,
                 to_id=row.to_id,
                 relation_type=row.relation_type,
+                to_name=row.to_name,
                 content=row.content,
                 category=row.category,
                 entity_id=row.entity_id,
@@ -399,7 +435,8 @@ class ContextService:
         self,
         entity_id_values: str,
         date_filter: str,
-        project_filter: str,
+        seed_project_filter: str,
+        connected_entity_project_filter: str,
         relation_date_filter: str,
         relation_project_filter: str,
         timeframe_condition: str,
@@ -417,6 +454,7 @@ class ContextService:
                 CAST(NULL AS INTEGER) as from_id,
                 CAST(NULL AS INTEGER) as to_id,
                 CAST(NULL AS TEXT) as relation_type,
+                CAST(NULL AS TEXT) as to_name,
                 CAST(NULL AS TEXT) as content,
                 CAST(NULL AS TEXT) as category,
                 CAST(NULL AS INTEGER) as entity_id,
@@ -424,12 +462,14 @@ class ContextService:
                 0 as depth,
                 e.id as root_id,
                 e.created_at,
-                e.created_at as relation_date
+                e.created_at as relation_date,
+                e.project_id as project_id,
+                ',' || e.id::text || ',' as entity_path
             FROM entity e
             LEFT JOIN search_index si ON (si.id = e.id AND si.type = 'entity' AND si.project_id = e.project_id)
             WHERE e.id IN ({entity_id_values})
             {date_filter}
-            {project_filter}
+            {seed_project_filter}
 
             UNION ALL
 
@@ -469,6 +509,10 @@ class ContextService:
                     WHEN step_type = 1 THEN r.relation_type
                     ELSE NULL
                 END as relation_type,
+                CASE
+                    WHEN step_type = 1 THEN r.to_name
+                    ELSE NULL
+                END as to_name,
                 CAST(NULL AS TEXT) as content,
                 CAST(NULL AS TEXT) as category,
                 CAST(NULL AS INTEGER) as entity_id,
@@ -485,16 +529,26 @@ class ContextService:
                 CASE
                     WHEN step_type = 1 THEN e_from.created_at
                     ELSE eg.relation_date
-                END as relation_date
+                END as relation_date,
+                CASE
+                    WHEN step_type = 1 THEN eg.project_id
+                    ELSE e.project_id
+                END as project_id,
+                CASE
+                    WHEN step_type = 1 THEN eg.entity_path
+                    ELSE eg.entity_path || e.id::text || ','
+                END as entity_path
             FROM entity_graph eg
             CROSS JOIN LATERAL (VALUES (1), (2)) AS steps(step_type)
             JOIN relation r ON (
                 eg.type = 'entity' AND
                 (r.from_id = eg.id OR r.to_id = eg.id)
                 AND r.relation_type != 'dataview_link'
+                AND r.project_id = eg.project_id
             )
             JOIN entity e_from ON (
                 r.from_id = e_from.id
+                {relation_date_filter}
                 {relation_project_filter}
             )
             LEFT JOIN entity e ON (
@@ -504,7 +558,7 @@ class ContextService:
                     ELSE r.from_id
                 END
                 {date_filter}
-                {project_filter}
+                {connected_entity_project_filter}
             )
             LEFT JOIN search_index si ON (
                 step_type = 2 AND
@@ -513,7 +567,14 @@ class ContextService:
                 si.project_id = e.project_id
             )
             WHERE eg.depth < :max_depth
-            AND (step_type = 1 OR (step_type = 2 AND e.id IS NOT NULL AND e.id != eg.id))
+            AND (
+                step_type = 1 OR (
+                    step_type = 2
+                    AND e.id IS NOT NULL
+                    AND e.id != eg.id
+                    AND position(',' || e.id::text || ',' in eg.entity_path) = 0
+                )
+            )
             {timeframe_condition}
         )
         -- Materialize and filter
@@ -526,6 +587,7 @@ class ContextService:
             from_id,
             to_id,
             relation_type,
+            to_name,
             content,
             category,
             entity_id,
@@ -536,7 +598,7 @@ class ContextService:
         FROM entity_graph
         WHERE depth > 0
         GROUP BY type, id, title, permalink, file_path, from_id, to_id,
-                 relation_type, content, category, entity_id, metadata, root_id, created_at
+                 relation_type, to_name, content, category, entity_id, metadata, root_id, created_at
         ORDER BY depth, type, id
         LIMIT :max_results
        """)
@@ -545,7 +607,8 @@ class ContextService:
         self,
         entity_id_values: str,
         date_filter: str,
-        project_filter: str,
+        seed_project_filter: str,
+        connected_entity_project_filter: str,
         relation_date_filter: str,
         relation_project_filter: str,
         timeframe_condition: str,
@@ -564,6 +627,7 @@ class ContextService:
                 NULL as from_id,
                 NULL as to_id,
                 NULL as relation_type,
+                NULL as to_name,
                 NULL as content,
                 NULL as category,
                 NULL as entity_id,
@@ -572,12 +636,14 @@ class ContextService:
                 e.id as root_id,
                 e.created_at,
                 e.created_at as relation_date,
-                0 as is_incoming
+                0 as is_incoming,
+                e.project_id as project_id,
+                ',' || e.id || ',' as entity_path
             FROM entity e
             LEFT JOIN search_index si ON (si.id = e.id AND si.type = 'entity' AND si.project_id = e.project_id)
             WHERE e.id IN ({entity_id_values})
             {date_filter}
-            {project_filter}
+            {seed_project_filter}
 
             UNION ALL
 
@@ -591,6 +657,7 @@ class ContextService:
                 r.from_id,
                 r.to_id,
                 r.relation_type,
+                r.to_name,
                 NULL as content,
                 NULL as category,
                 NULL as entity_id,
@@ -599,12 +666,15 @@ class ContextService:
                 eg.root_id,
                 e_from.created_at,
                 e_from.created_at as relation_date,
-                CASE WHEN r.from_id = eg.id THEN 0 ELSE 1 END as is_incoming
+                CASE WHEN r.from_id = eg.id THEN 0 ELSE 1 END as is_incoming,
+                eg.project_id as project_id,
+                eg.entity_path as entity_path
             FROM entity_graph eg
             JOIN relation r ON (
                 eg.type = 'entity' AND
                 (r.from_id = eg.id OR r.to_id = eg.id)
                 AND r.relation_type != 'dataview_link'
+                AND r.project_id = eg.project_id
             )
             JOIN entity e_from ON (
                 r.from_id = e_from.id
@@ -628,6 +698,7 @@ class ContextService:
                 NULL as from_id,
                 NULL as to_id,
                 NULL as relation_type,
+                NULL as to_name,
                 NULL as content,
                 NULL as category,
                 NULL as entity_id,
@@ -636,7 +707,9 @@ class ContextService:
                 eg.root_id,
                 e.created_at,
                 eg.relation_date,
-                eg.is_incoming
+                eg.is_incoming,
+                e.project_id as project_id,
+                eg.entity_path || e.id || ',' as entity_path
             FROM entity_graph eg
             JOIN entity e ON (
                 eg.type = 'relation' AND
@@ -645,10 +718,11 @@ class ContextService:
                     ELSE eg.from_id
                 END
                 {date_filter}
-                {project_filter}
+                {connected_entity_project_filter}
             )
             LEFT JOIN search_index si ON (si.id = e.id AND si.type = 'entity' AND si.project_id = e.project_id)
             WHERE eg.depth < :max_depth
+            AND instr(eg.entity_path, ',' || e.id || ',') = 0
             {timeframe_condition}
         )
         SELECT DISTINCT
@@ -660,6 +734,7 @@ class ContextService:
             from_id,
             to_id,
             relation_type,
+            to_name,
             content,
             category,
             entity_id,
@@ -670,7 +745,7 @@ class ContextService:
         FROM entity_graph
         WHERE depth > 0
         GROUP BY type, id, title, permalink, file_path, from_id, to_id,
-                 relation_type, content, category, entity_id, metadata, root_id, created_at
+                 relation_type, to_name, content, category, entity_id, metadata, root_id, created_at
         ORDER BY depth, type, id
         LIMIT :max_results
        """)

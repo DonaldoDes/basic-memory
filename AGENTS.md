@@ -83,7 +83,7 @@ Before opening or updating a PR, run the checks that mirror the common required 
 - Run `just typecheck` in addition to targeted `ruff` and `pytest` commands when tests were added or changed.
 - Sign commits with `git commit -s` so DCO passes. If a PR branch already has unsigned commits, rewrite the branch with signed-off commits before asking for review.
 - Use a semantic PR title accepted by `.github/workflows/pr-title.yml`: `type(scope): summary`.
-- Use one of the allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`, `plugins`, `skills`, `integrations`.
+- Use one of the allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `ci`, `deps`, `installer`, `plugins`, `skills`, `integrations`.
 
 ### Test Structure
 
@@ -108,13 +108,34 @@ Before opening or updating a PR, run the checks that mirror the common required 
 - Follow the repository pattern for data access
 - Tools communicate to api routers via the httpx ASGI client (in process)
 
+### Programming Style
+
+See [docs/ENGINEERING_STYLE.md](docs/ENGINEERING_STYLE.md) for the fuller house style. The
+short version for agents:
+
+- Prefer type-safe, explicit designs over object-heavy indirection. Use Python 3.12 `type`
+  aliases, full annotations, and narrow `Protocol`s when a caller only needs a capability.
+- Use dataclasses for internal value objects and operation results; use Pydantic v2 at API,
+  CLI, MCP, and persistence boundaries where validation and serialization matter.
+- Keep async boundaries obvious. Resource-owning code should use context managers, propagate
+  cancellation, and avoid hidden background work unless the lifecycle is explicit.
+- Fail fast. Do not add silent fallback logic, broad exception swallowing, speculative
+  `getattr`, or casts that hide an unclear model shape.
+- Keep control flow simple and local. Push branching decisions up, keep leaf helpers focused,
+  and name values after the domain concept they carry.
+- Use evidence-first testing. Add or update meaningful regression tests for bugs and risky
+  behavior, prefer real code paths over mocks, and run the narrowest command that proves the
+  change before widening verification.
+- Comments should explain why a branch, invariant, or constraint exists. Avoid comments that
+  merely narrate obvious code.
+
 ### Code Change Guidelines
 
 - **Full file read before edits**: Before editing any file, read it in full first to ensure complete context; partial reads lead to corrupted edits
 - **Minimize diffs**: Prefer the smallest change that satisfies the request. Avoid unrelated refactors or style rewrites unless necessary for correctness
-- **No speculative getattr**: Never use `getattr(obj, "attr", default)` when unsure about attribute names. Check the class definition or source code first
-- **Fail fast**: Write code with fail-fast logic by default. Do not swallow exceptions with errors or warnings
-- **No fallback logic**: Do not add fallback logic unless explicitly told to and agreed with the user
+- **House style is canonical**: Follow the Programming Style section above for type-safe,
+  fail-fast code; do not hide unclear models with speculative attributes, broad exception
+  handling, casts, or unapproved fallback logic
 - **No guessing**: Do not say "The issue is..." before you actually know what the issue is. Investigate first.
 
 ### Literate Programming Style
@@ -279,7 +300,9 @@ See SPEC-16 for full context manager refactor details.
 
 ### Release Process
 
-Releases are driven by `just release` / `just beta` — never by a bare `git tag`. The recipes bump version metadata, run pre-flight checks, commit, tag, and push. GitHub Actions then publishes to PyPI and updates the Homebrew formula.
+Releases are driven by `just release` / `just beta` — never by a bare `git tag`. The recipes bump version metadata, run pre-flight checks, land the bump on `main` through a release PR, tag, and push the tag. GitHub Actions then publishes to PyPI and updates the Homebrew formula.
+
+**Main requires PRs.** The `main` ruleset rejects direct pushes ("Changes must be made through a pull request") and the repo disallows merge commits, so the recipes push a `release/vX.Y.Z` branch, open a PR titled `chore(core): release vX.Y.Z`, rebase-merge it with `gh pr merge --rebase`, then tag the rebased bump commit on `main` (located by its commit subject, since rebasing rewrites the SHA) and push the tag. The CHANGELOG entry for the version must already be on `main` — land it via a normal PR before running the recipe (it pre-flight-checks for a `## vX.Y.Z` heading).
 
 **Stable release:**
 
@@ -287,7 +310,7 @@ Releases are driven by `just release` / `just beta` — never by a bare `git tag
 just release v0.21.3
 ```
 
-The recipe runs `just lint` + `just typecheck`, then updates every release manifest through `scripts/update_versions.py`: `src/basic_memory/__init__.py`, `server.json`, the root Claude marketplace, the Claude Code plugin manifest and local marketplace, the Hermes `plugin.yaml`, and the OpenClaw `package.json`. It commits as `chore: update version to X.Y.Z for vX.Y.Z release`, creates the `vX.Y.Z` tag, and pushes both the commit and the tag to `origin/main`. After the tag lands, the `Release` workflow builds the Python package, publishes to PyPI, creates the GitHub release with auto-generated notes, publishes the OpenClaw npm package, and updates the Homebrew formula. The recipe finishes by printing the post-release tasks the workflow doesn't cover.
+The recipe runs `just lint` + `just typecheck`, then updates every release manifest through `scripts/update_versions.py`: `src/basic_memory/__init__.py`, `server.json`, the root Claude marketplace, the Claude Code plugin manifest and local marketplace, the Hermes `plugin.yaml`, and the OpenClaw `package.json`. It commits as `chore: update version to X.Y.Z for vX.Y.Z release` on a `release/vX.Y.Z` branch, lands it on `main` via a rebase-merged PR, then tags the rebased commit and pushes the tag. After the tag lands, the `Release` workflow builds the Python package, publishes to PyPI, creates the GitHub release with auto-generated notes, publishes the OpenClaw npm package, and updates the Homebrew formula. The recipe finishes by printing the post-release tasks the workflow doesn't cover.
 
 **Beta release:** `just beta v0.21.3b1` — same flow with a beta-suffixed tag. PyPI consumers install with `pip install basic-memory --pre`.
 
@@ -298,8 +321,13 @@ The recipe runs `just lint` + `just typecheck`, then updates every release manif
 **Do not tag releases by hand.** A bare `git tag vX.Y.Z` skips the in-code version bump. Package metadata is still correct (uv-dynamic-versioning derives it from the git tag) but `basic-memory --version` reports the previous release, which is what happened with v0.21.2 → v0.21.3.
 
 **Post-release tasks** the recipe surfaces but doesn't run:
-- `docs.basicmemory.com` — add notes to `src/pages/latest-releases.mdx`
-- `basicmachines.co` — bump version in `src/components/sections/hero.tsx`
+- `docs.basicmemory.com` — add a What's New page under `content/2.whats-new/` and bump the version badge in `content/index.md` (the changelog page auto-fetches GitHub releases; see that repo's CLAUDE.md version-bump checklist)
+- `basicmemory.com` — the marketing site (Astro + React, repo
+  `basicmachines-co/basicmemory.com`, formerly `basicmachines.co`) carries **no
+  hardcoded version number** in its UI, so there is nothing to bump. For a
+  significant release, optionally add a dated announcement post under
+  `src/content/blog/` (model it on an existing `basic-memory-vX-Y-Z-release.md`).
+  Skip entirely for routine patch releases.
 - MCP Registry — `mcp-publisher publish` from the repo root
 
 See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `changelog.md` alongside it) for the full release + post-release runbook, including the slash commands.
@@ -347,6 +375,13 @@ See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `c
 - Create API key: `basic-memory cloud create-key "name"`
 - Manage snapshots: `basic-memory cloud snapshot [create|list|delete|show|browse]`
 - Restore from snapshot: `basic-memory cloud restore <path> --snapshot <id>`
+
+**Cloud Sync Commands (Personal and Team workspaces):**
+- Fetch cloud changes (cloud -> local): `basic-memory cloud pull --name "name"` (Team-safe; additive, never deletes local)
+- Upload local changes (local -> cloud): `basic-memory cloud push --name "name"` (Team-safe; additive, never deletes cloud)
+- Resolve conflicts on push/pull: `--on-conflict [fail|keep-local|keep-cloud|keep-both]` (default `fail` lists conflicts and aborts, git-style)
+- One-way mirror (local -> cloud): `basic-memory cloud sync --name "name"` (Personal workspaces only; deletes cloud files missing locally)
+- Two-way mirror (local <-> cloud): `basic-memory cloud bisync --name "name"` (Personal workspaces only)
 
 ### MCP Capabilities
 
@@ -506,7 +541,7 @@ With GitHub integration, the development workflow includes:
 5. **Code Commits**: ALWAYS sign off commits with `git commit -s`
 6. **Pull Request Titles**: PR titles must follow the semantic format enforced by `.github/workflows/pr-title.yml`: `type(scope): summary`
    - Allowed types: `feat`, `fix`, `chore`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
-   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`, `plugins`, `skills`, `integrations`
+   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `ci`, `deps`, `installer`, `plugins`, `skills`, `integrations`
    - Example: `fix(cli): propagate cloud workspace routing`
 
 This level of integration represents a new paradigm in AI-human collaboration, where the AI assistant becomes a full-fledged team member rather than just a tool for generating code snippets.

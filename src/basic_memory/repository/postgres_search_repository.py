@@ -18,6 +18,7 @@ from basic_memory.repository.search_index_row import SearchIndexRow
 from basic_memory.repository.search_repository_base import (
     SearchRepositoryBase,
     VectorChunkState,
+    relaxed_query_words,
 )
 from basic_memory.repository.metadata_filters import parse_metadata_filters
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
@@ -176,6 +177,14 @@ class PostgresSearchRepository(SearchRepositoryBase):
         # For non-Boolean queries, prepare single term
         return self._prepare_single_term(term, is_prefix)
 
+    @staticmethod
+    def _relaxed_tsquery_text(search_text: Optional[str]) -> Optional[str]:
+        """OR-relaxed tsquery expression for a failed strict query, or None."""
+        words = relaxed_query_words(search_text)
+        if not words:
+            return None
+        return " | ".join(f"{word}:*" for word in words)
+
     def _prepare_boolean_query(self, query: str) -> str:
         """Convert Boolean query to tsquery format.
 
@@ -236,7 +245,12 @@ class PostgresSearchRepository(SearchRepositoryBase):
 
         # Handle multi-word queries
         if " " in cleaned_term:
-            words = [w for w in cleaned_term.split() if w.strip()]
+            # Strip sentence punctuation from word edges so question-form
+            # queries produce clean lexemes (parity with SQLite FTS5 prep).
+            # The tsquery tokenizer ignores this punctuation anyway; leaving it
+            # in only risks tsquery syntax errors. Interior characters are kept.
+            words = [w.strip("?!.,;") for w in cleaned_term.split()]
+            words = [w for w in words if w]
             if not words:
                 # All characters were special chars, search won't match anything
                 # Return a safe search term that won't cause syntax errors
@@ -249,8 +263,11 @@ class PostgresSearchRepository(SearchRepositoryBase):
             # Join with AND operator
             return " & ".join(prepared_words)
 
-        # Single word
-        cleaned_term = cleaned_term.strip()
+        # Single word: strip edge punctuation; guard the now-empty case so a
+        # bare ":*"/"" never reaches tsquery.
+        cleaned_term = cleaned_term.strip().strip("?!.,;")
+        if not cleaned_term:
+            return "NOSPECIALCHARS:*"
         if is_prefix:
             return f"{cleaned_term}:*"
         else:
@@ -705,6 +722,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict] = None,
     ) -> tuple[str, str, dict, str, str]:
         """Build Postgres FTS FROM/WHERE params shared by search and count."""
@@ -762,14 +780,36 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 type_placeholders.append(f":{param_name}")
             conditions.append(f"search_index.type IN ({', '.join(type_placeholders)})")
 
-        # Handle note type filter using JSONB containment (parameterized)
+        # Handle observation category filter (parameterized for defense-in-depth).
+        # Trigger: caller passed `categories` to scope observation results.
+        # Why: `entity_types=["observation"]` only narrows to the observation row type;
+        #      callers expect exact-category matching, not incidental text matches.
+        # Outcome: only rows whose indexed category exactly equals a requested value
+        #          survive (entities/relations have NULL category and are excluded).
+        if categories:
+            category_placeholders = []
+            for idx, category in enumerate(categories):
+                param_name = f"category_{idx}"
+                params[param_name] = category
+                category_placeholders.append(f":{param_name}")
+            conditions.append(f"search_index.category IN ({', '.join(category_placeholders)})")
+
+        # Handle note type filter (frontmatter type field, parameterized).
+        # Trigger: caller passed `note_types` to scope by the frontmatter `type` field.
+        # Why: the stored note_type preserves the frontmatter casing (e.g. `Chapter`),
+        #      but the filter is documented case-insensitive. JSONB `@>` containment is
+        #      exact-match, so capitalized types were unfindable.
+        # Outcome: compare LOWER(metadata->>'note_type') against lowercased filter
+        #          values so `note_types=["Chapter"]` matches a stored `Chapter`.
         if note_types:
-            type_conditions = []
+            type_placeholders = []
             for idx, note_type in enumerate(note_types):
                 param_name = f"note_type_{idx}"
-                params[param_name] = json.dumps({"note_type": note_type})
-                type_conditions.append(f"search_index.metadata @> CAST(:{param_name} AS jsonb)")
-            conditions.append(f"({' OR '.join(type_conditions)})")
+                params[param_name] = note_type.lower()
+                type_placeholders.append(f":{param_name}")
+            conditions.append(
+                f"LOWER(search_index.metadata->>'note_type') IN ({', '.join(type_placeholders)})"
+            )
 
         # Handle date filter
         if after_date:
@@ -879,11 +919,13 @@ class PostgresSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
     ) -> List[SearchIndexRow]:
         """Search across all indexed content using PostgreSQL tsvector."""
         # --- Dispatch vector / hybrid modes (shared logic) ---
@@ -895,6 +937,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
             retrieval_mode=retrieval_mode,
             min_similarity=min_similarity,
@@ -919,6 +962,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
 
@@ -956,6 +1000,20 @@ class PostgresSearchRepository(SearchRepositoryBase):
             async with db.scoped_session(self.session_maker) as session:
                 result = await session.execute(text(sql), params)
                 rows = result.fetchall()
+                # Trigger: multi-word natural-language query matched nothing
+                # under the default all-terms-AND tsquery semantics.
+                # Why: questions rarely have every word in one document;
+                # without relaxation the FTS half of hybrid search contributes
+                # zero candidates (parity with the SQLite path).
+                # Outcome: one retry with OR-joined prefix lexemes; ts_rank
+                # still ranks multi-term matches first.
+                relaxed = (
+                    self._relaxed_tsquery_text(search_text) if allow_relaxed and not rows else None
+                )
+                if relaxed and params.get("text"):
+                    params["text"] = relaxed
+                    result = await session.execute(text(sql), params)
+                    rows = result.fetchall()
         except Exception as e:
             if self._is_tsquery_syntax_error(e):
                 logger.warning(f"tsquery syntax error for search term: {search_text}, error: {e}")
@@ -1008,6 +1066,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
@@ -1022,6 +1081,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 note_types=note_types,
                 after_date=after_date,
                 search_item_types=search_item_types,
+                categories=categories,
                 metadata_filters=metadata_filters,
                 retrieval_mode=retrieval_mode,
                 min_similarity=min_similarity,
@@ -1041,6 +1101,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
         sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"

@@ -83,11 +83,13 @@ class _ConcreteRepo(SearchRepositoryBase):
         note_types: list[str] | None = None,
         after_date: datetime | None = None,
         search_item_types: list[SearchItemType] | None = None,
+        categories: list[str] | None = None,
         metadata_filters: dict[str, Any] | None = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: float | None = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
     ) -> list[SearchIndexRow]:
         return []
 

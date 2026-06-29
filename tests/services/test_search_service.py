@@ -278,6 +278,39 @@ async def test_search_entity_type(search_service, test_graph):
 
 
 @pytest.mark.asyncio
+async def test_search_categories_filter(search_service, test_graph):
+    """categories propagates through _prepare_query/has_criteria to scope results.
+
+    The test_graph fixture indexes observations with categories "note" and "tech".
+    A categories filter must return only matching observation categories.
+    """
+    # categories alone is enough criteria to run a query (has_criteria True).
+    note_results = await search_service.search(SearchQuery(categories=["note"]))
+    assert len(note_results) > 0
+    assert all(r.type == SearchItemType.OBSERVATION for r in note_results)
+    assert all(r.category == "note" for r in note_results)
+
+    # A different category yields a disjoint, non-empty result set.
+    tech_results = await search_service.search(SearchQuery(categories=["tech"]))
+    assert len(tech_results) > 0
+    assert all(r.category == "tech" for r in tech_results)
+
+    note_ids = {r.id for r in note_results}
+    tech_ids = {r.id for r in tech_results}
+    assert note_ids.isdisjoint(tech_ids)
+
+    # count() must agree with the filtered search via the same prepared query.
+    assert await search_service.count(SearchQuery(categories=["note"])) == len(note_results)
+
+
+@pytest.mark.asyncio
+async def test_search_categories_only_is_not_no_criteria():
+    """A SearchQuery carrying only categories must not be treated as empty."""
+    assert SearchQuery(categories=["requirement"]).no_criteria() is False
+    assert SearchQuery().no_criteria() is True
+
+
+@pytest.mark.asyncio
 async def test_extract_entity_tags_exception_handling(search_service):
     """Test the _extract_entity_tags method exception handling (lines 147-151)."""
     from basic_memory.models.knowledge import Entity
@@ -1215,6 +1248,78 @@ async def test_index_entity_multiple_categories_same_content(
     assert len(results) >= 2
 
 
+@pytest.mark.asyncio
+async def test_index_entity_long_observations_shared_prefix_both_searchable(
+    search_service, session_maker, test_project
+):
+    """Regression test for issue #909: truncated permalink collisions drop observations.
+
+    Observation permalinks truncate content to 200 chars (PostgreSQL btree limit),
+    so two distinct observations of the same category sharing a 200-char prefix
+    collided on the same synthetic permalink and the second was silently skipped
+    during indexing. Both must be independently searchable.
+    """
+    from basic_memory.repository import EntityRepository, ObservationRepository
+    from datetime import datetime
+
+    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    obs_repo = ObservationRepository(session_maker, project_id=test_project.id)
+
+    entity_data = {
+        "title": "Long Observation Collision Entity",
+        "note_type": "note",
+        "entity_metadata": {},
+        "content_type": "text/markdown",
+        "file_path": "test/long-obs-collision.md",
+        "permalink": "test/long-obs-collision",
+        "project_id": test_project.id,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+    }
+    entity = await entity_repo.create(entity_data)
+
+    # Identical for the first 210 chars (beyond the 200-char truncation point),
+    # differing only in the trailing unique marker
+    shared_prefix = "x" * 210
+    await obs_repo.create(
+        {
+            "entity_id": entity.id,
+            "category": "note",
+            "content": f"{shared_prefix} ALPHA_UNIQUE_MARKER",
+        }
+    )
+    await obs_repo.create(
+        {
+            "entity_id": entity.id,
+            "category": "note",
+            "content": f"{shared_prefix} BETA_UNIQUE_MARKER",
+        }
+    )
+
+    # Reload entity with observations (get_by_permalink eagerly loads observations)
+    entity = await entity_repo.get_by_permalink("test/long-obs-collision")
+    assert entity is not None
+    assert len(entity.observations) == 2
+
+    # Distinct content must produce distinct permalinks despite the shared prefix
+    permalinks = {obs.permalink for obs in entity.observations}
+    assert len(permalinks) == 2
+
+    await search_service.index_entity(entity, content="")
+
+    # The second observation must be findable by its own unique marker
+    results = await search_service.search(
+        SearchQuery(text="BETA_UNIQUE_MARKER", entity_types=[SearchItemType.OBSERVATION])
+    )
+    assert any("BETA_UNIQUE_MARKER" in (r.content_snippet or "") for r in results)
+
+    # The first observation must remain findable as well
+    results = await search_service.search(
+        SearchQuery(text="ALPHA_UNIQUE_MARKER", entity_types=[SearchItemType.OBSERVATION])
+    )
+    assert any("ALPHA_UNIQUE_MARKER" in (r.content_snippet or "") for r in results)
+
+
 # Tests for NUL byte stripping
 
 
@@ -1278,6 +1383,21 @@ async def test_reindex_vectors(search_service, session_maker, test_project, monk
     from datetime import datetime
 
     entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+
+    # Test fixtures disable semantic search, and delete_stale_vector_rows is the one call
+    # in this flow that requires the semantic stack — stub it so the test exercises the
+    # reindex wiring (id collection, batch call, stats mapping) without embeddings.
+    # raising=False: the method is SQLite-only; the Postgres purge path never calls it,
+    # so on Postgres this just attaches an unused attribute.
+    async def _noop_delete_stale_vector_rows() -> None:
+        return None
+
+    monkeypatch.setattr(
+        search_service.repository,
+        "delete_stale_vector_rows",
+        _noop_delete_stale_vector_rows,
+        raising=False,
+    )
 
     # Create some entities
     created_entity_ids: list[int] = []
@@ -1349,6 +1469,22 @@ async def test_reindex_vectors_no_callback(
     from datetime import datetime
 
     entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+
+    # Test fixtures disable semantic search, and delete_stale_vector_rows is the one call
+    # in this flow that requires the semantic stack — stub it so the test exercises the
+    # reindex wiring without embeddings.
+    # raising=False: the method is SQLite-only; the Postgres purge path never calls it,
+    # so on Postgres this just attaches an unused attribute.
+    async def _noop_delete_stale_vector_rows() -> None:
+        return None
+
+    monkeypatch.setattr(
+        search_service.repository,
+        "delete_stale_vector_rows",
+        _noop_delete_stale_vector_rows,
+        raising=False,
+    )
+
     entity = await entity_repo.create(
         {
             "title": "No Callback Entity",
