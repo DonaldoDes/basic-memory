@@ -14,7 +14,11 @@ from basic_memory.mcp.server import mcp
 from basic_memory.mcp.project_context import get_active_project
 
 
-@mcp.tool("force_reindex")
+@mcp.tool(
+    "force_reindex",
+    title="Force Reindex",
+    tags={"search"},
+)
 async def force_reindex(
     project: Optional[str] = None,
     context: Context | None = None,
