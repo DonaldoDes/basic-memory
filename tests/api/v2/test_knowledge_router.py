@@ -740,19 +740,19 @@ async def test_v2_endpoints_use_project_id_not_name(client: AsyncClient, test_pr
 
 
 @pytest.mark.asyncio
-async def test_list_entities_for_dataview_skips_binary_files(
+async def test_list_entities_for_bases_skips_binary_files(
     client: AsyncClient,
     v2_project_url,
     entity_repository,
     file_service,
 ):
-    """Regression: dataview endpoint must NOT spam ERROR logs on binary entities.
+    """Regression: bases endpoint must NOT spam ERROR logs on binary entities.
 
     Before fix: reading a PDF/JPEG entity via file_service.read_file raised
     UnicodeDecodeError that was logged at ERROR level inside
     FileService.read_file's except-clause, spamming the log on every
     read_note / build_context call (which iterates all entities for
-    Dataview enrichment).
+    Bases enrichment).
     """
     from loguru import logger as loguru_logger
 
@@ -792,8 +792,8 @@ async def test_list_entities_for_dataview_skips_binary_files(
 
     handler_id = loguru_logger.add(sink, level="ERROR")
     try:
-        # Hit the dataview endpoint that crashed in production
-        response = await client.get(f"{v2_project_url}/knowledge/entities/dataview")
+        # Hit the bases dataset endpoint that crashed in production
+        response = await client.get(f"{v2_project_url}/knowledge/entities/bases")
     finally:
         loguru_logger.remove(handler_id)
 
@@ -808,52 +808,52 @@ async def test_list_entities_for_dataview_skips_binary_files(
     # No "File read error" log spam from FileService.read_file's except-clause
     file_read_errors = [m for m in captured if "File read error" in m]
     assert file_read_errors == [], (
-        f"Expected no File read errors during dataview enrichment, got: {file_read_errors}"
+        f"Expected no File read errors during bases enrichment, got: {file_read_errors}"
     )
 
 
 @pytest.mark.asyncio
-async def test_list_entities_for_dataview_exposes_note_type(
+async def test_list_entities_for_bases_exposes_note_type(
     client: AsyncClient,
     v2_project_url,
 ):
-    """Regression: dataview endpoint must read entity.note_type, not entity.entity_type.
+    """Regression: bases endpoint must read entity.note_type, not entity.entity_type.
 
     Upstream rename (c4429183, #600) changed the Entity column entity_type -> note_type.
-    The /entities/dataview endpoint still referenced entity.entity_type, raising
+    The /entities/bases endpoint still referenced entity.entity_type, raising
     AttributeError ('Entity' object has no attribute 'entity_type') -> HTTP 500.
-    Caught silently by read_note._enrich_with_dataview's broad except, this left
-    Dataview blocks un-rendered (raw) in read_note / build_context output.
+    Caught silently by the read path's broad except, this left base blocks
+    un-rendered (raw) in read_note / build_context output.
 
     This test loads a freshly-persisted entity from the DB (no constructor masking
     of entity_type) and asserts the endpoint returns 200 with the correct `type`.
     """
     md_data = {
-        "title": "DataviewTypeNote",
+        "title": "BasesTypeNote",
         "folder": "test",
         "content": "# A note\n\nBody text.",
     }
     md_response = await client.post(f"{v2_project_url}/knowledge/entities", json=md_data)
     assert md_response.status_code == 200
 
-    # Hit the dataview endpoint - must NOT 500 on entity.entity_type AttributeError
-    response = await client.get(f"{v2_project_url}/knowledge/entities/dataview")
+    # Hit the bases endpoint - must NOT 500 on entity.entity_type AttributeError
+    response = await client.get(f"{v2_project_url}/knowledge/entities/bases")
     assert response.status_code == 200, response.text
 
     notes = response.json()
-    note = next((n for n in notes if n["title"] == "DataviewTypeNote"), None)
-    assert note is not None, "Created markdown note missing from dataview listing"
+    note = next((n for n in notes if n["title"] == "BasesTypeNote"), None)
+    assert note is not None, "Created markdown note missing from bases listing"
 
     # `type` must be populated from entity.note_type (markdown notes -> "note")
     assert note["type"] == "note", f"Expected type='note' from note_type, got {note['type']!r}"
 
 
 @pytest.mark.asyncio
-async def test_list_entities_for_dataview_exposes_outlinks(
+async def test_list_entities_for_bases_exposes_outlinks(
     client: AsyncClient,
     v2_project_url,
 ):
-    """US-b (ADR-005 §Axe 2): the dataview dataset must carry each note's outlinks.
+    """US-b (ADR-005 §Axe 2): the bases dataset must carry each note's outlinks.
 
     file.hasLink(this.file) reads the row's outlinks (no filesystem, no graph
     recompute). The endpoint must expose them on file.outlinks, sourced from the
@@ -878,7 +878,7 @@ async def test_list_entities_for_dataview_exposes_outlinks(
     )
     assert source.status_code == 200
 
-    response = await client.get(f"{v2_project_url}/knowledge/entities/dataview")
+    response = await client.get(f"{v2_project_url}/knowledge/entities/bases")
     assert response.status_code == 200, response.text
     notes = response.json()
 

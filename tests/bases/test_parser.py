@@ -16,7 +16,7 @@ from basic_memory.bases.errors import (
 )
 from basic_memory.bases.filter_leaf import FormulaLeafNode
 from basic_memory.bases.formula_ast import FBinOp, FCall, FField, FLiteral, FPropChain
-from basic_memory.dataview.ast import (
+from basic_memory.bases.ast import (
     BinaryOpNode,
     LiteralNode,
 )

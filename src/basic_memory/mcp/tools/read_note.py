@@ -52,10 +52,9 @@ async def _enrich_with_bases(
 ) -> str:
     """Enrich note content with executed Bases (```base```) queries.
 
-    Mirror of _enrich_with_dataview: detects ```base``` blocks, fetches the
-    shared entity dataset once, renders each block, and appends a
-    ``## Bases Query Results`` section. Any failure returns the original
-    content unchanged (the note never breaks).
+    Detects ```base``` blocks, fetches the shared entity dataset once, renders
+    each block, and appends a ``## Bases Query Results`` section. Any failure
+    returns the original content unchanged (the note never breaks).
 
     ``note_metadata`` (US-b / ADR-005 §Axe 2) is the host-note identity threaded
     to ``process_note`` so ``this`` / ``file.hasLink(this.file)`` resolve. When
@@ -63,7 +62,7 @@ async def _enrich_with_bases(
     """
     try:
         host_metadata = note_metadata or _host_identity_from_content(content, None)
-        notes = await knowledge_client.list_entities_for_dataview()
+        notes = await knowledge_client.list_entities_for_bases()
         integration = create_bases_integration(notes_provider=lambda: notes)
         bases_results = integration.process_note(content, note_metadata=host_metadata)
 
@@ -98,17 +97,6 @@ async def _enrich_with_bases(
     except Exception as e:
         logger.warning(f"Failed to enrich note with Bases results: {e}")
         return content
-
-
-async def _enrich_with_dataview(content: str, project_name: str, knowledge_client) -> str:
-    """DEPRECATED no-op: the Dataview executor is retired.
-
-    ``enable_dataview`` is kept on the public signature for backward
-    compatibility but no longer executes ``​```dataview​`` blocks. The blocks are
-    left inert (raw markdown), symmetric to ``​```base​`` when
-    ``enable_bases=False``. Returns ``content`` unchanged.
-    """
-    return content
 
 
 def _is_exact_title_match(identifier: str, title: str) -> bool:
@@ -391,10 +379,6 @@ async def read_note(
                     if output_format == "json":
                         return await _read_json_payload(entity_id)
                     content = response.text
-                    if enable_dataview:
-                        content = await _enrich_with_dataview(
-                            content, active_project.name, knowledge_client
-                        )
                     if enable_bases:
                         content = await _enrich_with_bases(
                             content,
@@ -443,10 +427,6 @@ async def read_note(
                             if output_format == "json":
                                 return await _read_json_payload(entity_id)
                             content = response.text
-                            if enable_dataview:
-                                content = await _enrich_with_dataview(
-                                    content, active_project.name, knowledge_client
-                                )
                             if enable_bases:
                                 content = await _enrich_with_bases(
                                     content,

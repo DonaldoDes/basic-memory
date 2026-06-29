@@ -1,8 +1,8 @@
 """Obsidian Bases executor (Phase 1, parity-first).
 
-Fork-local module mirroring ``basic_memory.dataview``. Renders ```` ```base ````
-fenced blocks (TABLE/LIST views) to markdown, reusing the Dataview
-ExpressionEvaluator / FieldResolver / ResultFormatter by direct import.
+Renders ```` ```base ```` fenced blocks (TABLE/LIST views) to markdown. The
+shared filter AST, FieldResolver and ResultFormatter primitives live in this
+package (``basic_memory.bases.ast`` / ``field_resolver`` / ``result_formatter``).
 
 See ADR-003 and specs/bases-executor/spec.md.
 """

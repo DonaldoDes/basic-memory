@@ -40,7 +40,7 @@ from basic_memory.bases.errors import (
     BasesUnsupportedError,
 )
 from basic_memory.bases.schema import MAX_AST_DEPTH, MAX_LEAF_EXPR_CHARS
-from basic_memory.dataview.ast import (
+from basic_memory.bases.ast import (
     BinaryOpNode,
     ExpressionNode,
     FieldNode,

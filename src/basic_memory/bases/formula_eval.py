@@ -74,7 +74,7 @@ from basic_memory.bases.schema import (
     MAX_FORMULA_RESULT_SIZE,
     MAX_ITERATOR_CARDINALITY,
 )
-from basic_memory.dataview.executor.field_resolver import FieldResolver
+from basic_memory.bases.field_resolver import FieldResolver
 
 
 # --------------------------------------------------------------------------- #
@@ -551,7 +551,7 @@ class FormulaEvaluator:
         # BUG-018 (M-Bases-P4): a YAML frontmatter boolean ``agent_context: true``
         # is NOT stored as a Python ``bool``. The core parser
         # ``entity_parser.normalize_frontmatter_value(True)`` returns ``str(True)``
-        # == ``"True"``, so the row projected by ``list_entities_for_dataview``
+        # == ``"True"``, so the row projected by ``list_entities_for_bases``
         # carries the STRING ``"True"`` / ``"False"`` (confirmed on the live DB).
         # Without coercion ``field == true`` evaluates ``"True" == True`` → False
         # for every note → the 0-item live bug. Mirror of ``_coerce_date_operands``:

@@ -37,7 +37,7 @@ from basic_memory.bases.schema import (
     ViewType,
 )
 from basic_memory.bases.yaml_loader import safe_load_no_aliases
-from basic_memory.dataview.ast import (
+from basic_memory.bases.ast import (
     BinaryOpNode,
     ExpressionNode,
     LiteralNode,
