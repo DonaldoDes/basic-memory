@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from basic_memory.bases.formula_ast import FormulaNode
-from basic_memory.dataview.ast import ExpressionNode, SortDirection
+from basic_memory.bases.ast import ExpressionNode, SortDirection
 
 # ---------------------------------------------------------------------------
 # Anti-DoS bounds (ADR-003 §3.4) — chiffrées

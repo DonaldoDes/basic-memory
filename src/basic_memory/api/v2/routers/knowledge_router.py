@@ -258,33 +258,35 @@ async def resolve_identifier(
 ## Read endpoints
 
 
-@router.get("/entities/dataview")
-async def list_entities_for_dataview(
+@router.get("/entities/bases")
+async def list_entities_for_bases(
     project_id: ProjectExternalIdPathDep,
     entity_repository: EntityRepositoryV2ExternalDep,
     file_service: FileServiceV2ExternalDep,
 ) -> list[dict]:
-    """List all entities in a format suitable for Dataview query execution.
+    """List all entities in a format suitable for Bases query execution.
 
-    Returns entities with file metadata and frontmatter fields needed by Dataview:
+    Returns entities with file metadata and frontmatter fields needed by the
+    Bases executor:
     - file.path, file.name, file.folder
     - title
     - type (entity_type)
     - permalink (optional)
     - All frontmatter fields from the source file
 
-    This endpoint is used by build_context to provide notes to the Dataview integration.
+    This endpoint is used by build_context / read_note to provide notes to the
+    Bases integration.
 
     Args:
         project_id: Project external ID from URL path
 
     Returns:
-        List of note dictionaries with Dataview-compatible structure
+        List of note dictionaries with the nested file.* structure
     """
     from pathlib import Path as PathLib
     import frontmatter
 
-    logger.info(f"API v2 request: list_entities_for_dataview for project {project_id}")
+    logger.info(f"API v2 request: list_entities_for_bases for project {project_id}")
 
     # Get all entities in the project
     all_entities = await entity_repository.find_all()
@@ -335,7 +337,7 @@ async def list_entities_for_dataview(
                         rel_links[: _MAX_RELATION_LINKS_PER_TYPE - len(bucket)]
                     )
 
-        # Convert entity to note format expected by Dataview
+        # Convert entity to note format expected by the Bases executor
         note = {
             "file": {
                 "path": entity.file_path,
@@ -371,7 +373,7 @@ async def list_entities_for_dataview(
                 else str(entity.created_at)
             )
 
-        # Add entity_metadata as frontmatter for Dataview field resolution
+        # Add entity_metadata as frontmatter for Bases field resolution
         if entity.entity_metadata:
             note.update(entity.entity_metadata)
 
@@ -414,7 +416,7 @@ async def list_entities_for_dataview(
 
         notes.append(note)
 
-    logger.info(f"API v2 response: list_entities_for_dataview returned {len(notes)} notes")
+    logger.info(f"API v2 response: list_entities_for_bases returned {len(notes)} notes")
 
     return notes
 

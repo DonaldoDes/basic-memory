@@ -283,16 +283,14 @@ async def build_context(
                 max_related=max_related,
             )
 
-            # Dataview enrichment is DEPRECATED (no-op). ``enable_dataview`` is
-            # still accepted on the signature for backward compatibility but no
-            # longer executes ``​```dataview​`` blocks (they are left inert). The
-            # Dataview→Bases migration is complete; use ``enable_bases`` below
+            # ``enable_dataview`` is still accepted on the signature for backward
+            # compatibility but is a no-op (the Dataview executor was removed).
+            # ``​```dataview​`` blocks are left inert; use ``enable_bases`` below
             # for live query rendering.
 
             # Enrich with Bases (```base```) via on-the-fly detection on the
-            # primary content. Unlike Dataview (which reads dataview_queries
-            # metadata computed at sync), Bases detects blocks directly on the
-            # returned content — no dependency on sync_service (ADR-003 §4).
+            # primary content. Bases detects blocks directly on the returned
+            # content — no dependency on sync_service (ADR-003 §4).
             if enable_bases:
                 has_base = any(
                     cr.primary_result.type == "entity"
@@ -303,7 +301,7 @@ async def build_context(
                 if has_base:
                     logger.info("Enriching graph context with on-the-fly Bases queries")
                     knowledge_client = KnowledgeClient(client, active_project.external_id)
-                    notes = await knowledge_client.list_entities_for_dataview()
+                    notes = await knowledge_client.list_entities_for_bases()
                     bases_integration = create_bases_integration(
                         notes_provider=lambda: notes
                     )

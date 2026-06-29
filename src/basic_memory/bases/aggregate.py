@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from basic_memory.bases.errors import BasesLimitError, BasesUnsupportedError
-from basic_memory.dataview.executor.field_resolver import FieldResolver
+from basic_memory.bases.field_resolver import FieldResolver
 
 # ---------------------------------------------------------------------------
 # Closed aggregate whitelist (US-001 NC-1 + US-005 DoD).

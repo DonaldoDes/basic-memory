@@ -14,7 +14,6 @@ from sqlalchemy import text
 
 import logfire
 
-from basic_memory.dataview.detector import DataviewDetector
 from basic_memory.models import Entity
 from basic_memory.repository import EntityRepository
 from basic_memory.repository.search_repository import (
@@ -857,21 +856,11 @@ class SearchService:
                     :MAX_CONTENT_STEMS_SIZE
                 ]  # pragma: no cover
 
-            # Build entity metadata. Include note_type from upstream rename,
-            # plus Dataview queries extracted from content for search-time hydration.
+            # Build entity metadata (note_type from upstream rename).
             entity_metadata: Dict[str, Any] = {
                 "note_type": entity.note_type,
             }
-            if content:
-                dataview_queries = DataviewDetector.extract_query_text(content)
-                logger.debug(
-                    f"Dataview extraction for {entity.title}: "
-                    f"found {len(dataview_queries)} queries"
-                )
-                if dataview_queries:
-                    entity_metadata["dataview_queries"] = dataview_queries
-                    logger.debug(f"Added dataview_queries to metadata for {entity.title}")
-            else:
+            if not content:
                 logger.warning(
                     f"No content available for {entity.title} (entity_id={entity.id})"
                 )

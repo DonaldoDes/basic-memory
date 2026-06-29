@@ -39,7 +39,7 @@ class TestFormulaAstNodes:
 
     def test_disjoint_from_dataview_ast(self):
         """No formula node shares identity with a Phase 1 filter node."""
-        from basic_memory.dataview import ast as dv_ast
+        from basic_memory.bases import ast as dv_ast
 
         dv_names = {"LiteralNode", "FieldNode", "BinaryOpNode", "FunctionCallNode"}
         formula_names = {"FLiteral", "FField", "FCall", "FPropChain", "FLambda", "FBinOp"}

@@ -1,22 +1,20 @@
-"""Dataview executor deprecation — inertness guarantees.
+"""Dataview executor removal — inertness + shim guarantees.
 
 The Dataview→Bases migration is complete (vault 100% Bases). The fork's
-Dataview *executor* is deprecated: the ``enable_dataview`` flag stays accepted
-on ``read_note`` / ``build_context`` / ``search_notes`` for backward
-compatibility, but it is now a **no-op**. ``​```dataview​`` blocks are left
-inert (raw markdown), exactly as ``​```base​`` blocks are when
+Dataview *executor* has been **removed** entirely. What remains is only the
+``enable_dataview`` flag, kept accepted on ``read_note`` / ``build_context`` /
+``search_notes`` for backward compatibility as a **no-op** shim: clients/agents
+that still pass ``enable_dataview=True/False`` must never crash. ``​```dataview​``
+blocks are left inert (raw markdown), exactly as ``​```base​`` blocks are when
 ``enable_bases=False``.
 
 These tests pin that contract:
 
-  AC-1 — ``enable_dataview=True`` no longer executes ``​```dataview​``
-          blocks: no ``## Dataview Query Results`` section is appended, the raw
-          block survives verbatim, and nothing crashes on any of the three read
-          paths.
-  AC-2 — the executor entry point (``DataviewIntegration.process_note`` /
-          ``execute_raw_query``) is neutralised: even if invoked directly it
-          performs no execution and returns an empty / inert result. The
-          ``enable_dataview`` parameter is still accepted (no-op, retro-compat).
+  AC-1 — ``enable_dataview=True`` does not execute ``​```dataview​`` blocks: no
+          ``## Dataview Query Results`` section is appended, the raw block
+          survives verbatim, and nothing crashes on any of the three read paths.
+  AC-2 — the ``basic_memory.dataview`` package no longer exists (executor fully
+          removed); importing it raises ``ModuleNotFoundError``.
 
 ``enable_bases`` is intentionally *not* covered here — it must remain fully
 functional and is exercised by ``tests/bases/``.
@@ -113,10 +111,7 @@ async def test_search_notes_dataview_flag_is_inert(app, test_project):
         enable_dataview=True,
     )
 
-    # The rendered search payload must never carry executor output. Note:
-    # ``dataview_queries`` (index-time detection metadata from search_service)
-    # may be present and is harmless — only the *executed* results
-    # (``dataview_results`` / ``dataview_query_count``) prove the engine ran.
+    # The rendered search payload must never carry executor output.
     blob = str(result)
     assert "dataview_results" not in blob, (
         "executor must NOT attach dataview_results metadata"
@@ -124,21 +119,7 @@ async def test_search_notes_dataview_flag_is_inert(app, test_project):
     assert "dataview_query_count" not in blob
 
 
-def test_integration_process_note_is_neutralised():
-    """AC-2: the executor entry point is a no-op even if invoked directly."""
-    from basic_memory.dataview.integration import create_dataview_integration
-
-    integration = create_dataview_integration()
-    results = integration.process_note(_DATAVIEW_NOTE)
-    assert results == [], "process_note must execute nothing (deprecated executor)"
-
-
-def test_integration_execute_raw_query_is_neutralised():
-    """AC-2: execute_raw_query no longer runs the engine, returns inert status."""
-    from basic_memory.dataview.integration import create_dataview_integration
-
-    integration = create_dataview_integration()
-    result = integration.execute_raw_query('TABLE status FROM "test"')
-    assert result.get("status") == "deprecated"
-    assert result.get("result_count", 0) == 0
-    assert not result.get("result_markdown")
+def test_dataview_package_is_removed():
+    """AC-2: the Dataview executor package has been removed entirely."""
+    with pytest.raises(ModuleNotFoundError):
+        __import__("basic_memory.dataview")

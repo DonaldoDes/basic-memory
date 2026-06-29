@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 from basic_memory.bases.formula_ast import FormulaNode
 from basic_memory.bases.formula_parser import parse_formula
-from basic_memory.dataview.ast import ExpressionNode
+from basic_memory.bases.ast import ExpressionNode
 
 
 @dataclass

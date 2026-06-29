@@ -26,7 +26,7 @@ from basic_memory.bases.formula_ast import FCall, FLambda, FormulaNode, FPropCha
 from basic_memory.bases.formula_eval import evaluate_formula
 from basic_memory.bases.integration import create_bases_integration
 from basic_memory.bases.parser import BasesParser
-from basic_memory.dataview.ast import BinaryOpNode, ExpressionNode
+from basic_memory.bases.ast import BinaryOpNode, ExpressionNode
 
 
 # ---------------------------------------------------------------------------

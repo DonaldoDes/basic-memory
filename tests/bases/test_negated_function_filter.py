@@ -161,7 +161,7 @@ class TestFieldNegationNonRegression:
         a Dataview ``BinaryOpNode(operator="=", right=False)`` — distinct from a
         negated string leaf. This shape must stay intact (non-regression).
         """
-        from basic_memory.dataview.ast import BinaryOpNode, LiteralNode
+        from basic_memory.bases.ast import BinaryOpNode, LiteralNode
 
         body = (
             "filters:\n"

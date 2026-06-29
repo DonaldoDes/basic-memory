@@ -1513,12 +1513,13 @@ class SyncService:
         return affected_entity_ids
 
     async def _cleanup_legacy_dataview_links(self) -> None:
-        """Remove any legacy dataview_link relations from the database.
+        """Remove any legacy ``dataview_link`` relations from the database.
 
-        Previous versions persisted dataview_link relations during sync.
-        Dataview queries are now executed on-the-fly via the MCP layer
-        (build_context/read_note with enable_dataview=True), making
-        persisted relations redundant. This method cleans them up.
+        Previous versions persisted ``dataview_link`` relations during sync.
+        The Dataview executor has since been removed (rendering ```` ```base ````
+        blocks on-the-fly via the Bases integration instead), so these relations
+        are dead data. This migration guard cleans up any leftovers in databases
+        synced by an older version.
         """
         legacy_relations = await self.relation_repository.find_by_type("dataview_link")
         if legacy_relations:

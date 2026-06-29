@@ -356,12 +356,13 @@ class KnowledgeClient:
         data = response.json()
         return data["external_id"]
 
-    # --- Dataview Support ---
+    # --- Bases Support ---
 
-    async def list_entities_for_dataview(self) -> list[dict[str, Any]]:
-        """List all entities in a format suitable for Dataview query execution.
+    async def list_entities_for_bases(self) -> list[dict[str, Any]]:
+        """List all entities in a format suitable for Bases query execution.
 
-        Returns entities with file metadata and frontmatter fields needed by Dataview:
+        Returns entities with file metadata and frontmatter fields needed by the
+        Bases executor:
         - file.path, file.name, file.folder
         - title
         - type (entity_type)
@@ -369,13 +370,13 @@ class KnowledgeClient:
         - All frontmatter fields from the source file
 
         Returns:
-            List of note dictionaries with Dataview-compatible structure
+            List of note dictionaries with the nested file.* structure
 
         Raises:
             ToolError: If the request fails
         """
         response = await call_get(
             self.http_client,
-            f"{self._base_path}/entities/dataview",
+            f"{self._base_path}/entities/bases",
         )
         return response.json()

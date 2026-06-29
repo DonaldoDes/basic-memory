@@ -9,7 +9,7 @@ from basic_memory.bases.integration import (
     BasesIntegration,
     create_bases_integration,
 )
-from basic_memory.dataview.executor.result_formatter import ResultFormatter
+from basic_memory.bases.result_formatter import ResultFormatter
 
 
 def _note(title, folder, status, priority):

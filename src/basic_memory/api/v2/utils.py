@@ -100,8 +100,6 @@ async def to_graph_context(
             item: SearchIndexRow | ContextResultRow,
         ) -> EntitySummary | ObservationSummary | RelationSummary:
             # Extract metadata if available (only SearchIndexRow exposes it).
-            # Forked dataview integration stores dataview_queries here so
-            # build_context can hydrate query results downstream.
             metadata = getattr(item, "metadata", None)
             if metadata and isinstance(metadata, str):
                 try:

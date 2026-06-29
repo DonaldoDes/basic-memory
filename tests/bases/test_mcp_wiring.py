@@ -49,7 +49,7 @@ class _FakeKnowledgeClient:
     def __init__(self, notes):
         self._notes = notes
 
-    async def list_entities_for_dataview(self):
+    async def list_entities_for_bases(self):
         return self._notes
 
 
@@ -93,7 +93,7 @@ class TestEnrichWithBases:
     @pytest.mark.asyncio
     async def test_knowledge_client_failure_returns_original(self):
         class _Boom:
-            async def list_entities_for_dataview(self):
+            async def list_entities_for_bases(self):
                 raise RuntimeError("boom")
 
         enriched = await _enrich_with_bases(BASE_NOTE, "proj", _Boom())

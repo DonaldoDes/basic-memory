@@ -1011,14 +1011,13 @@ async def search_notes(
                     # Don't treat this as an error, but the user might want guidance
                     # We return the empty result as normal - the user can decide if they need help
 
-                # Dataview enrichment is DEPRECATED (no-op). ``enable_dataview``
-                # is still accepted on the signature for backward compatibility
-                # but no longer executes ``​```dataview​`` blocks — they are left
-                # inert. The Dataview→Bases migration is complete; use
+                # ``enable_dataview`` is still accepted on the signature for
+                # backward compatibility but is a no-op (the Dataview executor
+                # was removed); ``​```dataview​`` blocks are left inert. Use
                 # ``enable_bases`` below for live query rendering.
 
                 # Enrich with Bases if enabled and results have content.
-                # Independent of the Dataview flag (ADR-003 §4 — flag
+                # Independent of the enable_dataview flag (ADR-003 §4 — flag
                 # independence). Detection is on-the-fly per result content.
                 if enable_bases and result.results:
                     logger.info(
