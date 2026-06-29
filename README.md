@@ -6,6 +6,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/basicmachines-co/basic-memory)
 
 ## Skip the install — try Basic Memory in the cloud
 
@@ -199,7 +200,7 @@ just package-check-openclaw
 
 The Claude Code plugin is the bridge between Claude's working memory and Basic
 Memory — session-start briefings, pre-compaction checkpoints, an opt-in capture
-output style, and `/basic-memory:setup` · `:remember` · `:share` · `:status`.
+output style, and `/basic-memory:bm-setup` · `:remember` · `:share` · `:status`.
 
 **Connect the Basic Memory MCP server first** — see [Connect your AI
 client](#connect-your-ai-client). The plugin's hooks and skills call it, so it's a
@@ -216,14 +217,14 @@ Source: [`plugins/claude-code`](plugins/claude-code).
 ### Shared skills
 
 Framework-agnostic `SKILL.md` files live in [`skills/`](skills). If your
-Skills CLI supports subpath installs:
+Skills CLI supports repository subdirectory sources:
 
 ```bash
-npx skills add basicmachines-co/basic-memory --path skills
+npx skills add basicmachines-co/basic-memory/skills
 ```
 
-If it does not, copy the `memory-*` directories from `skills/` into your
-agent's skills directory as a temporary Phase 1 install path.
+If your installed Skills CLI cannot load that source, update the CLI or copy
+the `memory-*` directories from `skills/` into your agent's skills directory.
 
 ### Hermes
 
@@ -591,7 +592,7 @@ retention).
 | `BASIC_MEMORY_IMPORT_UPLOAD_MAX_BYTES` | `104857600` | Max uploaded import size |
 
 ```bash
-BASIC_MEMORY_LOG_LEVEL=DEBUG basic-memory sync
+BASIC_MEMORY_LOG_LEVEL=DEBUG basic-memory reindex
 tail -f ~/.basic-memory/basic-memory.log
 ```
 

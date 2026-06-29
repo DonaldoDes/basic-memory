@@ -99,10 +99,13 @@ All settings are fields on `BasicMemoryConfig` and can be set via environment va
 | Config Field | Env Var | Default | Description |
 |---|---|---|---|
 | `semantic_search_enabled` | `BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED` | Auto (`true` when semantic deps are available) | Enable semantic search. Required before vector/hybrid modes work. |
-| `semantic_embedding_provider` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER` | `"fastembed"` | Embedding provider: `"fastembed"` (local) or `"openai"` (API). |
+| `semantic_embedding_provider` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER` | `"fastembed"` | Embedding provider: `"fastembed"` (local), `"openai"` (API), or `"litellm"` (multi-provider API, **experimental** — advanced users only). |
 | `semantic_embedding_model` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_MODEL` | `"bge-small-en-v1.5"` | Model identifier. Auto-adjusted per provider if left at default. |
-| `semantic_embedding_dimensions` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_DIMENSIONS` | Auto-detected | Vector dimensions. 384 for FastEmbed, 1536 for OpenAI. Override only if using a non-default model. |
-| `semantic_embedding_batch_size` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_BATCH_SIZE` | `64` | Number of texts to embed per batch. |
+| `semantic_embedding_dimensions` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_DIMENSIONS` | Provider default | Vector dimensions. 384 for FastEmbed, 1536 for OpenAI/LiteLLM OpenAI. Required when using a non-default LiteLLM model. |
+| `semantic_embedding_forward_dimensions` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_FORWARD_DIMENSIONS` | Auto | LiteLLM-only override for whether configured dimensions are sent as a provider-side output-size request. |
+| `semantic_embedding_batch_size` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_BATCH_SIZE` | `2` | Number of texts to embed per batch. |
+| `semantic_embedding_document_input_type` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_DOCUMENT_INPUT_TYPE` | Auto for known LiteLLM models | Optional LiteLLM `input_type` for indexed document/passages. |
+| `semantic_embedding_query_input_type` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_QUERY_INPUT_TYPE` | Auto for known LiteLLM models | Optional LiteLLM `input_type` for search queries. |
 | `semantic_vector_k` | `BASIC_MEMORY_SEMANTIC_VECTOR_K` | `100` | Candidate count for vector nearest-neighbour retrieval. Higher values improve recall at the cost of latency. |
 
 ## Embedding Providers
@@ -135,7 +138,114 @@ export BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
 ```
 
-When switching from FastEmbed to OpenAI (or vice versa), you must rebuild embeddings since the vector dimensions differ:
+### LiteLLM
+
+> **Experimental — advanced users only.** The LiteLLM provider is experimental and aimed at users comfortable operating remote embedding backends: paid API calls, per-model dimension and input-role configuration, and slower reindexing of large corpora. For most users, FastEmbed (local, default) is recommended. See [LiteLLM Provider](litellm-provider.md) for the caveats and tuning.
+
+Uses the LiteLLM SDK to call embedding models from providers such as OpenAI, Cohere, Azure, Bedrock, NVIDIA NIM, and other LiteLLM-supported backends. Requires the provider's API credentials.
+For the full option reference, provider setup examples, and live validation harness, see [LiteLLM Provider](litellm-provider.md).
+
+```bash
+export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
+export BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER=litellm
+export BASIC_MEMORY_SEMANTIC_EMBEDDING_MODEL=cohere/embed-english-v3.0
+export BASIC_MEMORY_SEMANTIC_EMBEDDING_DIMENSIONS=1024
+export COHERE_API_KEY=...
+```
+
+Basic Memory creates vector tables before the first embedding call, so non-default LiteLLM models must set `BASIC_MEMORY_SEMANTIC_EMBEDDING_DIMENSIONS`. The LiteLLM OpenAI default (`openai/text-embedding-3-small`) uses 1536 dimensions automatically.
+
+For fixed-size LiteLLM models, dimensions are used as Basic Memory's local vector schema and
+validation size. Basic Memory automatically sends dimensions as a provider-side output-size
+request for `text-embedding-3` model strings, where LiteLLM/OpenAI support reduced output
+dimensions. If an Azure/OpenAI deployment uses an arbitrary LiteLLM model string such as
+`azure/<deployment-name>` and the underlying model supports reduced dimensions, set
+`BASIC_MEMORY_SEMANTIC_EMBEDDING_FORWARD_DIMENSIONS=true`.
+
+Some retrieval models are asymmetric: indexed passages and search queries must be embedded with different provider parameters. Basic Memory automatically sets LiteLLM `input_type` for known asymmetric model families:
+
+- Cohere v3: documents use `search_document`, queries use `search_query`
+- NVIDIA NIM retrieval models: documents use `passage`, queries use `query`
+
+For other asymmetric LiteLLM models, set the input types explicitly:
+
+```bash
+export BASIC_MEMORY_SEMANTIC_EMBEDDING_DOCUMENT_INPUT_TYPE=passage
+export BASIC_MEMORY_SEMANTIC_EMBEDDING_QUERY_INPUT_TYPE=query
+```
+
+#### Live LiteLLM Validation
+
+Provider APIs differ in subtle ways: some accept `dimensions`, some require separate
+document/query roles, and some route through deployment aliases that do not reveal the
+underlying model name. Before adding or changing LiteLLM model support, run the opt-in live
+evaluation harness:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export COHERE_API_KEY=...
+just test-litellm-live
+```
+
+The built-in live cases cover:
+
+| Case | Required key | What it validates |
+|---|---|---|
+| `openai/text-embedding-3-small` | `OPENAI_API_KEY` | Standard LiteLLM OpenAI embedding calls and normalized 1536-dimensional output. |
+| `cohere/embed-english-v3.0` | `COHERE_API_KEY` | Cohere v3 asymmetric `search_document` / `search_query` handling and fixed 1024-dimensional output. |
+
+The harness embeds two documents and one query, checks vector dimensions and normalization,
+then verifies the authentication query ranks the authentication document above the distractor.
+It prints a table with per-model scores, norms, latency, role settings, and dimension-forwarding
+mode.
+
+To validate provider aliases or additional LiteLLM backends, save custom JSON cases:
+
+```bash
+export AZURE_API_KEY=...
+export AZURE_API_BASE=https://example.openai.azure.com
+export AZURE_API_VERSION=2024-02-01
+
+cat > /tmp/litellm-azure-cases.json <<'JSON'
+[
+  {
+    "name": "azure-text-embedding-3-small-512",
+    "model": "azure/<deployment-name>",
+    "dimensions": 512,
+    "api_key_env": "AZURE_API_KEY",
+    "forward_dimensions": true
+  }
+]
+JSON
+
+just test-litellm-live --cases-file /tmp/litellm-azure-cases.json
+```
+
+NVIDIA NIM retrieval models can be checked the same way:
+
+```bash
+export NVIDIA_NIM_API_KEY=...
+
+cat > /tmp/litellm-nvidia-cases.json <<'JSON'
+[
+  {
+    "name": "nvidia-embed-qa-4",
+    "model": "nvidia_nim/nvidia/embed-qa-4",
+    "dimensions": 1024,
+    "api_key_env": "NVIDIA_NIM_API_KEY",
+    "document_input_type": "passage",
+    "query_input_type": "query"
+  }
+]
+JSON
+
+just test-litellm-live --cases-file /tmp/litellm-nvidia-cases.json
+```
+
+For repeatable local runs, put the same JSON array in a file and pass
+`just test-litellm-live --cases-file path/to/litellm-cases.json`.
+
+When switching providers, models, dimensions, or LiteLLM document/query input types, rebuild embeddings:
 
 ```bash
 bm reindex --embeddings
@@ -203,9 +313,10 @@ bm reindex -p my-project
 
 - **Upgrade note**: Migration now performs a one-time automatic embedding backfill on upgrade.
 - **Manual enable case**: If you explicitly had `semantic_search_enabled=false` and then turn it on
-- **Provider change**: After switching between `fastembed` and `openai`
+- **Provider change**: After switching between `fastembed`, `openai`, and `litellm`
 - **Model change**: After changing `semantic_embedding_model`
 - **Dimension change**: After changing `semantic_embedding_dimensions`
+- **LiteLLM role change**: After changing `semantic_embedding_document_input_type` or `semantic_embedding_query_input_type`
 
 The reindex command shows progress with embedded/skipped/error counts:
 

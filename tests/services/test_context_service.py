@@ -213,6 +213,47 @@ async def test_build_context_with_observations(context_service, test_graph):
 
 
 @pytest.mark.asyncio
+async def test_build_context_observation_permalinks_match_search_index(
+    context_service, search_service, entity_service
+):
+    """Regression test for #929: observation permalinks must match the search index.
+
+    build_context used to rebuild the synthetic observation permalink inline,
+    without the 200-char truncation (#446) or the content digest (#931) that
+    Observation.permalink applies, so for long observations it returned
+    permalinks the search index doesn't contain.
+    """
+    from basic_memory.schemas.base import Entity as EntitySchema
+    from basic_memory.schemas.search import SearchQuery
+
+    long_observation = "x" * 210 + " LONG_OBS_MARKER"
+    entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Long Obs Entity",
+            note_type="test",
+            directory="test",
+            content=f"# Long Obs Entity\n- [note] {long_observation}\n",
+        )
+    )
+    await search_service.index_entity(entity)
+
+    url = memory_url.validate_strings(f"memory://{entity.permalink}")
+    context_result = await context_service.build_context(url, include_observations=True)
+    assert len(context_result.results) == 1
+    context_item = context_result.results[0]
+    assert len(context_item.observations) == 1
+    obs_row = context_item.observations[0]
+
+    # The model property is the single definition of the permalink format
+    assert obs_row.permalink == entity.observations[0].permalink
+
+    # The search index row for this observation carries the same permalink
+    index_rows = await search_service.search(SearchQuery(text="LONG_OBS_MARKER"))
+    obs_permalinks = [r.permalink for r in index_rows if r.type == SearchItemType.OBSERVATION.value]
+    assert obs_permalinks == [obs_row.permalink]
+
+
+@pytest.mark.asyncio
 async def test_build_context_not_found(context_service):
     """Test handling non-existent permalinks."""
     context = await context_service.build_context("memory://does/not/exist")
@@ -340,6 +381,227 @@ async def test_project_isolation_in_find_related(session_maker, app_config):
 
 
 @pytest.mark.asyncio
+async def test_find_related_expands_cross_project_relation_targets(session_maker, app_config):
+    """Explicit cross-project links should expand without exposing unrelated incoming links."""
+    from basic_memory.repository.entity_repository import EntityRepository
+    from basic_memory.repository.observation_repository import ObservationRepository
+    from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
+    from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
+    from basic_memory.config import DatabaseBackend
+    from basic_memory import db
+
+    async with db.scoped_session(session_maker) as db_session:
+        project1 = Project(name="project1", path="/test1")
+        project2 = Project(name="project2", path="/test2")
+        project3 = Project(name="project3", path="/test3")
+        db_session.add_all([project1, project2, project3])
+        await db_session.flush()
+
+        now = datetime.now(UTC)
+        source = Entity(
+            title="Source",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project1.id,
+            permalink="project1/source",
+            file_path="project1/source.md",
+            created_at=now,
+            updated_at=now,
+        )
+        target = Entity(
+            title="Company Standards",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project2.id,
+            permalink="project2/company-standards",
+            file_path="project2/company-standards.md",
+            created_at=now,
+            updated_at=now,
+        )
+        target_child = Entity(
+            title="Review Checklist",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project2.id,
+            permalink="project2/review-checklist",
+            file_path="project2/review-checklist.md",
+            created_at=now,
+            updated_at=now,
+        )
+        unrelated_source = Entity(
+            title="Unrelated Source",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project3.id,
+            permalink="project3/unrelated-source",
+            file_path="project3/unrelated-source.md",
+            created_at=now,
+            updated_at=now,
+        )
+        db_session.add_all([source, target, target_child, unrelated_source])
+        await db_session.flush()
+
+        cross_project_relation = Relation(
+            project_id=project1.id,
+            from_id=source.id,
+            to_id=target.id,
+            to_name="Company Standards",
+            relation_type="links_to",
+        )
+        target_relation = Relation(
+            project_id=project2.id,
+            from_id=target.id,
+            to_id=target_child.id,
+            to_name="Review Checklist",
+            relation_type="links_to",
+        )
+        unrelated_incoming_relation = Relation(
+            project_id=project3.id,
+            from_id=unrelated_source.id,
+            to_id=target.id,
+            to_name="Company Standards",
+            relation_type="links_to",
+        )
+        db_session.add_all([cross_project_relation, target_relation, unrelated_incoming_relation])
+        await db_session.commit()
+
+    if app_config.database_backend == DatabaseBackend.POSTGRES:
+        search_repo_p1 = PostgresSearchRepository(session_maker, project1.id)
+    else:
+        search_repo_p1 = SQLiteSearchRepository(session_maker, project1.id)
+
+    entity_repo_p1 = EntityRepository(session_maker, project1.id)
+    obs_repo_p1 = ObservationRepository(session_maker, project1.id)
+    context_service_p1 = ContextService(search_repo_p1, entity_repo_p1, obs_repo_p1)
+
+    await search_repo_p1.index_item(
+        SearchIndexRow(
+            project_id=project1.id,
+            id=source.id,
+            title=source.title,
+            content_snippet="Source content",
+            permalink=source.permalink,
+            file_path=source.file_path,
+            type=SearchItemType.ENTITY,
+            metadata={"created_at": now.isoformat()},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    context = await context_service_p1.build_context(
+        memory_url.validate_strings("memory://project1/source"),
+        depth=2,
+        max_related=100,
+    )
+    assert len(context.results) == 1
+
+    context_related_entity_ids = {
+        row.id for row in context.results[0].related_results if row.type == "entity"
+    }
+    context_related_relation_ids = {
+        row.id for row in context.results[0].related_results if row.type == "relation"
+    }
+
+    assert target.id in context_related_entity_ids
+    assert target_child.id in context_related_entity_ids
+    assert unrelated_source.id not in context_related_entity_ids
+    assert cross_project_relation.id in context_related_relation_ids
+    assert target_relation.id in context_related_relation_ids
+    assert unrelated_incoming_relation.id not in context_related_relation_ids
+
+    related = await context_service_p1.find_related(
+        [("entity", source.id)], max_depth=2, max_results=100
+    )
+
+    related_entity_ids = {row.id for row in related if row.type == "entity"}
+    related_relation_ids = {row.id for row in related if row.type == "relation"}
+
+    assert target.id in related_entity_ids
+    assert target_child.id in related_entity_ids
+    assert unrelated_source.id not in related_entity_ids
+    assert cross_project_relation.id in related_relation_ids
+    assert target_relation.id in related_relation_ids
+    assert unrelated_incoming_relation.id not in related_relation_ids
+
+
+@pytest.mark.asyncio
+async def test_find_related_does_not_revisit_entities_in_cycles(session_maker, app_config):
+    """Recursive graph expansion should stop when a path loops back to a visited entity."""
+    from basic_memory.repository.entity_repository import EntityRepository
+    from basic_memory.repository.observation_repository import ObservationRepository
+    from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
+    from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
+    from basic_memory.config import DatabaseBackend
+    from basic_memory import db
+
+    async with db.scoped_session(session_maker) as db_session:
+        project = Project(name="cycle-project", path="/cycle")
+        db_session.add(project)
+        await db_session.flush()
+
+        now = datetime.now(UTC)
+        root = Entity(
+            title="Root",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project.id,
+            permalink="cycle/root",
+            file_path="cycle/root.md",
+            created_at=now,
+            updated_at=now,
+        )
+        connected = Entity(
+            title="Connected",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project.id,
+            permalink="cycle/connected",
+            file_path="cycle/connected.md",
+            created_at=now,
+            updated_at=now,
+        )
+        db_session.add_all([root, connected])
+        await db_session.flush()
+
+        root_to_connected = Relation(
+            project_id=project.id,
+            from_id=root.id,
+            to_id=connected.id,
+            to_name="Connected",
+            relation_type="links_to",
+        )
+        connected_to_root = Relation(
+            project_id=project.id,
+            from_id=connected.id,
+            to_id=root.id,
+            to_name="Root",
+            relation_type="links_to",
+        )
+        db_session.add_all([root_to_connected, connected_to_root])
+        await db_session.commit()
+
+    if app_config.database_backend == DatabaseBackend.POSTGRES:
+        search_repo = PostgresSearchRepository(session_maker, project.id)
+    else:
+        search_repo = SQLiteSearchRepository(session_maker, project.id)
+
+    entity_repo = EntityRepository(session_maker, project.id)
+    obs_repo = ObservationRepository(session_maker, project.id)
+    context_service = ContextService(search_repo, entity_repo, obs_repo)
+
+    related = await context_service.find_related(
+        [("entity", root.id)], max_depth=4, max_results=100
+    )
+
+    related_entity_ids = [row.id for row in related if row.type == "entity"]
+    related_relation_ids = {row.id for row in related if row.type == "relation"}
+
+    assert related_entity_ids == [connected.id]
+    assert related_relation_ids == {root_to_connected.id, connected_to_root.id}
+
+
+@pytest.mark.asyncio
 async def test_build_context_fallback_via_link_resolver(context_service, test_graph):
     """Test that build_context falls back to LinkResolver when exact permalink fails.
 
@@ -383,3 +645,102 @@ async def test_build_context_without_link_resolver(
     url = memory_url.validate_strings("memory://Root")
     context_result = await service.build_context(url)
     assert context_result.metadata.primary_count == 0
+
+
+@pytest.mark.asyncio
+async def test_find_related_carries_to_name_for_unresolved_relations(session_maker, app_config):
+    """Relation rows expose to_name so unresolved forward refs render by name (#955).
+
+    A forward reference (to_id NULL) previously surfaced with no usable target
+    text — build_context printed [[None]] even though the markdown named the
+    target. The context query must select to_name for both resolved and
+    unresolved relation rows.
+    """
+    from basic_memory.repository.entity_repository import EntityRepository
+    from basic_memory.repository.observation_repository import ObservationRepository
+    from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
+    from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
+    from basic_memory.config import DatabaseBackend
+    from basic_memory import db
+
+    async with db.scoped_session(session_maker) as db_session:
+        project = Project(name="forward-ref-project", path="/forward-ref")
+        db_session.add(project)
+        await db_session.flush()
+
+        source = Entity(
+            title="write-note(3)",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project.id,
+            permalink="man3/write-note-3",
+            file_path="man3/write-note-3.md",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        resolved_target = Entity(
+            title="bm-note(5)",
+            note_type="document",
+            content_type="text/markdown",
+            project_id=project.id,
+            permalink="man5/bm-note-5",
+            file_path="man5/bm-note-5.md",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        db_session.add_all([source, resolved_target])
+        await db_session.flush()
+
+        resolved = Relation(
+            project_id=project.id,
+            from_id=source.id,
+            to_id=resolved_target.id,
+            to_name="bm-note(5)",
+            relation_type="see_also",
+        )
+        # Forward reference: the target page does not exist yet
+        unresolved = Relation(
+            project_id=project.id,
+            from_id=source.id,
+            to_id=None,
+            to_name="edit-note(3)",
+            relation_type="see_also",
+        )
+        db_session.add_all([resolved, unresolved])
+        await db_session.commit()
+
+        if app_config.database_backend == DatabaseBackend.POSTGRES:
+            search_repo = PostgresSearchRepository(session_maker, project.id)
+        else:
+            search_repo = SQLiteSearchRepository(session_maker, project.id)
+        entity_repo = EntityRepository(session_maker, project.id)
+        obs_repo = ObservationRepository(session_maker, project.id)
+        context_service = ContextService(search_repo, entity_repo, obs_repo)
+
+        related = await context_service.find_related([("entity", source.id)], max_depth=2)
+        relation_rows = {r.to_name: r for r in related if r.type == "relation"}
+
+        assert "edit-note(3)" in relation_rows, "unresolved relation row missing to_name"
+        assert relation_rows["edit-note(3)"].to_id is None
+        assert relation_rows["bm-note(5)"].to_name == "bm-note(5)"
+
+
+@pytest.mark.asyncio
+async def test_pattern_search_falls_back_for_legacy_unqualified_rows(context_service, test_graph):
+    """Workspace-qualified patterns fall back to the project form for legacy rows (#957).
+
+    Rows written before workspace canonicalization (or via clients that did not
+    forward workspace headers) store project-qualified permalinks. A pattern
+    canonicalized under an active workspace context would otherwise match
+    nothing — the field failure that opened the issue.
+    """
+    from basic_memory.workspace_context import workspace_permalink_context
+
+    # test_graph rows are stored without any workspace prefix (legacy form).
+    # Query with a workspace-qualified pattern under an active context.
+    with workspace_permalink_context(workspace_slug="team-paul", workspace_type="organization"):
+        context = await context_service.build_context("memory://team-paul/test-project/test/*")
+
+    permalinks = {result.primary_result.permalink for result in context.results}
+    assert permalinks, "fallback did not match legacy rows"
+    assert all(p and p.startswith("test-project/test/") for p in permalinks), permalinks

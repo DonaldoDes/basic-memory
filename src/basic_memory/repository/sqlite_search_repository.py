@@ -23,7 +23,10 @@ from basic_memory.models.search import (
 from basic_memory.repository.embedding_provider import EmbeddingProvider
 from basic_memory.repository.embedding_provider_factory import create_embedding_provider
 from basic_memory.repository.search_index_row import SearchIndexRow
-from basic_memory.repository.search_repository_base import SearchRepositoryBase
+from basic_memory.repository.search_repository_base import (
+    SearchRepositoryBase,
+    relaxed_query_words,
+)
 from basic_memory.repository.metadata_filters import parse_metadata_filters, build_sqlite_json_path
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
@@ -255,6 +258,19 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         if "*" in term and all(c.isalnum() or c in "*_-" for c in term):
             return term
 
+        # Natural-language queries arrive with sentence punctuation that FTS5
+        # treats as syntax ("When did Melanie paint a sunrise?"). The tokenizer
+        # ignores this punctuation in the INDEX, so stripping it from word
+        # edges loses nothing — but leaving it forces the whole question into
+        # an exact-phrase match that returns zero rows, silently disabling the
+        # FTS half of hybrid search. Interior characters (hyphens, slashes —
+        # permalinks and paths) are untouched.
+        if " " in term:
+            words = [word.strip("?!.,;:") for word in term.split()]
+            term = " ".join(word for word in words if word)
+            if not term:
+                return ""
+
         # Characters that can cause FTS5 syntax errors when used as operators
         # We're more conservative here - only quote when we detect problematic patterns
         problematic_chars = [
@@ -350,6 +366,14 @@ class SQLiteSearchRepository(SearchRepositoryBase):
 
         # For non-Boolean queries, use the single term preparation logic
         return self._prepare_single_term(term, is_prefix)
+
+    @staticmethod
+    def _relaxed_fts_text(search_text: Optional[str]) -> Optional[str]:
+        """OR-relaxed FTS5 expression for a failed strict query, or None."""
+        words = relaxed_query_words(search_text)
+        if not words:
+            return None
+        return " OR ".join(f"{word}*" for word in words)
 
     # ------------------------------------------------------------------
     # sqlite-vec extension loading (SQLite-specific)
@@ -733,6 +757,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict] = None,
     ) -> tuple[str, str, dict, str]:
         """Build SQLite FTS FROM/WHERE params shared by search and count."""
@@ -794,15 +819,36 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 type_placeholders.append(f":{param_name}")
             conditions.append(f"search_index.type IN ({', '.join(type_placeholders)})")
 
-        # Handle note type filter (frontmatter type field, parameterized)
+        # Handle observation category filter (parameterized for defense-in-depth).
+        # Trigger: caller passed `categories` to scope observation results.
+        # Why: `entity_types=["observation"]` only narrows to the observation row type;
+        #      callers expect exact-category matching, not incidental text matches.
+        # Outcome: only rows whose indexed category exactly equals a requested value
+        #          survive (entities/relations have NULL category and are excluded).
+        if categories:
+            category_placeholders = []
+            for idx, category in enumerate(categories):
+                param_name = f"category_{idx}"
+                params[param_name] = category
+                category_placeholders.append(f":{param_name}")
+            conditions.append(f"search_index.category IN ({', '.join(category_placeholders)})")
+
+        # Handle note type filter (frontmatter type field, parameterized).
+        # Trigger: caller passed `note_types` to scope by the frontmatter `type` field.
+        # Why: the stored note_type preserves the frontmatter casing (e.g. `Chapter`),
+        #      but the filter is documented case-insensitive; comparing raw values
+        #      would miss capitalized types.
+        # Outcome: fold both sides to lowercase so `note_types=["Chapter"]` matches a
+        #          stored `Chapter`, `chapter`, etc.
         if note_types:
             type_placeholders = []
             for idx, t in enumerate(note_types):
                 param_name = f"note_type_{idx}"
-                params[param_name] = t
+                params[param_name] = t.lower()
                 type_placeholders.append(f":{param_name}")
             conditions.append(
-                f"json_extract(search_index.metadata, '$.note_type') IN ({', '.join(type_placeholders)})"
+                "LOWER(json_extract(search_index.metadata, '$.note_type')) "
+                f"IN ({', '.join(type_placeholders)})"
             )
 
         # Handle date filter using datetime() for proper comparison
@@ -925,13 +971,21 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
     ) -> List[SearchIndexRow]:
-        """Search across all indexed content using SQLite FTS5."""
+        """Search across all indexed content using SQLite FTS5.
+
+        ``allow_relaxed=True`` retries a zero-result strict multi-word query
+        with OR-joined content terms. Only the hybrid path opts in: its FTS
+        branch otherwise contributes nothing for question-form queries.
+        Service-level FTS searches keep their own conservative fallback.
+        """
         # --- Dispatch vector / hybrid modes (shared logic) ---
         dispatched = await self._dispatch_retrieval_mode(
             search_text=search_text,
@@ -941,6 +995,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
             retrieval_mode=retrieval_mode,
             min_similarity=min_similarity,
@@ -959,6 +1014,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
 
@@ -996,6 +1052,21 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             async with db.scoped_session(self.session_maker) as session:
                 result = await session.execute(text(sql), params)
                 rows = result.fetchall()
+                # Trigger: multi-word natural-language query matched nothing
+                # under the default all-terms-AND semantics.
+                # Why: questions ("when did X do Y") rarely have every word in
+                # one document; without relaxation the FTS half of hybrid
+                # search contributes zero candidates and ranking degrades to
+                # vector-only.
+                # Outcome: one retry with OR-joined prefix terms; bm25 still
+                # ranks multi-term matches first.
+                relaxed = (
+                    self._relaxed_fts_text(search_text) if allow_relaxed and not rows else None
+                )
+                if relaxed and params.get("text"):
+                    params["text"] = relaxed
+                    result = await session.execute(text(sql), params)
+                    rows = result.fetchall()
         except Exception as e:
             # Handle FTS5 syntax errors and provide user-friendly feedback
             if self._is_fts5_syntax_error(e):  # pragma: no cover
@@ -1046,6 +1117,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
@@ -1060,6 +1132,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 note_types=note_types,
                 after_date=after_date,
                 search_item_types=search_item_types,
+                categories=categories,
                 metadata_filters=metadata_filters,
                 retrieval_mode=retrieval_mode,
                 min_similarity=min_similarity,
@@ -1073,6 +1146,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
         sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"

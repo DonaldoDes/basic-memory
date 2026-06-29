@@ -1,10 +1,10 @@
 {
   "name": "@basicmemory/openclaw-basic-memory",
-  "version": "0.2.4",
+  "version": "0.22.1",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "description": "Basic Memory plugin for OpenClaw — local-first knowledge graph for agent memory",
+  "description": "Basic Memory plugin for OpenClaw \u2014 local-first knowledge graph for agent memory",
   "license": "MIT",
   "repository": {
     "type": "git",

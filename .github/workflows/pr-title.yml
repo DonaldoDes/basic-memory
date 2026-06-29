@@ -38,10 +38,12 @@ jobs:
             mcp
             sync
             ui
+            ci
             deps
             installer
             plugins
             skills
             integrations
+            benchmarks
           # Allow breaking changes (needs "!" after type/scope)
           requireScopeForBreakingChange: true

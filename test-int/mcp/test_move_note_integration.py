@@ -4,6 +4,8 @@ Integration tests for move_note MCP tool.
 Tests the complete move note workflow: MCP client -> MCP server -> FastAPI -> database -> file system
 """
 
+import json
+
 import pytest
 from fastmcp import Client
 
@@ -769,3 +771,224 @@ async def test_move_note_strict_resolution_rejects_fuzzy_match(mcp_server, app, 
             {"project": test_project.name, "identifier": "Move Strict Test B"},
         )
         assert "Content B" in read_b.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_move_note_unknown_workspace_shaped_path_allowed(mcp_server, app, test_project):
+    """A "<seg>/projects/<seg>/..." destination whose leading segment is NOT a known
+    project is a legitimate same-project nested move and must succeed.
+
+    The old "projects"-segment structural heuristic (#904) wrongly rejected this shape
+    even though it is structurally identical to a normal nested folder. Detection now
+    relies only on the leading segment matching a known project name (Detection 1) plus
+    the post-move outcome backstop, so a bare "other-workspace/projects/x/..." that
+    matches no known project is treated as a normal nested move.
+    """
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Workspace Shape Note",
+                "directory": "source",
+                "content": "# Workspace Shape Note\n\nNested move into a projects folder.",
+            },
+        )
+
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Workspace Shape Note",
+                "destination_path": "other-workspace/projects/x/moved-note.md",
+            },
+        )
+
+        move_text = move_result.content[0].text
+        assert "Cross-Project Move Not Supported" not in move_text
+        assert "✅ Note moved successfully" in move_text
+        assert "other-workspace/projects/x/moved-note.md" in move_text
+
+        # The note landed at the requested nested location.
+        read_moved = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": "other-workspace/projects/x/moved-note.md",
+            },
+        )
+        assert "Nested move into a projects folder" in read_moved.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_move_note_destination_folder_boundary_rejected(mcp_server, app, test_project):
+    """The destination_folder bypass (#881 Gap 3) must now be detected honestly.
+
+    Previously the cross-boundary guard ran before destination_folder was resolved into
+    destination_path, so a boundary-shaped folder slipped through and reported success.
+    """
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": "boundary-target-project",
+                "project_path": "/tmp/boundary-target-project",
+                "set_default": False,
+            },
+        )
+
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Folder Boundary Note",
+                "directory": "source",
+                "content": "# Folder Boundary Note\n\nFolder bypass should be caught.",
+            },
+        )
+
+        # destination_folder names another project — resolved path routes cross-project.
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Folder Boundary Note",
+                "destination_folder": "boundary-target-project",
+            },
+        )
+
+        error_message = move_result.content[0].text
+        assert "Cross-Project Move Not Supported" in error_message
+        assert "boundary-target-project" in error_message
+
+        # Note stays put.
+        read_original = await client.call_tool(
+            "read_note",
+            {"project": test_project.name, "identifier": "Folder Boundary Note"},
+        )
+        assert "Folder bypass should be caught" in read_original.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_move_note_unknown_workspace_shaped_path_allowed_json(mcp_server, app, test_project):
+    """JSON output for an unknown-workspace-shaped destination reports moved=True.
+
+    With the ambiguous "projects"-segment heuristic removed (#904), a
+    "<seg>/projects/<seg>/..." path whose leading segment is not a known project is a
+    legitimate same-project nested move, not a cross-project rejection.
+    """
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Workspace Shape JSON Note",
+                "directory": "source",
+                "content": "# Workspace Shape JSON Note\n\nJSON path.",
+            },
+        )
+
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Workspace Shape JSON Note",
+                "destination_path": "team-space/projects/alpha/moved.md",
+                "output_format": "json",
+            },
+        )
+
+        data = json.loads(move_result.content[0].text)
+        assert data["moved"] is True
+        # Success JSON does not include an error key.
+        assert "error" not in data
+        assert data["file_path"] == "team-space/projects/alpha/moved.md"
+
+
+@pytest.mark.asyncio
+async def test_move_note_new_nested_folder_still_succeeds(mcp_server, app, test_project):
+    """A legitimate same-project move into a brand-new nested folder must still succeed.
+
+    Guards against false positives from the broadened cross-boundary detection. Note the
+    top-level "projects/" folder is a valid same-project location and must NOT be flagged.
+    """
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Legit Nested Note",
+                "directory": "source",
+                "content": "# Legit Nested Note\n\nValid same-project nested move.",
+            },
+        )
+
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Legit Nested Note",
+                "destination_path": "projects/2025/q2/legit-nested-note.md",
+            },
+        )
+
+        move_text = move_result.content[0].text
+        assert "✅ Note moved successfully" in move_text
+        assert "projects/2025/q2/legit-nested-note.md" in move_text
+
+        read_result = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": "projects/2025/q2/legit-nested-note.md",
+            },
+        )
+        assert "Valid same-project nested move" in read_result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_move_note_interior_projects_segment_still_succeeds(mcp_server, app, test_project):
+    """A path containing an interior 'projects' segment must not trip cross-boundary detection.
+
+    Regression for the false positive where any path containing a 'projects' segment
+    (e.g. "notes/projects/my-project/note.md") was rejected. The ambiguous structural
+    heuristic has been removed (#904): a 'projects' folder anywhere in the path is just a
+    normal nested folder, so this is a valid same-project move and must succeed.
+    """
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Interior Projects Note",
+                "directory": "source",
+                "content": "# Interior Projects Note\n\nInterior projects segment is fine.",
+            },
+        )
+
+        move_result = await client.call_tool(
+            "move_note",
+            {
+                "project": test_project.name,
+                "identifier": "Interior Projects Note",
+                "destination_path": "team/2026/projects/alpha/interior-projects-note.md",
+            },
+        )
+
+        move_text = move_result.content[0].text
+        assert "✅ Note moved successfully" in move_text
+        assert "team/2026/projects/alpha/interior-projects-note.md" in move_text
+
+        read_result = await client.call_tool(
+            "read_note",
+            {
+                "project": test_project.name,
+                "identifier": "team/2026/projects/alpha/interior-projects-note.md",
+            },
+        )
+        assert "Interior projects segment is fine" in read_result.content[0].text

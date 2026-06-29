@@ -182,7 +182,9 @@ def _directory_path_for_delete(
 
 
 @mcp.tool(
+    title="Delete Note",
     description="Delete a note or directory by title, permalink, or path",
+    tags={"notes"},
     annotations={"destructiveHint": True, "openWorldHint": False},
 )
 async def delete_note(
@@ -315,14 +317,22 @@ async def delete_note(
                 )
                 result = await knowledge_client.delete_directory(directory_identifier)
                 if output_format == "json":
-                    return {
+                    response = {
                         "deleted": result.failed_deletes == 0,
                         "is_directory": True,
                         "identifier": identifier,
                         "total_files": result.total_files,
                         "successful_deletes": result.successful_deletes,
                         "failed_deletes": result.failed_deletes,
+                        "deleted_files": result.deleted_files,
+                        "errors": [error.model_dump() for error in result.errors],
                     }
+                    if result.failed_deletes > 0:
+                        response["error"] = (
+                            "Directory delete incomplete: "
+                            f"{result.failed_deletes} of {result.total_files} file(s) failed"
+                        )
+                    return response
 
                 # Build success message for directory delete
                 result_lines = [

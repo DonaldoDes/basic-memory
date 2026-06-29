@@ -91,6 +91,69 @@ class TestBasicMemoryConfig:
         assert Path(config.projects["other"].path) == other_path
         assert config.default_project == "other"
 
+    def test_model_post_init_seeds_default_for_local_postgres(self, config_home, monkeypatch):
+        """A LOCAL Postgres backend still seeds a default project, like SQLite.
+
+        The seeding skip is for stateless/cloud (skip_initialization_sync), not the
+        Postgres backend — otherwise a fresh local Postgres has no default project
+        and create_memory_project raises "No default project configured".
+        """
+        monkeypatch.delenv("BASIC_MEMORY_HOME", raising=False)
+        monkeypatch.delenv("BASIC_MEMORY_CLOUD_MODE", raising=False)
+
+        config = BasicMemoryConfig(database_backend="postgres")
+
+        assert "main" in config.projects
+        assert config.default_project == "main"
+
+    def test_model_post_init_skips_seeding_for_stateless_deployments(
+        self, config_home, monkeypatch
+    ):
+        """Stateless/cloud configs discover projects from the DB, so seed nothing."""
+        monkeypatch.delenv("BASIC_MEMORY_HOME", raising=False)
+
+        config = BasicMemoryConfig(database_backend="postgres", skip_initialization_sync=True)
+
+        assert config.projects == {}
+        assert config.default_project is None
+
+    def test_model_post_init_skips_seeding_in_cloud_mode(self, config_home, monkeypatch):
+        """BASIC_MEMORY_CLOUD_MODE deployments build config via ConfigManager, not
+        for_cloud_tenant, so skip_initialization_sync is false — they must still skip
+        seeding (and reconcile) so cloud startup can't delete tenant project rows."""
+        monkeypatch.delenv("BASIC_MEMORY_HOME", raising=False)
+        monkeypatch.setenv("BASIC_MEMORY_CLOUD_MODE", "1")
+
+        config = BasicMemoryConfig(database_backend="postgres", skip_initialization_sync=False)
+
+        assert config.cloud_mode is True
+        assert config.skip_local_initialization is True
+        assert config.projects == {}
+        assert config.default_project is None
+
+    def test_local_postgres_creates_project_directories(self, config_home, tmp_path):
+        """Local Postgres creates its project directories like SQLite — the
+        ensure_project_paths_exists skip is gated on skip_initialization_sync."""
+        proj = tmp_path / "pg-project"
+        BasicMemoryConfig(
+            database_backend="postgres",
+            skip_initialization_sync=False,
+            projects={"main": {"path": str(proj)}},
+            default_project="main",
+        )
+        assert proj.exists()
+
+    def test_stateless_postgres_skips_project_directories(self, config_home, tmp_path):
+        """Stateless/cloud deployments don't touch the local filesystem."""
+        proj = tmp_path / "cloud-project"
+        BasicMemoryConfig(
+            database_backend="postgres",
+            skip_initialization_sync=True,
+            projects={"main": {"path": str(proj)}},
+            default_project="main",
+        )
+        assert not proj.exists()
+
     def test_basic_memory_home_with_relative_path(self, config_home, monkeypatch):
         """Test that BASIC_MEMORY_HOME works with relative paths."""
         relative_path = "relative/memory/path"
@@ -1033,6 +1096,16 @@ class TestSemanticSearchConfig:
         config = BasicMemoryConfig(semantic_embedding_dimensions=1536)
         assert config.semantic_embedding_dimensions == 1536
 
+    def test_semantic_embedding_forward_dimensions_defaults_to_none(self):
+        """Dimension forwarding should default to provider auto-detection."""
+        config = BasicMemoryConfig()
+        assert config.semantic_embedding_forward_dimensions is None
+
+    def test_semantic_embedding_forward_dimensions_can_be_set(self):
+        """Explicit LiteLLM dimension forwarding should be stored on the config object."""
+        config = BasicMemoryConfig(semantic_embedding_forward_dimensions=True)
+        assert config.semantic_embedding_forward_dimensions is True
+
     def test_semantic_postgres_prepare_concurrency_defaults_to_4(self):
         """Postgres prepare concurrency should default to a conservative window of 4."""
         config = BasicMemoryConfig()
@@ -1234,6 +1307,30 @@ class TestProjectMode:
         config.set_project_mode("research", ProjectMode.LOCAL)
         assert config.projects["research"].mode == ProjectMode.LOCAL
         assert config.get_project_mode("research") == ProjectMode.LOCAL
+
+    def test_is_locally_syncable_true_for_config_project_with_absolute_path(self, tmp_path):
+        """A project in config with an absolute path is locally syncable."""
+        abs_path = str(tmp_path / "research")
+        config = BasicMemoryConfig(projects={"research": ProjectEntry(path=abs_path)})
+        assert config.is_locally_syncable("research", abs_path) is True
+
+    def test_is_locally_syncable_false_for_empty_path(self):
+        """An empty path resolves to cwd, so it is never locally syncable (#949)."""
+        config = BasicMemoryConfig(projects={"empty": ProjectEntry(path="")})
+        assert config.is_locally_syncable("empty", "") is False
+
+    def test_is_locally_syncable_false_for_relative_path(self):
+        """A relative (slug) path, as used by cloud-only projects, is not syncable."""
+        config = BasicMemoryConfig(projects={"cloud": ProjectEntry(path="cloud-slug")})
+        assert config.is_locally_syncable("cloud", "cloud-slug") is False
+
+    def test_is_locally_syncable_false_for_orphan_not_in_config(self, tmp_path):
+        """A DB row absent from config is not syncable even with an absolute path.
+
+        Config is the source of truth; stale rows must not be synced (#949).
+        """
+        config = BasicMemoryConfig(projects={})
+        assert config.is_locally_syncable("orphan", str(tmp_path / "orphan")) is False
 
     def test_cloud_api_key_defaults_to_none(self):
         """Test that cloud_api_key defaults to None."""
@@ -1590,3 +1687,62 @@ class TestAutoUpdateConfig:
             assert loaded.auto_update is False
             assert loaded.update_check_interval == 7200
             assert loaded.auto_update_last_checked_at == checked_at
+
+
+class TestAtomicConfigSave:
+    """Regression tests for #940: saving config must never tear the published file.
+
+    Long-lived readers (the MCP stdio server's mtime-based config reload, the CLI
+    background auto-update thread) re-read config.json while other code saves it.
+    An in-place write truncates the file first, so a concurrent reader can observe
+    empty/partial JSON — and load_config() raises SystemExit on invalid JSON.
+    """
+
+    def test_interrupted_save_preserves_published_config(self, config_home, monkeypatch):
+        """A write that dies mid-stream must leave the existing config untouched."""
+        import json
+
+        from basic_memory.config import save_basic_memory_config
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_file = temp_path / "config.json"
+            config = BasicMemoryConfig(
+                projects={"main": {"path": str(temp_path / "main")}},
+                default_project="main",
+            )
+            save_basic_memory_config(config_file, config)
+            published = config_file.read_text(encoding="utf-8")
+            json.loads(published)  # sanity: complete, valid document
+
+            def torn_write_text(self, content, *args, **kwargs):
+                # Fault injection: the write dies halfway through. For an in-place
+                # write this is exactly the truncated state a concurrent reader
+                # observes mid-save; an atomic save must confine it to a temp file.
+                with open(self, "w", encoding="utf-8") as fh:
+                    fh.write(content[: len(content) // 2])
+                raise OSError("simulated interrupted write")
+
+            monkeypatch.setattr(Path, "write_text", torn_write_text)
+            # save_basic_memory_config logs write failures instead of raising
+            save_basic_memory_config(config_file, config)
+            monkeypatch.undo()
+
+            assert config_file.read_text(encoding="utf-8") == published
+
+    def test_save_leaves_no_temp_files(self, config_home):
+        """The atomic-write temp file must not survive a successful save."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_file = temp_path / "config.json"
+            config = BasicMemoryConfig(
+                projects={"main": {"path": str(temp_path / "main")}},
+                default_project="main",
+            )
+
+            from basic_memory.config import save_basic_memory_config
+
+            save_basic_memory_config(config_file, config)
+
+            assert config_file.exists()
+            assert not list(temp_path.glob("*.tmp"))

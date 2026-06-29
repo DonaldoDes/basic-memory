@@ -66,9 +66,13 @@ def test_workspace_list_prints_available_workspaces(runner, monkeypatch):
 
     assert result.exit_code == 0
     assert "Available Workspaces" in result.stdout
+    assert "Slug" in result.stdout
+    assert "Workspace ID" in result.stdout
     assert "Personal" in result.stdout
     assert "Team" in result.stdout
-    # Tenant ID may be truncated by Rich table rendering
+    assert "personal" in result.stdout
+    assert "team" in result.stdout
+    # Workspace ID may be truncated by Rich table rendering
     assert "11111111" in result.stdout
 
 

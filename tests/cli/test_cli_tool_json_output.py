@@ -39,6 +39,21 @@ EDIT_NOTE_RESULT = {
     "operation": "append",
 }
 
+DELETE_NOTE_RESULT = {
+    "deleted": True,
+    "is_directory": False,
+    "title": "Test Note",
+    "permalink": "notes/test-note",
+    "file_path": "notes/Test Note.md",
+}
+
+DELETE_DIRECTORY_RESULT = {
+    "deleted": True,
+    "is_directory": True,
+    "directory": "notes/archive",
+    "deleted_count": 3,
+}
+
 BUILD_CONTEXT_RESULT = {
     "results": [],
     "metadata": {"uri": "test/topic", "depth": 1},
@@ -83,7 +98,7 @@ SEARCH_RESULT = {
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_write_note",
+    "basic_memory.mcp.tools.write_note",
     new_callable=AsyncMock,
     return_value=WRITE_NOTE_RESULT,
 )
@@ -114,7 +129,7 @@ def test_write_note_json_output(mock_mcp_write):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_write_note",
+    "basic_memory.mcp.tools.write_note",
     new_callable=AsyncMock,
     return_value=WRITE_NOTE_RESULT,
 )
@@ -146,7 +161,7 @@ def test_write_note_project_id_passthrough(mock_mcp_write):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_write_note",
+    "basic_memory.mcp.tools.write_note",
     new_callable=AsyncMock,
     return_value=WRITE_NOTE_RESULT,
 )
@@ -174,11 +189,63 @@ def test_write_note_with_tags(mock_mcp_write):
     assert mock_mcp_write.call_args.kwargs["tags"] == ["python", "async"]
 
 
+@patch(
+    "basic_memory.mcp.tools.write_note",
+    new_callable=AsyncMock,
+    return_value=WRITE_NOTE_RESULT,
+)
+def test_write_note_type_passthrough(mock_mcp_write):
+    """--type forwards to the MCP tool's note_type parameter."""
+    result = runner.invoke(
+        cli_app,
+        [
+            "tool",
+            "write-note",
+            "--title",
+            "Test Note",
+            "--folder",
+            "notes",
+            "--content",
+            "hello",
+            "--type",
+            "guide",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_mcp_write.call_args.kwargs["note_type"] == "guide"
+
+
+@patch(
+    "basic_memory.mcp.tools.write_note",
+    new_callable=AsyncMock,
+    return_value=WRITE_NOTE_RESULT,
+)
+def test_write_note_type_defaults_to_note(mock_mcp_write):
+    """write-note defaults note_type to 'note' when --type is omitted."""
+    result = runner.invoke(
+        cli_app,
+        [
+            "tool",
+            "write-note",
+            "--title",
+            "Test Note",
+            "--folder",
+            "notes",
+            "--content",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_mcp_write.call_args.kwargs["note_type"] == "note"
+
+
 # --- read-note ---
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_read_note",
+    "basic_memory.mcp.tools.read_note",
     new_callable=AsyncMock,
     return_value=READ_NOTE_RESULT,
 )
@@ -200,7 +267,7 @@ def test_read_note_json_output(mock_mcp_read):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_read_note",
+    "basic_memory.mcp.tools.read_note",
     new_callable=AsyncMock,
     return_value=READ_NOTE_RESULT,
 )
@@ -215,11 +282,143 @@ def test_read_note_include_frontmatter(mock_mcp_read):
     assert mock_mcp_read.call_args.kwargs["include_frontmatter"] is True
 
 
+# --- delete-note ---
+
+
+@patch(
+    "basic_memory.mcp.tools.delete_note",
+    new_callable=AsyncMock,
+    return_value=DELETE_NOTE_RESULT,
+)
+def test_delete_note_json_output(mock_mcp_delete: AsyncMock) -> None:
+    """delete-note outputs valid JSON from MCP tool."""
+    result = runner.invoke(
+        cli_app,
+        ["tool", "delete-note", "test-note"],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    data = json.loads(result.output)
+    assert data["deleted"] is True
+    assert data["permalink"] == "notes/test-note"
+    mock_mcp_delete.assert_called_once()
+    assert mock_mcp_delete.call_args.kwargs["output_format"] == "json"
+    assert mock_mcp_delete.call_args.kwargs["is_directory"] is False
+
+
+@patch(
+    "basic_memory.mcp.tools.delete_note",
+    new_callable=AsyncMock,
+    return_value=DELETE_DIRECTORY_RESULT,
+)
+def test_delete_note_directory_flag(mock_mcp_delete: AsyncMock) -> None:
+    """delete-note --is-directory passes directory mode to MCP."""
+    result = runner.invoke(
+        cli_app,
+        ["tool", "delete-note", "notes/archive", "--is-directory"],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    data = json.loads(result.output)
+    assert data["is_directory"] is True
+    assert mock_mcp_delete.call_args.kwargs["is_directory"] is True
+
+
+@patch(
+    "basic_memory.mcp.tools.delete_note",
+    new_callable=AsyncMock,
+    return_value={
+        "deleted": False,
+        "is_directory": False,
+        "identifier": "missing-note",
+        "error": None,
+    },
+)
+def test_delete_note_not_found_outputs_json(mock_mcp_delete: AsyncMock) -> None:
+    """delete-note treats not-found JSON without an error as a successful command."""
+    result = runner.invoke(
+        cli_app,
+        ["tool", "delete-note", "missing-note"],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    data = json.loads(result.output)
+    assert data["deleted"] is False
+    assert data["identifier"] == "missing-note"
+    assert mock_mcp_delete.call_args.kwargs["output_format"] == "json"
+
+
+@patch(
+    "basic_memory.mcp.tools.delete_note",
+    new_callable=AsyncMock,
+    return_value={
+        "deleted": False,
+        "is_directory": False,
+        "identifier": "test-note",
+        "error": "Delete failed",
+    },
+)
+def test_delete_note_error_response(mock_mcp_delete: AsyncMock) -> None:
+    """delete-note exits with code 1 when MCP tool returns an error field."""
+    result = runner.invoke(
+        cli_app,
+        ["tool", "delete-note", "test-note"],
+    )
+
+    assert result.exit_code == 1
+    assert "Error: Delete failed" in result.output
+    assert mock_mcp_delete.call_args.kwargs["output_format"] == "json"
+
+
+@patch(
+    "basic_memory.mcp.tools.delete_note",
+    new_callable=AsyncMock,
+    return_value={
+        "deleted": False,
+        "is_directory": True,
+        "identifier": "notes/archive",
+        "total_files": 3,
+        "successful_deletes": 2,
+        "failed_deletes": 1,
+        "errors": [{"path": "notes/archive/locked.md", "error": "permission denied"}],
+    },
+)
+def test_delete_note_directory_partial_failure_exits_nonzero(
+    mock_mcp_delete: AsyncMock,
+) -> None:
+    """delete-note --is-directory exits 1 when any directory file remains undeleted."""
+    result = runner.invoke(
+        cli_app,
+        ["tool", "delete-note", "notes/archive", "--is-directory"],
+    )
+
+    assert result.exit_code == 1
+    assert "Error: Directory delete incomplete: 1 file(s) failed" in result.output
+    assert mock_mcp_delete.call_args.kwargs["output_format"] == "json"
+
+
+@patch(
+    "basic_memory.mcp.tools.delete_note",
+    new_callable=AsyncMock,
+    return_value=DELETE_NOTE_RESULT,
+)
+def test_delete_note_project_id_passthrough(mock_mcp_delete: AsyncMock) -> None:
+    """--project-id forwards to the MCP tool's project_id parameter."""
+    uuid = "11111111-1111-1111-1111-111111111111"
+    result = runner.invoke(
+        cli_app,
+        ["tool", "delete-note", "test-note", "--project-id", uuid],
+    )
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert mock_mcp_delete.call_args.kwargs["project_id"] == uuid
+
+
 # --- edit-note ---
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_edit_note",
+    "basic_memory.mcp.tools.edit_note",
     new_callable=AsyncMock,
     return_value=EDIT_NOTE_RESULT,
 )
@@ -247,7 +446,7 @@ def test_edit_note_json_output(mock_mcp_edit):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_edit_note",
+    "basic_memory.mcp.tools.edit_note",
     new_callable=AsyncMock,
     return_value={"title": "Test", "permalink": "test", "error": "Edit failed: not found"},
 )
@@ -273,7 +472,7 @@ def test_edit_note_error_response(mock_mcp_edit):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_build_context",
+    "basic_memory.mcp.tools.build_context",
     new_callable=AsyncMock,
     return_value=BUILD_CONTEXT_RESULT,
 )
@@ -292,7 +491,7 @@ def test_build_context_json_output(mock_build_ctx):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_build_context",
+    "basic_memory.mcp.tools.build_context",
     new_callable=AsyncMock,
     return_value=BUILD_CONTEXT_RESULT,
 )
@@ -327,7 +526,7 @@ def test_build_context_with_options(mock_build_ctx):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_recent_activity",
+    "basic_memory.mcp.tools.recent_activity",
     new_callable=AsyncMock,
     return_value=RECENT_ACTIVITY_RESULT,
 )
@@ -349,7 +548,7 @@ def test_recent_activity_json_output(mock_mcp_recent):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_recent_activity",
+    "basic_memory.mcp.tools.recent_activity",
     new_callable=AsyncMock,
     return_value=RECENT_ACTIVITY_RESULT,
 )
@@ -367,7 +566,7 @@ def test_recent_activity_pagination(mock_mcp_recent):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_recent_activity",
+    "basic_memory.mcp.tools.recent_activity",
     new_callable=AsyncMock,
     return_value=[],
 )
@@ -387,7 +586,7 @@ def test_recent_activity_empty(mock_mcp_recent):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_search",
+    "basic_memory.mcp.tools.search_notes",
     new_callable=AsyncMock,
     return_value=SEARCH_RESULT,
 )
@@ -407,7 +606,7 @@ def test_search_notes_json_output(mock_mcp_search):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_search",
+    "basic_memory.mcp.tools.search_notes",
     new_callable=AsyncMock,
     return_value=SEARCH_RESULT,
 )
@@ -423,7 +622,7 @@ def test_search_notes_with_meta_filter(mock_mcp_search):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_search",
+    "basic_memory.mcp.tools.search_notes",
     new_callable=AsyncMock,
     return_value=SEARCH_RESULT,
 )
@@ -439,7 +638,7 @@ def test_search_notes_permalink_mode(mock_mcp_search):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_search",
+    "basic_memory.mcp.tools.search_notes",
     new_callable=AsyncMock,
     return_value="Error: search failed",
 )
@@ -500,7 +699,7 @@ SCHEMA_VALIDATE_RESULT = {
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value=SCHEMA_VALIDATE_RESULT,
 )
@@ -520,7 +719,7 @@ def test_schema_validate_json_output(mock_mcp):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value=SCHEMA_VALIDATE_RESULT,
 )
@@ -537,7 +736,7 @@ def test_schema_validate_identifier_heuristic(mock_mcp):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value={"error": "No notes found of type 'person'"},
 )
@@ -570,7 +769,7 @@ SCHEMA_INFER_RESULT = {
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_schema_infer",
+    "basic_memory.mcp.tools.schema_infer",
     new_callable=AsyncMock,
     return_value=SCHEMA_INFER_RESULT,
 )
@@ -590,7 +789,7 @@ def test_schema_infer_json_output(mock_mcp):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_schema_infer",
+    "basic_memory.mcp.tools.schema_infer",
     new_callable=AsyncMock,
     return_value=SCHEMA_INFER_RESULT,
 )
@@ -619,7 +818,7 @@ SCHEMA_DIFF_RESULT = {
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_schema_diff",
+    "basic_memory.mcp.tools.schema_diff",
     new_callable=AsyncMock,
     return_value=SCHEMA_DIFF_RESULT,
 )
@@ -661,7 +860,7 @@ LIST_PROJECTS_RESULT = {
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_list_projects",
+    "basic_memory.mcp.tools.list_memory_projects",
     new_callable=AsyncMock,
     return_value=LIST_PROJECTS_RESULT,
 )
@@ -699,7 +898,7 @@ LIST_WORKSPACES_RESULT = {
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_list_workspaces",
+    "basic_memory.mcp.tools.list_workspaces",
     new_callable=AsyncMock,
     return_value=LIST_WORKSPACES_RESULT,
 )
@@ -720,7 +919,7 @@ def test_list_workspaces_json_output(mock_mcp):
 
 
 @patch(
-    "basic_memory.cli.commands.tool.mcp_list_workspaces",
+    "basic_memory.mcp.tools.list_workspaces",
     new_callable=AsyncMock,
     return_value={"workspaces": [], "count": 0},
 )

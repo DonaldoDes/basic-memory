@@ -70,12 +70,14 @@ def _format_bulk_response(response: BulkEditResponse, project_name: str) -> str:
 
 
 @mcp.tool(
+    title="Bulk Edit Notes",
     description=(
         "Apply up to 100 edit operations (append, prepend, find_replace, "
         "replace_section, insert_before_section, insert_after_section) across "
         "notes of one project in a single call, with per-note success/failure "
         "report and optional dry-run (validate_first)."
     ),
+    tags={"notes"},
     annotations={"destructiveHint": False, "openWorldHint": False},
 )
 async def bulk_edit_notes(

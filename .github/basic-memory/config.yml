@@ -1,0 +1,7 @@
+project: dev
+workspace: basic-memory-7020de4e925843c68c9056c60d101d9e
+deploy_workflows:
+- Deploy Production
+production_environments:
+- production
+note_folder: project-updates/github/{owner}/{repo}

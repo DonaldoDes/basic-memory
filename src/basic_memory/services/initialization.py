@@ -13,7 +13,7 @@ from pathlib import Path
 from loguru import logger
 
 from basic_memory import db
-from basic_memory.config import BasicMemoryConfig, DatabaseBackend, ProjectMode
+from basic_memory.config import BasicMemoryConfig
 from basic_memory.models import Project
 from basic_memory.repository import (
     ProjectRepository,
@@ -120,18 +120,14 @@ async def initialize_file_sync(
         active_projects = [p for p in active_projects if p.name == constrained_project]
         logger.info(f"Background sync constrained to project: {constrained_project}")
 
-    # Skip cloud-mode projects that have no local directory.
-    # Cloud projects with a local bisync copy (absolute path) are kept for local sync.
-    cloud_skip = []
-    for p in active_projects:
-        if app_config.get_project_mode(p.name) == ProjectMode.CLOUD:
-            entry = app_config.projects.get(p.name)
-            if entry and Path(entry.path).is_absolute():
-                continue  # Cloud project with local bisync copy — keep for local sync
-            cloud_skip.append(p.name)
-    if cloud_skip:
-        active_projects = [p for p in active_projects if p.name not in cloud_skip]
-        logger.info(f"Skipping cloud-mode projects for local sync: {cloud_skip}")
+    # Only sync projects that are in config (source of truth) and have an
+    # absolute local path; see BasicMemoryConfig.is_locally_syncable. This keeps
+    # background sync from adopting the process cwd as a project root and
+    # mutating unrelated files (issue #949).
+    skip = [p.name for p in active_projects if not app_config.is_locally_syncable(p.name, p.path)]
+    if skip:
+        active_projects = [p for p in active_projects if p.name not in skip]
+        logger.info(f"Skipping projects that are not locally syncable for sync: {skip}")
 
     # Start sync for all projects as background tasks (non-blocking)
     async def sync_project_background(project: Project):
@@ -195,13 +191,18 @@ async def initialize_app(
             "permalinks will be written."
         )
 
-    # Trigger: database backend is Postgres (cloud deployment)
-    # Why: cloud deployments manage their own projects and migrations via the cloud platform.
-    # The local MCP server always uses SQLite and needs initialization even when
-    # projects are configured for cloud routing.
-    # Outcome: skip initialization only for actual cloud Postgres deployments.
-    if app_config.database_backend == DatabaseBackend.POSTGRES:
-        logger.info("Skipping local initialization - Postgres backend manages its own schema")
+    # Trigger: cloud/stateless deployment (skip_local_initialization — either
+    # for_cloud_tenant's skip_initialization_sync or BASIC_MEMORY_CLOUD_MODE).
+    # Why: cloud manages its own schema and per-tenant projects from the database.
+    # Running reconcile_projects_with_config there would delete tenant project rows
+    # absent from local config. Gating on the Postgres *backend* was wrong (it
+    # caught a LOCAL Postgres install, which still needs the seeded default
+    # reconciled into a projects row, else /v2/projects/resolve rejects it).
+    # Outcome: skip only for actual cloud/stateless deployments.
+    if app_config.skip_local_initialization:
+        logger.info(
+            "Skipping local initialization - cloud/stateless deployment manages its own schema"
+        )
         return
 
     logger.info("Initializing app...")
@@ -220,13 +221,17 @@ def ensure_initialization(app_config: BasicMemoryConfig) -> None:
     This is a wrapper for the async initialize_app function that can be
     called from synchronous code like CLI entry points.
 
-    No-op if database backend is Postgres (cloud deployment manages its own schema).
+    No-op for cloud/stateless deployments (skip_local_initialization). A LOCAL
+    Postgres install still needs initialization, so gate on that, not the backend —
+    matching initialize_app.
 
     Args:
         app_config: The Basic Memory project configuration
     """
-    if app_config.database_backend == DatabaseBackend.POSTGRES:
-        logger.info("Skipping local initialization - Postgres backend manages its own schema")
+    if app_config.skip_local_initialization:
+        logger.info(
+            "Skipping local initialization - cloud/stateless deployment manages its own schema"
+        )
         return
 
     async def _init_and_cleanup():

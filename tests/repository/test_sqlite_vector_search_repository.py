@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from basic_memory import db
 from basic_memory.config import BasicMemoryConfig, DatabaseBackend
+from basic_memory.repository.litellm_provider import LiteLLMEmbeddingProvider
 from basic_memory.repository.search_index_row import SearchIndexRow
 from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
@@ -70,6 +71,32 @@ def _entity_row(
         entity_id=entity_id,
         content_stems=content_stems,
         content_snippet=content_stems,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _relation_row(
+    *,
+    project_id: int,
+    row_id: int,
+    entity_id: int,
+    title: str,
+    permalink: str,
+    relation_type: str,
+) -> SearchIndexRow:
+    now = datetime.now(timezone.utc)
+    return SearchIndexRow(
+        project_id=project_id,
+        id=row_id,
+        type=SearchItemType.RELATION.value,
+        title=title,
+        permalink=permalink,
+        file_path=f"{permalink}.md",
+        metadata=None,
+        entity_id=entity_id,
+        from_id=entity_id,
+        relation_type=relation_type,
         created_at=now,
         updated_at=now,
     )
@@ -296,6 +323,30 @@ async def test_sqlite_vector_sync_skips_unchanged_and_reembeds_changed_content(s
     assert model_changed_result.embedding_jobs_total == model_changed_result.chunks_total
 
 
+def test_sqlite_embedding_model_key_includes_litellm_role_settings():
+    """LiteLLM role changes should invalidate previously embedded document chunks."""
+    repo = _make_sqlite_repo_for_unit_tests()
+    repo._embedding_provider = LiteLLMEmbeddingProvider(
+        model_name="nvidia_nim/nvidia/embed-qa-4",
+        dimensions=1024,
+        document_input_type="passage",
+        query_input_type="query",
+    )
+    passage_query_key = repo._embedding_model_key()
+
+    repo._embedding_provider = LiteLLMEmbeddingProvider(
+        model_name="nvidia_nim/nvidia/embed-qa-4",
+        dimensions=1024,
+        document_input_type="document",
+        query_input_type="query",
+    )
+    document_query_key = repo._embedding_model_key()
+
+    assert passage_query_key != document_query_key
+    assert "document_input_type=passage" in passage_query_key
+    assert "query_input_type=query" in passage_query_key
+
+
 @pytest.mark.asyncio
 async def test_sqlite_prepare_window_uses_shared_reads_and_serialized_write_scope(monkeypatch):
     """SQLite should batch read-side prepare work but serialize write-side mutations."""
@@ -471,6 +522,71 @@ async def test_sqlite_vector_search_returns_ranked_entities(search_repository):
     assert results
     assert results[0].permalink == "specs/authentication"
     assert all(result.type == SearchItemType.ENTITY.value for result in results)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_vector_search_survives_cross_type_id_collision(search_repository):
+    """Entity and relation rows sharing one numeric id must both hydrate (#982).
+
+    Entity, observation, and relation rows carry ids from independent
+    auto-increment sequences, so search_index rows of different types routinely
+    share the same numeric id. Keying vector hydration by bare id collapsed
+    colliding hits into one dict slot and silently dropped the other result.
+    """
+    if not isinstance(search_repository, SQLiteSearchRepository):
+        pytest.skip("sqlite-vec repository behavior is local SQLite-only.")
+
+    _enable_semantic(search_repository)
+    await search_repository.init_search_index()
+    await search_repository.bulk_index_items(
+        [
+            _entity_row(
+                project_id=search_repository.project_id,
+                row_id=7,
+                entity_id=701,
+                title="Auth Token Design",
+                permalink="specs/auth-token-design",
+                content_stems="auth token session login design",
+            ),
+            # Same numeric id as the entity row above, different row type.
+            _relation_row(
+                project_id=search_repository.project_id,
+                row_id=7,
+                entity_id=702,
+                title="login flow relates to auth token design",
+                permalink="specs/login-flow/relates-to/auth-token-design",
+                relation_type="relates_to",
+            ),
+        ]
+    )
+    await search_repository.sync_entity_vectors(701)
+    await search_repository.sync_entity_vectors(702)
+
+    results = await search_repository.search(
+        search_text="session token auth",
+        retrieval_mode=SearchRetrievalMode.VECTOR,
+        limit=5,
+        offset=0,
+    )
+
+    # Both rows match the query; both share id=7 and must survive hydration.
+    assert len(results) == 2
+    assert {result.type for result in results} == {
+        SearchItemType.ENTITY.value,
+        SearchItemType.RELATION.value,
+    }
+    entity_result = next(r for r in results if r.type == SearchItemType.ENTITY.value)
+    assert entity_result.permalink == "specs/auth-token-design"
+
+    # The type filter must keep the entity even though a relation shares its id.
+    filtered = await search_repository.search(
+        search_text="session token auth",
+        search_item_types=[SearchItemType.ENTITY],
+        retrieval_mode=SearchRetrievalMode.VECTOR,
+        limit=5,
+        offset=0,
+    )
+    assert [r.permalink for r in filtered] == ["specs/auth-token-design"]
 
 
 @pytest.mark.asyncio

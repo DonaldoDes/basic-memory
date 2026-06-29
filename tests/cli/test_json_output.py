@@ -231,13 +231,144 @@ def test_status_json_with_skipped_files(mock_get_client, mock_get_active, mock_c
 
 
 # ---------------------------------------------------------------------------
+# Status --wait
+#
+# Real watch/sync timing is nondeterministic (filesystem events + background
+# indexing), so these tests mock ProjectClient.get_status to drive deterministic
+# poll sequences and patch asyncio.sleep to a no-op to avoid wall-clock waits.
+# ---------------------------------------------------------------------------
+
+
+@patch("basic_memory.cli.commands.status.asyncio.sleep", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_succeeds_after_polling(
+    mock_get_client, mock_get_active, mock_config_cls, mock_sleep
+):
+    """bm status --wait polls until total == 0, then exits 0."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    # First poll reports pending changes, second reports a synced project.
+    get_status = AsyncMock(side_effect=[SYNC_REPORT_WITH_CHANGES, SYNC_REPORT_EMPTY])
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait"])
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    # Polled twice: pending -> empty.
+    assert get_status.await_count == 2
+    # Slept once between the two polls.
+    assert mock_sleep.await_count == 1
+
+
+@patch("basic_memory.cli.commands.status.asyncio.sleep", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_times_out(mock_get_client, mock_get_active, mock_config_cls, mock_sleep):
+    """bm status --wait exits 1 with a timeout message when never synced."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    # Always pending: --wait should hit the deadline and fail.
+    get_status = AsyncMock(return_value=SYNC_REPORT_WITH_CHANGES)
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    # timeout=0 makes the deadline immediate: poll once, then time out.
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait", "--timeout", "0"])
+
+    assert result.exit_code == 1
+    assert "Timed out" in result.output
+
+
+def test_status_wait_negative_timeout_is_rejected():
+    """A negative --timeout fails fast with a usage error instead of a confusing
+    'Timed out after -5s' message. The guard runs before any client I/O, no mocks needed."""
+    result = runner.invoke(cli_app, ["status", "--wait", "--timeout", "-5"])
+
+    assert result.exit_code != 0
+    # Typer colorizes the flag name with ANSI codes (so the literal "--timeout" is split),
+    # but the message body renders clean — assert on that.
+    assert "must be >= 0" in result.output
+
+
+@patch("basic_memory.cli.commands.status.asyncio.sleep", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_json_reports_total_zero(
+    mock_get_client, mock_get_active, mock_config_cls, mock_sleep
+):
+    """bm status --wait --json emits total: 0 once indexing completes."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    get_status = AsyncMock(side_effect=[SYNC_REPORT_WITH_CHANGES, SYNC_REPORT_EMPTY])
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait", "--json"])
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    data = _parse_json_output(result.output)
+    assert data["total"] == 0
+
+
+@patch("basic_memory.cli.commands.status.asyncio.sleep", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_json_timeout_emits_error(
+    mock_get_client, mock_get_active, mock_config_cls, mock_sleep
+):
+    """bm status --wait --json on timeout emits a JSON error and exits 1."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    get_status = AsyncMock(return_value=SYNC_REPORT_WITH_CHANGES)
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait", "--timeout", "0", "--json"])
+
+    assert result.exit_code == 1
+    data = _parse_json_output(result.output)
+    assert "error" in data
+    assert "Timed out" in data["error"]
+
+
+# ---------------------------------------------------------------------------
 # Schema validate --json
 # ---------------------------------------------------------------------------
 
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value=VALIDATE_REPORT,
 )
@@ -256,7 +387,7 @@ def test_schema_validate_json(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value={"error": "No schema found for type 'person'"},
 )
@@ -273,7 +404,7 @@ def test_schema_validate_json_error(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value=VALIDATE_REPORT,
 )
@@ -296,7 +427,7 @@ def test_schema_validate_json_strict_exit(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_infer",
+    "basic_memory.mcp.tools.schema_infer",
     new_callable=AsyncMock,
     return_value=INFER_REPORT,
 )
@@ -320,7 +451,7 @@ def test_schema_infer_json(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_diff",
+    "basic_memory.mcp.tools.schema_diff",
     new_callable=AsyncMock,
     return_value=DIFF_REPORT_WITH_DRIFT,
 )

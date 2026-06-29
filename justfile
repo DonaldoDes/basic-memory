@@ -1,5 +1,12 @@
 # Basic Memory - Modern Command Runner
 
+TESTMON_FLAGS := env_var_or_default("BASIC_MEMORY_TESTMON_FLAGS", "--testmon-noselect")
+TESTMON_SELECT_FLAGS := env_var_or_default("BASIC_MEMORY_TESTMON_SELECT_FLAGS", "--testmon --testmon-forceselect")
+TESTMON_REFRESH_FLAGS := env_var_or_default("BASIC_MEMORY_TESTMON_REFRESH_FLAGS", "--testmon-noselect")
+# CI shards the Postgres unit suite across parallel jobs via pytest-split
+# (e.g. "--splits 3 --group 2"). Empty locally.
+PYTEST_SPLIT_FLAGS := env_var_or_default("BASIC_MEMORY_PYTEST_SPLIT_FLAGS", "")
+
 # Install dependencies
 install:
     uv sync
@@ -35,40 +42,60 @@ test-sqlite: test-unit-sqlite test-int-sqlite
 test-postgres: test-unit-postgres test-int-postgres
 
 # Run unit tests against SQLite
-test-unit-sqlite:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov tests
+test-unit-sqlite: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=unit-sqlite tests
 
 # Run unit tests against Postgres
-test-unit-postgres:
-    BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov tests
+# Exit code 5 (no tests collected) is success: a testmon-selected PR build can
+# leave a pytest-split shard empty.
+test-unit-postgres: testmon-seed
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} {{PYTEST_SPLIT_FLAGS}} --testmon-env=unit-postgres tests || test $? -eq 5
 
-# Run integration tests against SQLite (excludes semantic benchmarks — use just test-semantic)
-test-int-sqlite:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int
+# Run integration tests against SQLite (excludes semantic tests and on-demand benchmarks —
+# use just test-semantic / run benchmark files explicitly)
+test-int-sqlite: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=int-sqlite -m "not semantic and not benchmark" test-int
 
 # Run integration tests against Postgres
 # Note: Uses timeout due to FastMCP Client + asyncpg cleanup hang (tests pass, process hangs on exit)
 # See: https://github.com/jlowin/fastmcp/issues/1311
-test-int-postgres:
+test-int-postgres: testmon-seed
     #!/usr/bin/env bash
     set -euo pipefail
     # Use gtimeout (macOS/Homebrew) or timeout (Linux)
     TIMEOUT_CMD=$(command -v gtimeout || command -v timeout || echo "")
     if [[ -n "$TIMEOUT_CMD" ]]; then
-        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int' || test $? -eq 137
+        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=int-postgres -m "not semantic and not benchmark" test-int' || test $? -eq 137
     else
         echo "⚠️  No timeout command found, running without timeout..."
-        BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int
+        BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=int-postgres -m "not semantic and not benchmark" test-int
     fi
 
 # Run tests impacted by recent changes (requires pytest-testmon)
 # Pass paths or node ids after `just testmon` to limit the candidate set further.
-testmon *args:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov --testmon {{args}}
+testmon *args: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_SELECT_FLAGS}} --testmon-env=local {{args}}
+
+# Seed pytest-testmon data into this worktree from the shared Git cache.
+testmon-seed:
+    uv run python scripts/testmon_cache.py seed
+
+# Refresh the shared pytest-testmon cache from a full backend test run.
+testmon-refresh:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BASIC_MEMORY_TESTMON_FLAGS="{{TESTMON_REFRESH_FLAGS}}" just test
+    uv run python scripts/testmon_cache.py refresh
+
+# Show local and shared pytest-testmon cache locations.
+testmon-status:
+    uv run python scripts/testmon_cache.py status
 
 # Run MCP smoke test (fast end-to-end loop)
-test-smoke:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m smoke test-int/mcp/test_smoke_integration.py
+test-smoke: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=smoke -m smoke test-int/mcp/test_smoke_integration.py
 
 # Fast local loop: lint, format, typecheck, impacted tests via pytest-testmon
 fast-check:
@@ -97,27 +124,31 @@ postgres-migrate:
 # Run Windows-specific tests only (only works on Windows platform)
 # These tests verify Windows-specific database optimizations (locking mode, NullPool)
 # Will be skipped automatically on non-Windows platforms
-test-windows:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m windows tests test-int
+test-windows: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=windows -m windows tests test-int
 
 # Run benchmark tests only (performance testing)
 # These are slow tests that measure sync performance with various file counts
 # Excluded from default test runs to keep CI fast
-test-benchmark:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m benchmark tests test-int
+test-benchmark: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=benchmark -m benchmark tests test-int
 
 # Run semantic search quality benchmarks (all combos)
-test-semantic:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m semantic test-int/semantic/
+test-semantic: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=semantic -m semantic test-int/semantic/
 
 # Run semantic benchmarks with JSON artifact output, then show report
 test-semantic-report:
     BASIC_MEMORY_ENV=test BASIC_MEMORY_BENCHMARK_OUTPUT=.benchmarks/semantic-quality.jsonl uv run pytest -p pytest_mock -v -s --no-cov -m semantic test-int/semantic/
     uv run python test-int/semantic/report.py .benchmarks/semantic-quality.jsonl
 
+# Run opt-in live LiteLLM provider checks against configured external APIs
+test-litellm-live *args:
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_RUN_LITELLM_INTEGRATION=1 PYTHONPATH=test-int:src uv run python -m semantic.litellm_live_harness {{args}}
+
 # Run semantic benchmarks (Postgres combos only)
-test-semantic-postgres:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m semantic -k postgres test-int/semantic/
+test-semantic-postgres: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=semantic-postgres -m semantic -k postgres test-int/semantic/
 
 # View semantic benchmark results (rich formatted table)
 # Usage: just semantic-report [--filter-combo sqlite] [--filter-suite paraphrase] [--sort-by avg_latency_ms]
@@ -133,8 +164,8 @@ benchmark-compare baseline candidate *args:
 
 # Run all tests including Windows, Postgres, and Benchmarks (for CI/comprehensive testing)
 # Use this before releasing to ensure everything works across all backends and platforms
-test-all:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov tests test-int
+test-all: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_FLAGS}} --testmon-env=all tests test-int
 
 # Generate HTML coverage report
 coverage:
@@ -265,8 +296,8 @@ check: lint format typecheck test
 # Run all code quality checks and all test suites, including semantic benchmarks
 check-all: lint format typecheck test test-semantic
 
-# Validate every consolidated agent package (Claude Code, skills, Hermes, OpenClaw)
-package-check: package-check-claude-code package-check-skills package-check-hermes package-check-openclaw
+# Validate every consolidated agent package (Claude Code, Codex, skills, Hermes, OpenClaw)
+package-check: package-check-claude-code package-check-codex package-check-skills package-check-hermes package-check-openclaw
 
 # Alias for plugin/package validation during consolidation work
 plugins-check: package-check
@@ -277,6 +308,10 @@ agent-harness-check: package-check-claude-code package-check-hermes package-chec
 # Claude Code plugin: manifests, bundled skills, bundled agent, and strict plugin validation
 package-check-claude-code:
     just --justfile plugins/claude-code/justfile --working-directory plugins/claude-code check
+
+# Codex plugin: manifest, bundled skills, hooks, MCP config, and schemas
+package-check-codex:
+    just --justfile plugins/codex/justfile --working-directory plugins/codex check
 
 # Shared top-level SKILL.md source
 package-check-skills:
@@ -303,7 +338,7 @@ set-version version scope="all":
 set-version-dry-run version scope="all":
     python3 scripts/update_versions.py "{{version}}" --scope "{{scope}}" --dry-run
 
-# Set the version for just the plugin/agent artifacts (plugin, marketplaces, Hermes, OpenClaw)
+# Set the version for just the plugin/agent artifacts (plugins, marketplaces, Hermes, OpenClaw)
 set-packages-version version:
     just set-version "{{version}}" packages
 
@@ -348,43 +383,93 @@ release version:
         echo "❌ Tag {{version}} already exists"
         exit 1
     fi
-    
+
+    # Changelog must already be on main (land it via a normal PR first)
+    if ! grep -q "^## {{version}} " CHANGELOG.md; then
+        echo "❌ CHANGELOG.md has no entry for {{version}}. Land one via PR first."
+        exit 1
+    fi
+
     # Run quality checks
     echo "🔍 Running lint  checks..."
     just lint
     just typecheck
-    
+
     # Update all package manifests to the one Basic Memory product version.
     echo "📝 Updating consolidated package versions..."
     just set-version "{{version}}"
 
-    # Commit version update
+    # Trigger: main's ruleset rejects direct pushes ("Changes must be made
+    # through a pull request").
+    # Why: the version bump must land on main before the tag is cut, so it
+    # rides a release PR that is rebase-merged (the repo disallows merge
+    # commits).
+    # Outcome: the bump commit gets a new SHA on main; the tag is created on
+    # that rebased commit, found by its commit subject.
+    COMMIT_SUBJECT="chore: update version to $VERSION_NUM for {{version}} release"
+    git checkout -b "release/{{version}}"
     git add \
         src/basic_memory/__init__.py \
         server.json \
         .claude-plugin/marketplace.json \
         plugins/claude-code/.claude-plugin/plugin.json \
         plugins/claude-code/.claude-plugin/marketplace.json \
+        plugins/codex/.codex-plugin/plugin.json \
         integrations/hermes/plugin.yaml \
         integrations/hermes/__init__.py \
         integrations/openclaw/package.json
-    git commit -s -m "chore: update version to $VERSION_NUM for {{version}} release"
-    
-    # Create and push tag
-    echo "🏷️  Creating tag {{version}}..."
-    git tag "{{version}}"
-    
-    echo "📤 Pushing to GitHub..."
-    git push origin main
+    git commit -s -m "$COMMIT_SUBJECT"
+
+    echo "📤 Opening release PR..."
+    git push -u origin "release/{{version}}"
+    gh pr create --title "chore(core): release {{version}}" \
+        --body "Version bump for {{version}}. See CHANGELOG.md for release notes."
+
+    # Trigger: the PR may not be mergeable synchronously (merge gates,
+    # required checks added later, or GitHub still computing mergeability).
+    # Why: the tag must point at the bump commit on main, so the recipe
+    # cannot tag until the merge has actually landed.
+    # Outcome: try a direct rebase-merge, fall back to queueing auto-merge,
+    # then poll main for the rebased bump commit before tagging.
+    if ! gh pr merge "release/{{version}}" --rebase --delete-branch; then
+        echo "⚠️  Direct merge did not complete (merge gates pending?). Queueing auto-merge..."
+        gh pr merge "release/{{version}}" --rebase --delete-branch --auto
+    fi
+
+    echo "⏳ Waiting for the bump commit to land on main..."
+    TAG_COMMIT=""
+    for _ in $(seq 1 60); do
+        git fetch origin main --quiet
+        TAG_COMMIT=$(git log FETCH_HEAD --fixed-strings --grep "$COMMIT_SUBJECT" --format='%H' -1)
+        [[ -n "$TAG_COMMIT" ]] && break
+        sleep 5
+    done
+    if [[ -z "$TAG_COMMIT" ]]; then
+        echo "❌ Bump commit not on main after 5 minutes (merge still pending?)."
+        echo "   Once the release PR merges, finish the release manually:"
+        echo "   git fetch origin main"
+        echo "   git tag {{version}} \$(git log FETCH_HEAD --fixed-strings --grep \"$COMMIT_SUBJECT\" --format='%H' -1)"
+        echo "   git push origin {{version}}"
+        exit 1
+    fi
+
+    git checkout main
+    git pull --ff-only origin main
+    git branch -D "release/{{version}}" 2>/dev/null || true
+
+    echo "🏷️  Creating tag {{version}} at $TAG_COMMIT..."
+    git tag "{{version}}" "$TAG_COMMIT"
     git push origin "{{version}}"
-    
+
     echo "✅ Release {{version}} created successfully!"
     echo "📦 GitHub Actions will build and publish to PyPI"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
     echo ""
     echo "📝 REMINDER: Post-release tasks:"
-    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
-    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   1. docs.basicmemory.com - Add a What's New page under content/2.whats-new/"
+    echo "      and bump the badge in content/index.md (see that repo's CLAUDE.md)"
+    echo "   2. basicmemory.com - No version number in the site UI; for a significant"
+    echo "      release optionally add a post under src/content/blog/. Skip for patches."
     echo "   3. MCP Registry - Run: mcp-publisher publish"
     echo "   See: .claude/commands/release/release.md for detailed instructions"
 
@@ -431,34 +516,78 @@ beta version:
     echo "📝 Updating consolidated package versions..."
     just set-version "{{version}}"
 
-    # Commit version update
+    # Trigger: main's ruleset rejects direct pushes ("Changes must be made
+    # through a pull request").
+    # Why: the version bump must land on main before the tag is cut, so it
+    # rides a release PR that is rebase-merged (the repo disallows merge
+    # commits).
+    # Outcome: the bump commit gets a new SHA on main; the tag is created on
+    # that rebased commit, found by its commit subject.
+    COMMIT_SUBJECT="chore: update version to $VERSION_NUM for {{version}} beta release"
+    git checkout -b "release/{{version}}"
     git add \
         src/basic_memory/__init__.py \
         server.json \
         .claude-plugin/marketplace.json \
         plugins/claude-code/.claude-plugin/plugin.json \
         plugins/claude-code/.claude-plugin/marketplace.json \
+        plugins/codex/.codex-plugin/plugin.json \
         integrations/hermes/plugin.yaml \
         integrations/hermes/__init__.py \
         integrations/openclaw/package.json
-    git commit -s -m "chore: update version to $VERSION_NUM for {{version}} beta release"
-    
-    # Create and push tag
-    echo "🏷️  Creating tag {{version}}..."
-    git tag "{{version}}"
-    
-    echo "📤 Pushing to GitHub..."
-    git push origin main
+    git commit -s -m "$COMMIT_SUBJECT"
+
+    echo "📤 Opening release PR..."
+    git push -u origin "release/{{version}}"
+    gh pr create --title "chore(core): release {{version}}" \
+        --body "Version bump for {{version}} beta."
+
+    # Trigger: the PR may not be mergeable synchronously (merge gates,
+    # required checks added later, or GitHub still computing mergeability).
+    # Why: the tag must point at the bump commit on main, so the recipe
+    # cannot tag until the merge has actually landed.
+    # Outcome: try a direct rebase-merge, fall back to queueing auto-merge,
+    # then poll main for the rebased bump commit before tagging.
+    if ! gh pr merge "release/{{version}}" --rebase --delete-branch; then
+        echo "⚠️  Direct merge did not complete (merge gates pending?). Queueing auto-merge..."
+        gh pr merge "release/{{version}}" --rebase --delete-branch --auto
+    fi
+
+    echo "⏳ Waiting for the bump commit to land on main..."
+    TAG_COMMIT=""
+    for _ in $(seq 1 60); do
+        git fetch origin main --quiet
+        TAG_COMMIT=$(git log FETCH_HEAD --fixed-strings --grep "$COMMIT_SUBJECT" --format='%H' -1)
+        [[ -n "$TAG_COMMIT" ]] && break
+        sleep 5
+    done
+    if [[ -z "$TAG_COMMIT" ]]; then
+        echo "❌ Bump commit not on main after 5 minutes (merge still pending?)."
+        echo "   Once the release PR merges, finish the release manually:"
+        echo "   git fetch origin main"
+        echo "   git tag {{version}} \$(git log FETCH_HEAD --fixed-strings --grep \"$COMMIT_SUBJECT\" --format='%H' -1)"
+        echo "   git push origin {{version}}"
+        exit 1
+    fi
+
+    git checkout main
+    git pull --ff-only origin main
+    git branch -D "release/{{version}}" 2>/dev/null || true
+
+    echo "🏷️  Creating tag {{version}} at $TAG_COMMIT..."
+    git tag "{{version}}" "$TAG_COMMIT"
     git push origin "{{version}}"
-    
+
     echo "✅ Beta release {{version}} created successfully!"
     echo "📦 GitHub Actions will build and publish to PyPI as pre-release"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
     echo "📥 Install with: uv tool install basic-memory --pre"
     echo ""
     echo "📝 REMINDER: For stable releases, update documentation sites:"
-    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
-    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   1. docs.basicmemory.com - Add a What's New page under content/2.whats-new/"
+    echo "      and bump the badge in content/index.md (see that repo's CLAUDE.md)"
+    echo "   2. basicmemory.com - No version number in the site UI; for a significant"
+    echo "      release optionally add a post under src/content/blog/. Skip for patches."
     echo "   See: .claude/commands/release/release.md for detailed instructions"
 
 # List all available recipes
