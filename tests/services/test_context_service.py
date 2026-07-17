@@ -744,3 +744,121 @@ async def test_pattern_search_falls_back_for_legacy_unqualified_rows(context_ser
     permalinks = {result.primary_result.permalink for result in context.results}
     assert permalinks, "fallback did not match legacy rows"
     assert all(p and p.startswith("test-project/test/") for p in permalinks), permalinks
+
+
+# ---------------------------------------------------------------------------
+# BUG-022: build_context must not silently substitute an arbitrary note when an
+# EXACT memory:// URL fails to resolve but its tokens match the FTS corpus.
+#
+# Root cause (two points):
+#   - context_service.py exact-URL branch calls resolve_link(strict=False),
+#     authorizing fuzzy FTS fallback.
+#   - link_resolver.py step 5 returns results[0] unconditionally (no score
+#     threshold).
+# Fix: seal the build_context call-site with strict=True so exact resolutions
+#   (permalink/title/file_path) survive but the unscored FTS fallback is bypassed.
+#   The strict=False default of resolve_link is UNCHANGED for sync/indexing
+#   wikilink resolution (test_link_resolver.py covers that; BUG-022-04 below
+#   re-asserts it at this layer).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_context_no_silent_substitution_on_unresolved_exact_url(
+    context_service, test_graph
+):
+    """BUG-022-01 (adversarial): an exact URL that does NOT resolve but whose
+    token fuzzy-matches the corpus must return empty — never a substituted note.
+
+    ``memory://connected`` is not an existing permalink/title/file_path, but the
+    token ``connected`` FTS-fuzzy-matches "Connected Entity 1"/"2". Before the
+    fix, resolve_link(strict=False) fell through to the unscored FTS top-1 and
+    build_context returned that arbitrary note (primary_count == 1). The caller
+    could not distinguish this from a deliberate hit.
+    """
+    url = memory_url.validate_strings("memory://connected")
+    context_result = await context_service.build_context(url)
+
+    assert context_result.metadata.primary_count == 0, (
+        "unresolved exact URL substituted an arbitrary FTS match "
+        f"(got {context_result.metadata.primary_count} primary result(s))"
+    )
+    assert context_result.results == []
+    # metadata.uri must NOT be rewritten to a substituted note's permalink.
+    assert "connected-entity" not in (context_result.metadata.uri or "")
+
+
+@pytest.mark.asyncio
+async def test_build_context_empty_on_unresolved_gibberish_url(context_service, test_graph):
+    """BUG-022-02: a second, independent witness — an exact URL made of pure
+    gibberish tokens must also return empty after the fix.
+
+    Note: in the unit test environment the fuzzy fallback (search_service) returns
+    a nearest-neighbour even for gibberish (no ``semantic_min_similarity`` gate,
+    unlike prod), so before the fix this ALSO substitutes an arbitrary note. The
+    fix bypasses the unscored fallback entirely, so the result is empty regardless
+    of search backend or token content — which is exactly why the fix is robust to
+    the prod ``hybrid`` / ``min_similarity=0.55`` configuration."""
+    url = memory_url.validate_strings("memory://zzz-nonexistent-note-qqqwxyz")
+    context_result = await context_service.build_context(url)
+
+    assert context_result.metadata.primary_count == 0
+    assert context_result.results == []
+
+
+@pytest.mark.asyncio
+async def test_build_context_exact_url_still_resolves(context_service, test_graph):
+    """BUG-022-03: an exact URL that resolves normally is unaffected by the fix
+    (no regression on the nominal path)."""
+    url = memory_url.validate_strings("memory://test-project/test/root")
+    context_result = await context_service.build_context(url)
+
+    assert context_result.metadata.primary_count == 1
+    assert context_result.results[0].primary_result.id == test_graph["root"].id
+
+
+@pytest.mark.asyncio
+async def test_build_context_exact_title_and_path_resolutions_survive_fix(
+    context_service, test_graph
+):
+    """BUG-022-03b: the fix bypasses only the unscored FTS fuzzy step. Exact
+    resolutions 1-4 (permalink, title, file_path, file_path.md) MUST still work
+    through the build_context exact-URL branch, so that a URL addressing a note
+    by title or by file path keeps resolving."""
+    # Resolve by exact title ("Root") — reaches resolve_link, which returns the
+    # title match (step 2) even in strict mode.
+    by_title = await context_service.build_context(memory_url.validate_strings("memory://Root"))
+    assert by_title.metadata.primary_count == 1
+    assert by_title.results[0].primary_result.id == test_graph["root"].id
+
+    # Resolve by exact file_path ("test/Root.md") — reaches resolve_link file
+    # path match (steps 3-4), preserved in strict mode.
+    by_path = await context_service.build_context(
+        memory_url.validate_strings("memory://test/Root.md")
+    )
+    assert by_path.metadata.primary_count == 1
+    assert by_path.results[0].primary_result.id == test_graph["root"].id
+
+
+@pytest.mark.asyncio
+async def test_link_resolver_fuzzy_wikilink_still_works_for_sync(link_resolver, test_graph):
+    """BUG-022-04 (non-regression, critical): the fix is sealed to the
+    build_context call-site. resolve_link's DEFAULT (strict=False) fuzzy
+    matching — used massively to resolve ``[[...]]`` wikilinks during
+    sync/indexing (sync_service, batch_indexer, entity_service,
+    knowledge_router) — MUST remain intact. A partial/approximate wikilink still
+    resolves to its best FTS match."""
+    # "Connectd Entty" (misspelled, no exact permalink/title/file_path) can only
+    # be resolved via the fuzzy FTS fallback. The crisp contract:
+    #   - strict=False (sync/indexing default) → still fuzzy-resolves (non-None).
+    #   - strict=True  (build_context call-site after fix) → returns None.
+    # This proves the fix is sealed to the call-site and did not alter the
+    # resolve_link default relied upon by sync_service/batch_indexer/entity_service.
+    # "Connected Entity" (no trailing number) matches no exact title/permalink/
+    # file_path (real titles are "Connected Entity 1"/"2"), so it can only be
+    # resolved via the fuzzy FTS fallback.
+    fuzzy = await link_resolver.resolve_link("Connected Entity", strict=False)
+    assert fuzzy is not None, "sync fuzzy wikilink resolution regressed"
+
+    strict = await link_resolver.resolve_link("Connected Entity", strict=True)
+    assert strict is None, "strict mode must not fuzzy-resolve"

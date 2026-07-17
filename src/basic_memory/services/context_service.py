@@ -177,8 +177,19 @@ class ContextService:
                         )
 
                         if not primary and self.link_resolver:
+                            # Trigger: an EXACT memory:// URL (no wildcard) did not
+                            #   match a permalink directly.
+                            # Why: strict=True keeps the exact resolutions (permalink,
+                            #   title, file_path) but bypasses the unscored FTS fuzzy
+                            #   top-1 fallback. Without it, an unresolved-but-token-
+                            #   matchable URL silently substitutes an arbitrary note
+                            #   (BUG-022) — indistinguishable from a real hit.
+                            # Outcome: unresolved exact URLs return empty ("No results
+                            #   found"), symmetrically to read_note. The strict=False
+                            #   default of resolve_link is untouched for [[wikilink]]
+                            #   resolution during sync/indexing.
                             entity = await self.link_resolver.resolve_link(
-                                path, use_search=True, strict=False
+                                path, use_search=True, strict=True
                             )
                             if entity:
                                 logger.debug(

@@ -339,6 +339,16 @@ Contexte double : ce repo (1) fait tourner le serveur MCP du **vault PKM personn
   - Une opération est **single-project** : le projet résolu (param explicite ou contexte) fait foi, jamais de fallback silencieux vers un autre projet.
   - Les permalinks workspace-qualified (`workspace/project/...`) ne contournent pas la résolution — validation via `workspace_context.validate_workspace_permalink_context_values`.
   - Côté bulk : I-6 (identifiers `memory://` et workspace-qualified rejetés au schéma).
+  - Pas de substitution silencieuse d'une note non demandée — y compris **intra-projet, cross-note** (voir la zone « Résolution de contexte » ci-dessous). L'invariant « single-project » couvre le bleed cross-projet ; il ne dispense PAS de la fidélité de résolution à l'intérieur d'un même projet (BUG-022).
+
+### Résolution de contexte (build_context / fidélité de résolution)
+
+- **Fichiers** : `src/basic_memory/services/context_service.py` (branche URL exacte de `build_context`, ~l.179-192 — bascule lookup exact `search_repository.search(permalink=...)` → `link_resolver.resolve_link(...)`), `src/basic_memory/services/link_resolver.py` (`_resolve_in_project`, étape 5 « fall back to search », ~l.379-397 — retourne `results[0]` du FTS sans seuil de score).
+- **Risque** : les URLs `memory://` sont des entrées non fiables (générées par un LLM, mal orthographiées, pointant vers des notes renommées/supprimées). Une URL **exacte** (sans `*`) qui ne résout pas mais dont les tokens matchent le corpus (FTS ou nearest-neighbor sémantique en mode `hybrid`) déclenchait une **substitution silencieuse** : `build_context` retournait une note arbitraire (`results[0]`, sans seuil), avec `metadata.uri` réécrit vers le permalink de la note trouvée — indiscernable d'un hit voulu par l'appelant. Un agent traite alors le contenu d'une note qu'il n'a pas demandée comme la réponse légitime, sans signal de rattrapage (le garde-fou « pivot à 1 échec MCP » ne se déclenche jamais, aucun échec n'étant perçu). C'est l'analogue **intra-projet cross-note** du bleed cross-projet de la zone « Isolation » (lettre non violée, esprit violé).
+- **Invariants** :
+  - L'appel `resolve_link` du call-site `build_context` (URL exacte) est **`strict=True`** : les résolutions exactes (permalink, titre, file_path) survivent, mais le fallback FTS/fuzzy non seuillé (`results[0]`) est bypassé. Une URL exacte non résolue rend un résultat **vide** (« No results found », `primary_count: 0`), symétriquement à `read_note`. Ne jamais repasser ce call-site en `strict=False`.
+  - Le comportement `strict=False` par défaut de `resolve_link` reste **inchangé** : il est massivement utilisé pour résoudre les wikilinks `[[...]]` pendant sync/indexing (`sync_service`, `batch_indexer`, `entity_service`, `knowledge_router`) — ces call-sites ONT BESOIN du fuzzy. Le fix est scellé au seul call-site `build_context` ; ne pas modifier la signature ni le défaut de `resolve_link`.
+  - Si un jour l'étape 5 (fuzzy `results[0]`) est réactivée pour un usage `build_context`, elle doit appliquer un **seuil de score** (`best_match.score`, bm25/rank) explicite — jamais un top-1 inconditionnel.
 
 ### Parsing markdown / frontmatter (entrée non fiable)
 
