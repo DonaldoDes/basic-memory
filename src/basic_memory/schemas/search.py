@@ -124,6 +124,10 @@ class SearchResult(BaseModel):
     permalink: Optional[str]
     content: Optional[str] = None
     matched_chunk: Optional[str] = None
+    # Short ~200-char digest persisted at indexation (US-006a), exposed alongside
+    # matched_chunk (distinct semantics: matched_chunk = the excerpt that matched
+    # the query; summary = a stable short digest of the note) — US-006b.
+    summary: Optional[str] = None
     file_path: str
 
     metadata: Optional[dict] = None

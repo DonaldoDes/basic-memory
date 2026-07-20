@@ -39,6 +39,9 @@ class ContextResultRow:
     relation_type: Optional[str] = None
     to_name: Optional[str] = None
     content: Optional[str] = None
+    # Short ~200-char digest projected from search_index.summary (US-006a/006b).
+    # Symmetric to content: populated on entity rows, NULL on relation rows.
+    summary: Optional[str] = None
     category: Optional[str] = None
     entity_id: Optional[int] = None
     metadata: Optional[dict] = None
@@ -431,6 +434,7 @@ class ContextService:
                 relation_type=row.relation_type,
                 to_name=row.to_name,
                 content=row.content,
+                summary=row.summary,
                 category=row.category,
                 entity_id=row.entity_id,
                 metadata=row.metadata,
@@ -467,6 +471,7 @@ class ContextService:
                 CAST(NULL AS TEXT) as relation_type,
                 CAST(NULL AS TEXT) as to_name,
                 CAST(NULL AS TEXT) as content,
+                si.summary as summary,
                 CAST(NULL AS TEXT) as category,
                 CAST(NULL AS INTEGER) as entity_id,
                 si.metadata,
@@ -525,6 +530,10 @@ class ContextService:
                     ELSE NULL
                 END as to_name,
                 CAST(NULL AS TEXT) as content,
+                CASE
+                    WHEN step_type = 1 THEN CAST(NULL AS TEXT)
+                    ELSE si.summary
+                END as summary,
                 CAST(NULL AS TEXT) as category,
                 CAST(NULL AS INTEGER) as entity_id,
                 CASE
@@ -600,6 +609,7 @@ class ContextService:
             relation_type,
             to_name,
             content,
+            summary,
             category,
             entity_id,
             metadata,
@@ -609,7 +619,7 @@ class ContextService:
         FROM entity_graph
         WHERE depth > 0
         GROUP BY type, id, title, permalink, file_path, from_id, to_id,
-                 relation_type, to_name, content, category, entity_id, metadata, root_id, created_at
+                 relation_type, to_name, content, summary, category, entity_id, metadata, root_id, created_at
         ORDER BY depth, type, id
         LIMIT :max_results
        """)
@@ -640,6 +650,7 @@ class ContextService:
                 NULL as relation_type,
                 NULL as to_name,
                 NULL as content,
+                si.summary as summary,
                 NULL as category,
                 NULL as entity_id,
                 si.metadata,
@@ -670,6 +681,7 @@ class ContextService:
                 r.relation_type,
                 r.to_name,
                 NULL as content,
+                NULL as summary,
                 NULL as category,
                 NULL as entity_id,
                 NULL as metadata,
@@ -711,6 +723,7 @@ class ContextService:
                 NULL as relation_type,
                 NULL as to_name,
                 NULL as content,
+                si.summary as summary,
                 NULL as category,
                 NULL as entity_id,
                 si.metadata,
@@ -747,6 +760,7 @@ class ContextService:
             relation_type,
             to_name,
             content,
+            summary,
             category,
             entity_id,
             metadata,
@@ -756,7 +770,7 @@ class ContextService:
         FROM entity_graph
         WHERE depth > 0
         GROUP BY type, id, title, permalink, file_path, from_id, to_id,
-                 relation_type, to_name, content, category, entity_id, metadata, root_id, created_at
+                 relation_type, to_name, content, summary, category, entity_id, metadata, root_id, created_at
         ORDER BY depth, type, id
         LIMIT :max_results
        """)

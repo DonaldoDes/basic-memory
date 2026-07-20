@@ -304,3 +304,80 @@ def test_format_entity_block_renders_unresolved_relations_by_name():
     assert "- see_also [[edit-note(3)]]" in block
     assert "- see_also [[bm-note(5)]]" in block
     assert "[[None]]" not in block
+
+
+# ---------------------------------------------------------------------------
+# US-006b (SUM-16 / SUM-18): build_context exposes the persisted summary on
+# related entities in both JSON and markdown output.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sum16_build_context_exposes_summary_on_related(client, test_project):
+    """SUM-16: related entities carry `summary` in JSON, and it is rendered in
+    the markdown output."""
+    await write_note(
+        project=test_project.name,
+        title="Target Note",
+        directory="test",
+        content="# Target Note\n\nSome body about the target.",
+        metadata={"description": "Digest of the target note."},
+    )
+    await write_note(
+        project=test_project.name,
+        title="Hub Note",
+        directory="test",
+        content="# Hub Note\n\n- relates_to [[Target Note]]\n",
+        metadata={"description": "Digest of the hub note."},
+    )
+
+    # JSON: the related entity exposes the summary field, populated.
+    result = await build_context(
+        project=test_project.name, url="memory://test/hub-note", output_format="json"
+    )
+    assert isinstance(result, dict)
+    related_entities = [r for r in result["results"][0]["related_results"] if r["type"] == "entity"]
+    assert related_entities, "expected a related entity"
+    target = next((r for r in related_entities if r["title"] == "Target Note"), None)
+    assert target is not None
+    assert target["summary"] == "Digest of the target note."
+
+    # Markdown: the summary is rendered under the related item.
+    text_out = await build_context(
+        project=test_project.name, url="memory://test/hub-note", output_format="text"
+    )
+    assert isinstance(text_out, str)
+    assert "Digest of the target note." in text_out
+
+
+@pytest.mark.asyncio
+async def test_sum18_smoke_both_tools_render_summary(client, test_project):
+    """SUM-18 (e2e/smoke): a summary is visible via build_context markdown and
+    via search_notes markdown for the same note."""
+    from basic_memory.mcp.tools import search_notes
+
+    await write_note(
+        project=test_project.name,
+        title="Findable Note",
+        directory="test",
+        content="# Findable Note\n\nBody discussing widgets and gadgets.",
+        metadata={"description": "A short digest about widgets."},
+    )
+    await write_note(
+        project=test_project.name,
+        title="Origin Note",
+        directory="test",
+        content="# Origin Note\n\n- mentions [[Findable Note]]\n",
+        metadata={"description": "Digest of the origin note."},
+    )
+
+    ctx_text = await build_context(
+        project=test_project.name, url="memory://test/origin-note", output_format="text"
+    )
+    assert "A short digest about widgets." in ctx_text
+
+    search_text = await search_notes(
+        project=test_project.name, query="widgets", output_format="text"
+    )
+    assert isinstance(search_text, str)
+    assert "A short digest about widgets." in search_text

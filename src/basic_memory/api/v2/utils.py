@@ -118,6 +118,10 @@ async def to_graph_context(
                         title=_required_str(item.title, "title"),
                         permalink=item.permalink,
                         content=item.content,
+                        # Populated for both the primary (SearchIndexRow.summary,
+                        # hydrated by US-006a) and related entities
+                        # (ContextResultRow.summary, projected by the CTE) — US-006b.
+                        summary=getattr(item, "summary", None),
                         file_path=_required_str(item.file_path, "file_path"),
                         created_at=item.created_at,
                         metadata=metadata,
@@ -277,6 +281,7 @@ async def to_search_results(
                         entity=parent_entity.permalink if parent_entity else None,
                         content=result.content,
                         matched_chunk=result.matched_chunk_text,
+                        summary=result.summary,
                         file_path=_required_str(result.file_path, "file_path"),
                         metadata=result.metadata,
                         entity_id=entity_id,

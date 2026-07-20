@@ -2273,3 +2273,67 @@ def test_search_notes_parse_str_list_rejects_non_string_list_elements_in_place()
     # All-string lists still work correctly.
     assert parse_str_list(["note", "task"]) == ["note", "task"]
     assert parse_str_list(["note,task"]) == ["note", "task"]
+
+
+# ---------------------------------------------------------------------------
+# US-006b (SUM-17): search_notes exposes the persisted summary in JSON and
+# markdown, in addition to the existing matched_chunk.
+# ---------------------------------------------------------------------------
+
+
+def test_sum17_format_search_markdown_renders_summary():
+    """SUM-17 (unit): _format_search_markdown renders summary in addition to
+    the matched_chunk line."""
+    from basic_memory.schemas.search import SearchResult, SearchItemType
+
+    result = SearchResponse(
+        results=[
+            SearchResult(
+                title="My Note",
+                type=SearchItemType.ENTITY,
+                score=0.85,
+                permalink="docs/my-note",
+                file_path="docs/My Note.md",
+                matched_chunk="This is a matching snippet",
+                summary="A concise digest of my note.",
+            ),
+        ],
+        current_page=1,
+        page_size=10,
+    )
+    text = _format_search_markdown(result, "test-project", "my query")
+    assert "match: This is a matching snippet" in text
+    assert "summary: A concise digest of my note." in text
+
+
+@pytest.mark.asyncio
+async def test_sum17_search_notes_exposes_summary(client, test_project):
+    """SUM-17 (e2e): search_notes returns summary in JSON and renders it in
+    markdown."""
+    await write_note(
+        project=test_project.name,
+        title="Summary Search Note",
+        directory="test",
+        content="# Summary Search Note\n\nBody about quokkas and platypus.",
+        metadata={"description": "A digest about quokkas."},
+    )
+
+    response = await search_notes(
+        project=test_project.name,
+        query="quokkas",
+        search_type="text",
+        output_format="json",
+    )
+    assert isinstance(response, dict), f"search failed: {response}"
+    hit = next((r for r in response["results"] if r["title"] == "Summary Search Note"), None)
+    assert hit is not None
+    assert hit["summary"] == "A digest about quokkas."
+
+    text_out = await search_notes(
+        project=test_project.name,
+        query="quokkas",
+        search_type="text",
+        output_format="text",
+    )
+    assert isinstance(text_out, str)
+    assert "A digest about quokkas." in text_out

@@ -862,3 +862,72 @@ async def test_link_resolver_fuzzy_wikilink_still_works_for_sync(link_resolver, 
 
     strict = await link_resolver.resolve_link("Connected Entity", strict=True)
     assert strict is None, "strict mode must not fuzzy-resolve"
+
+
+# ---------------------------------------------------------------------------
+# US-006b: build_context must project search_index.summary onto related entity
+# rows (SUM-13 SQLite / SUM-14 Postgres — same body, dual backend). The summary
+# column is populated by US-006a; this US only exposes it.
+#
+# Sensitive zone ("Résolution de contexte"): the projection is orthogonal to the
+# BUG-022 strict-resolution seal — an adversarial test re-asserts that adding
+# si.summary to the CTE does not reintroduce silent note substitution and that
+# the UNION ALL arity stays consistent (a broken arity raises OperationalError).
+# ---------------------------------------------------------------------------
+
+from sqlalchemy import text as _sql_text  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_sum13_find_related_projects_summary_on_entities_null_on_relations(
+    context_service, test_graph
+):
+    """SUM-13/14: the recursive CTE projects search_index.summary onto related
+    ENTITY rows; RELATION rows carry summary = NULL (symmetric to content)."""
+    sentinel = {
+        test_graph["connected1"].id: "Summary of connected one.",
+        test_graph["connected2"].id: "Summary of connected two.",
+    }
+    for eid, summ in sentinel.items():
+        await context_service.search_repository.execute_query(
+            _sql_text("UPDATE search_index SET summary = :s WHERE id = :id AND type = 'entity'"),
+            params={"s": summ, "id": eid},
+        )
+
+    related = await context_service.find_related(
+        [("entity", test_graph["root"].id)], max_depth=3, max_results=100
+    )
+
+    entity_rows = {r.id: r for r in related if r.type == "entity"}
+    assert entity_rows[test_graph["connected1"].id].summary == "Summary of connected one."
+    assert entity_rows[test_graph["connected2"].id].summary == "Summary of connected two."
+
+    # Adversarial (arity/CAST): relation rows must never carry an entity summary.
+    relation_rows = [r for r in related if r.type == "relation"]
+    assert relation_rows, "expected at least one relation row in the traversal"
+    assert all(r.summary is None for r in relation_rows), (
+        "a relation row leaked a non-null summary — UNION ALL summary column "
+        "must be NULL on relation branches"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sum13_summary_projection_preserves_strict_resolution(context_service, test_graph):
+    """Adversarial (sensitive zone, BUG-022 non-regression): adding si.summary to
+    the CTE must not reintroduce the silent substitution of an unresolved exact
+    URL, and a resolved URL must still traverse with summary available on related.
+    """
+    # Unresolved exact URL whose tokens fuzzy-match the corpus → still empty.
+    empty = await context_service.build_context(memory_url.validate_strings("memory://connected"))
+    assert empty.metadata.primary_count == 0
+    assert empty.results == []
+    assert "connected-entity" not in (empty.metadata.uri or "")
+
+    # Resolved URL → related entities expose the summary attribute end-to-end.
+    ctx = await context_service.build_context(
+        memory_url.validate_strings("memory://test-project/test/root")
+    )
+    assert ctx.metadata.primary_count == 1
+    related_entities = [r for r in ctx.results[0].related_results if r.type == "entity"]
+    assert related_entities, "expected related entities in the traversal"
+    assert all(hasattr(r, "summary") for r in related_entities)
