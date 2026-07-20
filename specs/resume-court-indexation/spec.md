@@ -132,10 +132,118 @@ Note double-backend : le harness rejoue les mêmes fichiers de test sous SQLite 
 (`BASIC_MEMORY_TEST_POSTGRES=1`). SUM-07/08 et SUM-10/11 sont le même test exécuté sous les deux
 configurations ; SUM-09 vérifie l'égalité à la valeur Python calculée, garantissant la parité sous chaque run.
 
-## Hors scope (US-006b)
+## Hors scope (US-006a — couvert par US-006b ci-dessous)
+
+Le périmètre suivant était hors scope d'US-006a. Il est **désormais couvert par US-006b** (section
+« Exposition » ci-dessous) :
 
 - Projection `si.summary` dans les CTE `build_context`.
 - Champ `EntitySummary.summary` et exposition JSON/markdown.
 - Exposition sur `search_notes`.
 - Renderers MCP `build_context.py` / `search.py`, sérialiseur `api/v2/utils.py`.
+
+---
+
+# Exposition du résumé — build_context et search_notes (US-006b)
+
+Seconde moitié du split de US-006 (ADR-007 § Decision 1, 3). Cette section couvre **uniquement la couche
+exposition** : le résumé déjà persisté par US-006a (colonne `search_index.summary`, hydraté sur
+`SearchIndexRow.summary`) est désormais rendu visible sur les deux surfaces MCP. **Aucune nouvelle donnée
+n'est calculée ni persistée** — cette couche consomme exclusivement la colonne existante.
+
+Référence normative : ADR-007 (Decisions 1, 3) et US-006b. En cas de divergence, l'US-006b fait foi.
+
+## Levée du `[NEEDS CLARIFICATION]` (couverture de peuplement primaire vs related)
+
+ADR-007 § Decision 3 laissait ouvert : le résultat **primaire** de `build_context` et les résultats de
+`search_notes` passent-ils par la même classe `EntitySummary`, ou le primaire est-il un `SearchIndexRow` ?
+Résolution par lecture du code (`context_service.py`, `api/v2/utils.py`, `schemas/memory.py`,
+`schemas/search.py`) :
+
+| Surface | Résultat | Type interne (service) | Classe de sortie (schéma public) | `summary` disponible avant 006b ? |
+|---------|----------|------------------------|----------------------------------|-----------------------------------|
+| `build_context` | **primaire** | `SearchIndexRow` | `EntitySummary` | **Oui** — `SearchIndexRow.summary` hydraté par US-006a |
+| `build_context` | **related** | `ContextResultRow` (CTE `find_related`) | `EntitySummary` | Non — la CTE ne projette pas encore `si.summary` |
+| `search_notes` | résultats | `SearchIndexRow` | `SearchResult` | **Oui** — `SearchIndexRow.summary` hydraté par US-006a |
+
+Conclusions tranchées :
+
+1. **build_context** : primaire ET related sont sérialisés vers la **même** classe `EntitySummary`
+   (helper `to_summary` dans `api/v2/utils.py`). Le primaire (`SearchIndexRow`) porte déjà `summary`
+   depuis US-006a ; il suffit que `to_summary` le lise. Les related (`ContextResultRow`) exigent la
+   projection CTE + un nouveau champ dataclass. → **`summary` est peuplé sur le primaire ET les related.**
+2. **search_notes** : les résultats passent par `SearchResult` (schéma distinct d'`EntitySummary`), et non
+   par `EntitySummary`. `SearchResult` reçoit un nouveau champ `summary`, alimenté depuis
+   `SearchIndexRow.summary` (déjà hydraté).
+
+Décision : **peupler `summary` sur le primaire de `build_context`** (utile, gratuit — la donnée est déjà
+présente sur `SearchIndexRow`), en plus des related. Le contrat n'est pas modifié — seule la couverture de
+peuplement l'est, comme cadré par l'ADR.
+
+## 1. Projection CTE `build_context` (`services/context_service.py`)
+
+- `ContextResultRow` (dataclass) : nouveau champ `summary: Optional[str] = None` (symétrique à `content`).
+- **CTE SQLite** (`_build_sqlite_query`, 3 branches `UNION ALL`) :
+  - branche de base (seed entity) et branche entités-connectées : `si.summary as summary` (LEFT JOIN
+    `search_index si` déjà présent) ;
+  - branche relations : `NULL as summary` (symétrique à `NULL as content`) ;
+  - `summary` ajouté au `SELECT DISTINCT` final et au `GROUP BY`.
+- **CTE Postgres** (`_build_postgres_query`, base + terme récursif `CROSS JOIN LATERAL`) :
+  - branche de base : `si.summary as summary` ;
+  - terme récursif : `CASE WHEN step_type = 1 THEN CAST(NULL AS TEXT) ELSE si.summary END as summary` ;
+  - `summary` ajouté au `SELECT DISTINCT` final et au `GROUP BY`.
+- `find_related` : mapping `row → ContextResultRow` reçoit `summary=row.summary`.
+
+Contrainte d'arité `UNION ALL` : la colonne `summary` est présente dans **toutes** les branches, à la même
+position (juste après `content`), sur les deux backends.
+
+## 2. Contrat public `EntitySummary` (`schemas/memory.py`) — additif
+
+- Ajout `summary: Optional[str] = None`.
+- **Conservation** de `content: Optional[str]` avec sa sémantique inchangée, marqué `DEPRECATED` en
+  commentaire (retrait différé à un bump majeur ≥ v0.19, ticket de dette séparé). Pas de rename cassant.
+
+## 3. Contrat public `SearchResult` (`schemas/search.py`) — additif
+
+- Ajout `summary: Optional[str] = None`, en plus du `matched_chunk` existant (sémantiques distinctes :
+  `matched_chunk` = extrait ayant matché la requête ; `summary` = digest court stable de la note).
+
+## 4. Sérialiseurs (`api/v2/utils.py`)
+
+- `to_summary` (build_context, branche `EntitySummary`) : `summary=getattr(item, "summary", None)` —
+  couvre le primaire (`SearchIndexRow.summary`) et les related (`ContextResultRow.summary`).
+- `to_search_results` (search_notes → `SearchResult`) : `summary=result.summary`.
+
+## 5. Renderers MCP
+
+- `mcp/tools/build_context.py` (`_format_entity_block`) : rendu markdown du `summary` sur les entités
+  related (sous le lien `[[title]] (permalink)`). Le JSON est automatique via `model_dump`.
+- `mcp/tools/search.py` (`_format_search_markdown`) : ligne `- summary: …` en plus de
+  `- match: …` (matched_chunk). Le JSON est automatique via `model_dump`.
+
+## Test IDs (ADR-007)
+
+| ID | Type | Backend | Couverture |
+|----|------|---------|-----------|
+| SUM-13 | Integration | SQLite | CTE `build_context` : related portent `summary` peuplé, relations `summary = NULL` |
+| SUM-14 | Integration | Postgres | Idem SUM-13 (arité `UNION ALL` + `CAST` respectés) |
+| SUM-15 | Unit | — | `EntitySummary` additif : `summary` présent et peuplé, `content` conservé (compat v0.18) |
+| SUM-16 | Integration | — | Rendu MCP `build_context` : `summary` présent en markdown ET JSON sur les related |
+| SUM-17 | Integration | — | Rendu MCP `search_notes` : `summary` présent en markdown ET JSON, en plus de `matched_chunk` |
+| SUM-18 | E2E/smoke | — | Consommation via les deux outils MCP : le markdown affiche un résumé par related/résultat qui en a un |
+
+## Non-régression (US-006a et BUG-022)
+
+- Aucune modification de `search_service.py`, `compute_summary`, la migration Alembic, le DDL de
+  `search_index` (colonne `summary` déjà en place). US-006b consomme, ne recalcule pas.
+- La logique de résolution stricte `build_context` (BUG-022, `context_service.py` branche URL exacte,
+  `resolve_link(strict=True)`) est **inchangée** : la projection `si.summary` est orthogonale à la
+  résolution du primaire. Les tests BUG-022 restent verts.
+
+## Hors scope (US-006b)
+
+- Calcul/persistance du résumé (US-006a).
+- Retrait de `EntitySummary.content` (breaking, différé ≥ v0.19).
+- Modification du cap 4000 de `SearchIndexRow.content`.
+- Génération de résumé par LLM.
 - Modification du cap 4000 de `SearchIndexRow.content`.
