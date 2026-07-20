@@ -32,6 +32,7 @@ class SearchIndexRow:
     title: Optional[str] = None  # entity
     content_stems: Optional[str] = None  # entity, observation
     content_snippet: Optional[str] = None  # entity, observation
+    summary: Optional[str] = None  # entity: short ~200-char digest (US-006a)
     entity_id: Optional[int] = None  # observations
     category: Optional[str] = None  # observations
     from_id: Optional[int] = None  # relations
@@ -87,6 +88,7 @@ class SearchIndexRow:
             "title": self.title,
             "content_stems": self.content_stems,
             "content_snippet": self.content_snippet,
+            "summary": self.summary,
             "permalink": self.permalink,
             "file_path": self.file_path,
             "type": self.type,

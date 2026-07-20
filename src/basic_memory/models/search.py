@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS search_index (
     title TEXT,
     content_stems TEXT,
     content_snippet TEXT,
+    summary TEXT,
     permalink VARCHAR,
     file_path VARCHAR,
     type VARCHAR,
@@ -66,6 +67,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
     title,                 -- Title for searching
     content_stems,         -- Main searchable content split into stems
     content_snippet,       -- File content snippet for display
+    summary UNINDEXED,     -- Short ~200-char digest for display (US-006a, not searchable)
     permalink,             -- Stable identifier (now indexed for path search)
     file_path UNINDEXED,   -- Physical location
     type UNINDEXED,        -- entity/relation/observation

@@ -416,13 +416,13 @@ class SearchRepositoryBase(ABC):
             await session.execute(
                 text("""
                     INSERT INTO search_index (
-                        id, title, content_stems, content_snippet, permalink, file_path, type, metadata,
+                        id, title, content_stems, content_snippet, summary, permalink, file_path, type, metadata,
                         from_id, to_id, relation_type,
                         entity_id, category,
                         created_at, updated_at,
                         project_id
                     ) VALUES (
-                        :id, :title, :content_stems, :content_snippet, :permalink, :file_path, :type, :metadata,
+                        :id, :title, :content_stems, :content_snippet, :summary, :permalink, :file_path, :type, :metadata,
                         :from_id, :to_id, :relation_type,
                         :entity_id, :category,
                         :created_at, :updated_at,
@@ -463,13 +463,13 @@ class SearchRepositoryBase(ABC):
             await session.execute(
                 text("""
                     INSERT INTO search_index (
-                        id, title, content_stems, content_snippet, permalink, file_path, type, metadata,
+                        id, title, content_stems, content_snippet, summary, permalink, file_path, type, metadata,
                         from_id, to_id, relation_type,
                         entity_id, category,
                         created_at, updated_at,
                         project_id
                     ) VALUES (
-                        :id, :title, :content_stems, :content_snippet, :permalink, :file_path, :type, :metadata,
+                        :id, :title, :content_stems, :content_snippet, :summary, :permalink, :file_path, :type, :metadata,
                         :from_id, :to_id, :relation_type,
                         :entity_id, :category,
                         :created_at, :updated_at,

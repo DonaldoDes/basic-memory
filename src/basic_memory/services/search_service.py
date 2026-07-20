@@ -91,6 +91,100 @@ def _strip_nul(value: str) -> str:
     return value.replace("\x00", "")
 
 
+# --- Short summary (US-006a, ADR-007 Decision 4) ---
+
+# Target length for the persisted short summary. Centralized so the DDL, the
+# calculation and the tests share a single source of truth.
+SUMMARY_MAX_LENGTH = 200
+
+# Minimum length at which a sentence-ending cut is accepted, so a summary is
+# never trimmed to an uselessly short fragment just because an early period
+# happens to fall inside the window [SUMMARY_SENTENCE_WINDOW, SUMMARY_MAX_LENGTH].
+SUMMARY_SENTENCE_WINDOW = 120
+
+_FRONTMATTER_BLOCK_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
+_SENTENCE_END_RE = re.compile(r"[.!?]")
+
+
+def _clean_content_lead(content_snippet: str) -> str:
+    """Extract a one-line lead from indexed content.
+
+    Removes a leading residual frontmatter block and leading markdown heading /
+    blank lines, then normalizes all whitespace to single spaces. Returns an
+    empty string if nothing usable remains.
+    """
+    text_value = content_snippet.lstrip()
+
+    # Drop a residual frontmatter block if the snippet still carries one.
+    match = _FRONTMATTER_BLOCK_RE.match(text_value)
+    if match:
+        text_value = text_value[match.end() :]
+
+    # Skip only the *leading* run of heading lines and blank lines; keep the
+    # rest of the body once real content starts.
+    lines = text_value.splitlines()
+    kept: list[str] = []
+    started = False
+    for line in lines:
+        stripped = line.strip()
+        if not started:
+            if not stripped or stripped.startswith("#"):
+                continue
+            started = True
+        kept.append(line)
+
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
+
+
+def compute_summary(description: str | None, content_snippet: str | None) -> str | None:
+    """Compute the short summary persisted at indexation (pure, no LLM).
+
+    Priority: non-empty frontmatter ``description`` → cleaned lead of
+    ``content_snippet`` → ``None`` (clean degradation, never raises).
+
+    The result is a single line (no newline), NUL-stripped, and bounded to
+    ``SUMMARY_MAX_LENGTH`` with a clean cut: on a sentence end inside the
+    tolerance window when available, otherwise on the last word boundary before
+    the limit with a trailing ``…``. The suffix is only added on a mid-content
+    (word-boundary) truncation.
+    """
+    source: str | None = None
+    if description and description.strip():
+        source = description
+    elif content_snippet:
+        lead = _clean_content_lead(content_snippet)
+        if lead:
+            source = lead
+
+    if source is None:
+        return None
+
+    # Sanitize: strip NUL, collapse all whitespace (incl. CR/LF/TAB) to one line.
+    text_value = re.sub(r"\s+", " ", _strip_nul(source)).strip()
+    if not text_value:
+        return None
+
+    if len(text_value) <= SUMMARY_MAX_LENGTH:
+        return text_value
+
+    window = text_value[:SUMMARY_MAX_LENGTH]
+
+    # Prefer the last sentence end within the tolerance window — reads as a
+    # complete sentence, so no truncation suffix is added.
+    sentence_cut = -1
+    for match in _SENTENCE_END_RE.finditer(window):
+        if match.end() >= SUMMARY_SENTENCE_WINDOW:
+            sentence_cut = match.end()
+    if sentence_cut != -1:
+        return window[:sentence_cut].strip()
+
+    # Fall back to the last word boundary before the limit; never cut mid-word.
+    space_cut = window.rfind(" ")
+    if space_cut == -1:
+        space_cut = SUMMARY_MAX_LENGTH
+    return window[:space_cut].rstrip() + "…"
+
+
 def _mtime_to_datetime(entity: Entity) -> datetime:
     """Convert entity mtime (file modification time) to datetime.
 
@@ -867,9 +961,14 @@ class SearchService:
                 "note_type": entity.note_type,
             }
             if not content:
-                logger.warning(
-                    f"No content available for {entity.title} (entity_id={entity.id})"
-                )
+                logger.warning(f"No content available for {entity.title} (entity_id={entity.id})")
+
+            # Compute the short summary in the same pass (US-006a). The frontmatter
+            # `description` lives in entity.entity_metadata (not search_index.metadata).
+            entity_description = (
+                entity.entity_metadata.get("description") if entity.entity_metadata else None
+            )
+            entity_summary = compute_summary(entity_description, content_snippet)
 
             rows_to_index.append(
                 SearchIndexRow(
@@ -878,6 +977,7 @@ class SearchService:
                     title=_strip_nul(entity.title),
                     content_stems=entity_content_stems,
                     content_snippet=content_snippet,
+                    summary=entity_summary,
                     permalink=entity.permalink,
                     file_path=entity.file_path,
                     entity_id=entity.id,

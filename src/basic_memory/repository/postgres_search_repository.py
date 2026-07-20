@@ -117,13 +117,13 @@ class PostgresSearchRepository(SearchRepositoryBase):
             await session.execute(
                 text("""
                     INSERT INTO search_index (
-                        id, title, content_stems, content_snippet, permalink, file_path, type, metadata,
+                        id, title, content_stems, content_snippet, summary, permalink, file_path, type, metadata,
                         from_id, to_id, relation_type,
                         entity_id, category,
                         created_at, updated_at,
                         project_id
                     ) VALUES (
-                        :id, :title, :content_stems, :content_snippet, :permalink, :file_path, :type, :metadata,
+                        :id, :title, :content_stems, :content_snippet, :summary, :permalink, :file_path, :type, :metadata,
                         :from_id, :to_id, :relation_type,
                         :entity_id, :category,
                         :created_at, :updated_at,
@@ -134,6 +134,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                         title = EXCLUDED.title,
                         content_stems = EXCLUDED.content_stems,
                         content_snippet = EXCLUDED.content_snippet,
+                        summary = EXCLUDED.summary,
                         file_path = EXCLUDED.file_path,
                         type = EXCLUDED.type,
                         metadata = EXCLUDED.metadata,
@@ -666,13 +667,13 @@ class PostgresSearchRepository(SearchRepositoryBase):
             await session.execute(
                 text("""
                     INSERT INTO search_index (
-                        id, title, content_stems, content_snippet, permalink, file_path, type, metadata,
+                        id, title, content_stems, content_snippet, summary, permalink, file_path, type, metadata,
                         from_id, to_id, relation_type,
                         entity_id, category,
                         created_at, updated_at,
                         project_id
                     ) VALUES (
-                        :id, :title, :content_stems, :content_snippet, :permalink, :file_path, :type, :metadata,
+                        :id, :title, :content_stems, :content_snippet, :summary, :permalink, :file_path, :type, :metadata,
                         :from_id, :to_id, :relation_type,
                         :entity_id, :category,
                         :created_at, :updated_at,
@@ -683,6 +684,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                         title = EXCLUDED.title,
                         content_stems = EXCLUDED.content_stems,
                         content_snippet = EXCLUDED.content_snippet,
+                        summary = EXCLUDED.summary,
                         file_path = EXCLUDED.file_path,
                         type = EXCLUDED.type,
                         metadata = EXCLUDED.metadata,
@@ -984,6 +986,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 search_index.relation_type,
                 search_index.entity_id,
                 search_index.content_snippet,
+                search_index.summary,
                 search_index.category,
                 search_index.created_at,
                 search_index.updated_at,
@@ -1042,6 +1045,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 relation_type=row.relation_type,
                 entity_id=row.entity_id,
                 content_snippet=row.content_snippet,
+                summary=row.summary,
                 category=row.category,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
