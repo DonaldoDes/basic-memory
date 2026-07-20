@@ -129,7 +129,14 @@ class EntitySummary(BaseModel):
     entity_id: Optional[int] = None
     permalink: Optional[str]
     title: str
+    # DEPRECATED(v0.19): full (4000-char capped) content of the primary result.
+    # Superseded by `summary` for the short digest use case; retained unchanged for
+    # backward compatibility (US-006b, ADR-007 Decision 3). Removal deferred to a
+    # major bump (tracked in a separate debt ticket).
     content: Optional[str] = None
+    # Short ~200-char digest persisted at indexation (US-006a). Populated on both
+    # the primary result and related entities (US-006b).
+    summary: Optional[str] = None
     file_path: str
     created_at: Annotated[
         datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})

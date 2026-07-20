@@ -334,6 +334,10 @@ def _format_search_markdown(result: SearchResponse, project: str, query: str | N
         parts.append(f"### {r.title}")
         parts.append(f"- permalink: {r.permalink}")
         parts.append(f"- score: {r.score:.4f}")
+        # Short digest persisted at indexation (US-006b), rendered in addition to
+        # the query-matched chunk below — distinct signals, both useful.
+        if getattr(r, "summary", None):
+            parts.append(f"- summary: {r.summary}")
         if r.matched_chunk:
             parts.append(f"- match: {r.matched_chunk[:200]}")
         parts.append("")
@@ -1162,9 +1166,7 @@ async def search_notes(
                 # Independent of the enable_dataview flag (ADR-003 §4 — flag
                 # independence). Detection is on-the-fly per result content.
                 if enable_bases and result.results:
-                    logger.info(
-                        f"Enriching {len(result.results)} search results with Bases"
-                    )
+                    logger.info(f"Enriching {len(result.results)} search results with Bases")
                     bases_integration = create_bases_integration()
 
                     for search_result in result.results:
@@ -1186,12 +1188,8 @@ async def search_notes(
                                 if bases_results:
                                     if not search_result.metadata:
                                         search_result.metadata = {}
-                                    search_result.metadata["bases_results"] = (
-                                        bases_results
-                                    )
-                                    search_result.metadata["bases_query_count"] = len(
-                                        bases_results
-                                    )
+                                    search_result.metadata["bases_results"] = bases_results
+                                    search_result.metadata["bases_query_count"] = len(bases_results)
                             except Exception as e:  # pragma: no cover
                                 logger.warning(
                                     "Failed to process Bases for result "

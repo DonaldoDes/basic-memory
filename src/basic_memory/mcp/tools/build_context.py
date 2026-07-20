@@ -71,6 +71,11 @@ def _format_entity_block(result: ContextResult) -> str:
         for item in related_entities:
             permalink = item.permalink if item.permalink else ""
             lines.append(f"- [[{item.title}]] ({permalink})")
+            # Short digest (US-006b) — helps decide whether to follow the link
+            # without a read_note. Only EntitySummary carries it; render when set.
+            summary = getattr(item, "summary", None)
+            if summary:
+                lines.append(f"  summary: {summary}")
 
     return "\n".join(lines)
 
@@ -319,9 +324,7 @@ async def build_context(
                     logger.info("Enriching graph context with on-the-fly Bases queries")
                     knowledge_client = KnowledgeClient(client, active_project.external_id)
                     notes = await knowledge_client.list_entities_for_bases()
-                    bases_integration = create_bases_integration(
-                        notes_provider=lambda: notes
-                    )
+                    bases_integration = create_bases_integration(notes_provider=lambda: notes)
                     for cr in graph.results:
                         primary = cr.primary_result
                         if (
@@ -346,16 +349,12 @@ async def build_context(
                                 section = "\n\n---\n## Bases Query Results\n\n"
                                 appended = section
                                 for r in results:
-                                    if r["status"] == "success" and r.get(
-                                        "result_markdown"
-                                    ):
+                                    if r["status"] == "success" and r.get("result_markdown"):
                                         appended += r["result_markdown"] + "\n\n"
                                 if len(appended) > len(section):
                                     primary.content = cast(str, primary.content) + appended
                             except Exception as e:  # pragma: no cover
-                                logger.warning(
-                                    f"Failed to execute Bases queries: {e}"
-                                )
+                                logger.warning(f"Failed to execute Bases queries: {e}")
 
             logger.info(
                 f"MCP tool response: tool=build_context project={active_project.name} "

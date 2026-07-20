@@ -617,3 +617,40 @@ class TestV018BackwardCompatContract:
         assert result["related_results"][0]["entity_id"] == 1
         assert result["related_results"][0]["from_entity_id"] == 1
         assert result["related_results"][0]["to_entity_id"] == 2
+
+
+class TestSummaryExposition:
+    """US-006b (SUM-15): EntitySummary carries an additive `summary` field while
+    keeping the deprecated `content` field for backward compatibility."""
+
+    def test_entity_summary_additive_summary_field(self):
+        """summary is present and populated; content stays present (compat v0.18)."""
+        entity = EntitySummary(
+            external_id="550e8400-e29b-41d4-a716-446655440000",
+            entity_id=1,
+            permalink="test/entity",
+            title="Test Entity",
+            content="Full body content still here.",
+            summary="Short digest of the note.",
+            file_path="test/entity.md",
+            created_at=datetime(2023, 12, 8, 10, 30, 0),
+        )
+
+        data = json.loads(entity.model_dump_json())
+        # New additive field is serialized and populated.
+        assert data["summary"] == "Short digest of the note."
+        # Deprecated content field is preserved (no breaking change).
+        assert data["content"] == "Full body content still here."
+
+    def test_entity_summary_summary_defaults_none(self):
+        """summary is optional and defaults to None when not provided."""
+        entity = EntitySummary(
+            external_id="550e8400-e29b-41d4-a716-446655440000",
+            permalink="test/entity",
+            title="Test Entity",
+            file_path="test/entity.md",
+            created_at=datetime(2023, 12, 8, 10, 30, 0),
+        )
+        assert entity.summary is None
+        # content also remains available with its unchanged optional semantics.
+        assert entity.content is None
