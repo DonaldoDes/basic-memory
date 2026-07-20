@@ -14,9 +14,16 @@ Adds a persisted short-summary column to search_index on both backends.
 
 BACKFILL (post-deploy, REQUIRED): search_index is populated by indexing, not by
 this migration. After upgrading, run ``basic-memory reindex --full`` (or let the
-continuous auto-sync reindex) so existing rows gain their summary value. Without
-a reindex, rows with a frontmatter description keep a NULL summary until their
-next natural reindex.
+continuous auto-sync reindex) so existing rows gain their summary value. The
+impact of skipping this differs by backend:
+
+- Postgres: ADD COLUMN preserves existing rows. Only ``summary`` is affected —
+  it stays NULL until the next natural reindex, while search itself keeps
+  working (partial degradation).
+- SQLite: the DROP+CREATE above empties ``search_index`` entirely (not just
+  ``summary``). Until a full reindex runs, search returns ZERO results, not
+  just missing summaries. The reindex is not optional here — it is required
+  before reopening the service to traffic.
 """
 
 from typing import Sequence, Union
