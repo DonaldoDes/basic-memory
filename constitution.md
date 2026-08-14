@@ -293,6 +293,15 @@ Cette section désigne les fichiers et patterns qui déclenchent automatiquement
 
 Contexte double : ce repo (1) fait tourner le serveur MCP du **vault PKM personnel** (données privées, sous git auto-sync + Obsidian Sync) et (2) alimente des **PRs upstream** (basicmachines-co). Toute régression sur ces zones touche des données réelles ET du code publié.
 
+### Modèle d'identité et d'authentification (lecture de grille MCP-SEC)
+
+Ce serveur est **mono-utilisateur local par défaut** (`RuntimeMode.LOCAL`) : le process MCP tourne en stdio sur le poste de l'utilisateur, sans notion de session HTTP multi-client ni d'utilisateurs distincts à isoler les uns des autres. Conséquence directe sur la grille d'invariants MCP-SEC de `.claude/skills/mcp-server/SKILL.md` (vault) :
+
+- **Pas de paramètre `user_id`/`owner_id`/`tenant_id` en input MCP** — vérifié (`grep` sur `mcp/tools/`, `mcp/server.py`, `mcp/async_client.py`) : aucun tool n'accepte un identifiant d'utilisateur en paramètre. L'identité de l'appelant, en mode local, est simplement « le process qui a ouvert ce stdio » — il n'y a rien à dériver côté serveur au-delà de ça.
+- **Isolation multi-tenant non applicable en mode LOCAL** — l'invariant « filtre d'identité obligatoire sur toute query de données utilisateur » se traduit ici par l'invariant **projet** existant (§ « Isolation projets / workspaces » ci-dessous), pas par un filtre utilisateur : un seul utilisateur humain, N projets/workspaces potentiellement montés dans la même config (`config.json`), et c'est le **projet résolu** (jamais un tenant) qui doit border chaque opération.
+- **Mode CLOUD (`cli/auth.py`, `cloud_api_key`)** est le seul endroit où une notion d'identité distante existe (Bearer token / OAuth vers le service cloud Basic Machines) — cf. § « Credentials cloud / OAuth » ci-dessous. Même dans ce mode, l'auth protège l'accès **réseau au service cloud**, pas un cloisonnement inter-utilisateurs *dans* ce serveur MCP : chaque instance locale reste un client mono-utilisateur de son propre espace cloud.
+- **Ce que ça ne dispense PAS** : validation d'input avant logique métier (zones path traversal / SQL / markdown ci-dessous), et absence de fuite d'énumération (404 vs 403) — ces invariants restent pleinement pertinents indépendamment du modèle mono-utilisateur, car l'entrée reste non fiable (LLM, fichiers vault, imports) même sans multi-tenant à protéger.
+
 ### Path traversal / résolution filesystem
 
 - **Fichiers** : `src/basic_memory/utils.py` (`validate_project_path`, l.706 — frontière unique projet/filesystem), `src/basic_memory/file_utils.py` (`sanitize_for_directory`, l.494 — rejet `..` post-strip, fix BUG-004 ; whitelist Option B qui raise au lieu de stripper silencieusement, fix BUG-001), `src/basic_memory/services/file_service.py` (`write_file`, l.185-236 — défense last-mile `is_relative_to(base_path)` ; `move_file`, `delete_file`), call sites MCP : `mcp/tools/read_content.py` (l.242-251), `mcp/tools/move_note.py` (l.512-516 et l.728-731), `mcp/tools/write_note.py`.
